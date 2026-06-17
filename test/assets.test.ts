@@ -35,6 +35,17 @@ test('downloadImages leaves marker on failure', async () => {
   expect(out).toContain('https://x/p.png');
 });
 
+test('downloadImages leaves marker when fetch throws (e.g. timeout/abort)', async () => {
+  const md = '![a](https://x/p.png)';
+  const out = await downloadImages(md, {
+    id: 'EP-1', attachmentsDir: '/v/PRDs/_attachments', vaultRelativePrefix: '_attachments',
+    fetchFn: (async () => { throw new Error('The operation was aborted due to timeout'); }) as unknown as typeof fetch,
+    writeFileFn: async () => {}, mkdirFn: async () => {},
+  });
+  expect(out).toContain('<!-- image download failed -->');
+  expect(out).toContain('https://x/p.png');
+});
+
 test('downloadImages handles the same url appearing twice (distinct local files)', async () => {
   const md = '![a](https://x/p.png)\n![b](https://x/p.png)';
   const writes: string[] = [];
