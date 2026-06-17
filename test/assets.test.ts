@@ -34,3 +34,16 @@ test('downloadImages leaves marker on failure', async () => {
   expect(out).toContain('<!-- image download failed -->');
   expect(out).toContain('https://x/p.png');
 });
+
+test('downloadImages handles the same url appearing twice (distinct local files)', async () => {
+  const md = '![a](https://x/p.png)\n![b](https://x/p.png)';
+  const writes: string[] = [];
+  const out = await downloadImages(md, {
+    id: 'EP-1', attachmentsDir: '/v/PRDs/_attachments', vaultRelativePrefix: '_attachments',
+    fetchFn: (async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(2) })) as unknown as typeof fetch,
+    writeFileFn: async (p) => { writes.push(p); },
+    mkdirFn: async () => {},
+  });
+  expect(out).toBe('![a](_attachments/EP-1/img-0.png)\n![b](_attachments/EP-1/img-1.png)');
+  expect(writes).toEqual(['/v/PRDs/_attachments/EP-1/img-0.png', '/v/PRDs/_attachments/EP-1/img-1.png']);
+});

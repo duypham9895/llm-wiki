@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 export function extractImageUrls(md: string): string[] {
   const urls: string[] = [];
@@ -27,7 +27,7 @@ export async function downloadImages(
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
     const abs = localImagePath(opts.attachmentsDir, opts.id, url, i);
-    const rel = `${opts.vaultRelativePrefix}/${opts.id}/${abs.split('/').pop()}`;
+    const rel = `${opts.vaultRelativePrefix}/${opts.id}/${basename(abs)}`;
     try {
       const res = await opts.fetchFn(url);
       if (!(res as Response).ok) throw new Error('bad status');
