@@ -689,7 +689,7 @@ git commit -m "feat: classify discovered items into kind + canonical"
 ```json
 {
   "Epic Name": { "type": "title", "title": [{ "plain_text": "PRD 2: Client Management" }] },
-  "userDefined:ID": { "type": "unique_id", "unique_id": { "prefix": "EP", "number": 827 } },
+  "ID": { "type": "unique_id", "unique_id": { "prefix": "EP", "number": 827 } },
   "Status": { "type": "status", "status": { "name": "Requirement in Progress" } },
   "Platform": { "type": "multi_select", "multi_select": [{ "name": "AI Agent" }] },
   "Strategic Goal": { "type": "multi_select", "multi_select": [{ "name": "RISA-NXT" }] },
@@ -808,7 +808,7 @@ export function buildSyncMeta(
     .filter((h): h is string => Boolean(h))
     .map((h) => `[[${h}]]`);
   return {
-    id: uniqueId(p, 'userDefined:ID') ?? item.uuid.slice(0, 8),
+    id: uniqueId(p, 'ID') ?? item.uuid.slice(0, 8),   // 'ID' = Notion API display-name key (NOT the MCP 'userDefined:ID')
     uuid: item.uuid,
     source_url: item.url,
     title: item.title,
@@ -1418,7 +1418,7 @@ async function main(): Promise<number> {
   const urlByUuid = new Map<string, string>();
   for (const it of items) {
     const { kind } = classify(it);
-    const id = (it.properties as any)?.['userDefined:ID']?.unique_id;
+    const id = (it.properties as any)?.['ID']?.unique_id;
     const idStr = id ? `${id.prefix ? id.prefix + '-' : ''}${id.number}` : null;
     handleByUuid.set(it.uuid, filenameStem({ kind, id: idStr, title: it.title, uuid: it.uuid }));
     urlByUuid.set(it.uuid, it.url);
