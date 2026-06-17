@@ -1,0 +1,5 @@
+node_modules/
+.sync-state.json
+.env
+*.log
+.DS_Store
