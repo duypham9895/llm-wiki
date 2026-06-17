@@ -1633,3 +1633,114 @@ git commit -m "chore: launchd schedule, README, verified smoke run"
 **Type consistency:** `SyncMeta`/`LlmMeta`/`DiscoveredItem`/`SyncState` defined in Task 1 and used consistently. `filenameStem` signature matches between Tasks 4, 12. `writeMarkdown`/`archiveFile` signatures match Tasks 10, 12. `classify` return shape matches Tasks 6, 12. `buildSyncMeta` opts match Tasks 7, 12. ✓
 
 **Known follow-ups (intentionally deferred, not gaps):** `parent`/`sub_items` relation wikilinks and in-body `depends_on` extraction are scaffolded in `SyncMeta` (set to null/[] in Task 7/12) — full relation traversal is a refinement that can land after the core pipeline is green, since it needs the second-pass handle map which Task 12 already builds. Flag for the implementer: wire these once the smoke run confirms the core path.
+
+---
+
+## Task 14: Re-scope discovery (DB-only + body-content filter + API timeout)
+
+**Added 2026-06-18 after the Task 13 live smoke run.** The live run revealed that `/search "PRD"` returns **828** items (tickets/templates/subtasks) and the Product Backlog DB has **715** rows (**423** are "Not Started" stubs). The original "everything matching PRD" scope is unusable. Revised scope (spec §3, revised): **DB rows only, filtered to those with real body content**, with all API calls bounded by a timeout. See the spec's revised Decisions table.
+
+**Files:**
+- Modify: `src/index.ts` (drop search pass; construct client with timeout; add content-filter gate before write)
+- Create: `src/content.ts` (pure `hasRealContent` helper) + `test/content.test.ts`
+- Modify: `src/config.ts` (add `minBodyChars` + `apiTimeoutMs` settings) + `test/config.test.ts`
+
+**Interfaces:**
+- Produces: `hasRealContent(markdown: string, minChars: number): boolean` — strips frontmatter-irrelevant whitespace/markdown punctuation and returns true if the meaningful text length ≥ minChars.
+- `Config` gains `minBodyChars: number` (default 300) and `apiTimeoutMs: number` (default 30000).
+
+- [ ] **Step 1: Write the failing test for `hasRealContent`** (`test/content.test.ts`)
+
+```ts
+import { expect, test } from 'vitest';
+import { hasRealContent } from '../src/content.js';
+
+test('empty / whitespace-only body is not real content', () => {
+  expect(hasRealContent('', 300)).toBe(false);
+  expect(hasRealContent('   \n\n  \t ', 300)).toBe(false);
+});
+
+test('a stub heading alone is below threshold', () => {
+  expect(hasRealContent('# Title\n\n', 300)).toBe(false);
+});
+
+test('a substantial body is real content', () => {
+  const body = '# Background\n\n' + 'This PRD describes the disbursement flow in detail. '.repeat(20);
+  expect(hasRealContent(body, 300)).toBe(true);
+});
+
+test('counts visible text, not markdown punctuation', () => {
+  // 250 pipe/dash table-border chars but little real text → below 300
+  const tableNoise = '| --- | --- |\n'.repeat(20);
+  expect(hasRealContent(tableNoise, 300)).toBe(false);
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run test/content.test.ts`
+Expected: FAIL — cannot find `../src/content.js`.
+
+- [ ] **Step 3: Implement `src/content.ts`**
+
+```ts
+// Decide whether a converted page body has enough real prose to be worth syncing,
+// so 'Not Started' backlog stubs (empty bodies) are skipped.
+export function hasRealContent(markdown: string, minChars: number): boolean {
+  const meaningful = markdown
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')   // drop image embeds
+    .replace(/[#>*_`|\-\\]/g, ' ')          // drop markdown punctuation / table borders
+    .replace(/\s+/g, ' ')                   // collapse whitespace
+    .trim();
+  return meaningful.length >= minChars;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run test/content.test.ts`
+Expected: PASS (4 tests).
+
+- [ ] **Step 5: Add config settings** (modify `src/config.ts`)
+
+Add to the `Config` interface: `minBodyChars: number;` and `apiTimeoutMs: number;`. In `loadConfig`'s returned object add:
+```ts
+    minBodyChars: env.MIN_BODY_CHARS ? Number(env.MIN_BODY_CHARS) : 300,
+    apiTimeoutMs: env.API_TIMEOUT_MS ? Number(env.API_TIMEOUT_MS) : 30000,
+```
+Add a test to `test/config.test.ts` asserting the defaults (300 / 30000) and that env overrides parse to numbers.
+
+- [ ] **Step 6: Re-scope the orchestrator** (modify `src/index.ts`)
+
+1. Construct the client with a timeout so block fetches can't hang:
+   `const notion = new Client({ auth: cfg.token, timeoutMs: cfg.apiTimeoutMs });`
+2. **Drop the search pass.** Discovery becomes DB-only:
+   ```ts
+   const items = await enumerateDatabase(notion, cfg.databaseId);
+   const presentUuids = new Set(items.map((i) => i.uuid));
+   ```
+   (Remove the `Promise.all([... searchPrd ...])` and the `mergeDiscovery` call. `searchPrd`/`mergeDiscovery` remain exported for potential later use but are no longer called here.)
+3. After converting the body (`blocksToMarkdown` → normalize → resolveLinks) and BEFORE downloading images / writing, gate on content:
+   ```ts
+   if (!hasRealContent(body, cfg.minBodyChars)) { skipped++; continue; }
+   ```
+   A row that fails the gate is treated like a stub: not written, not added to `state.pages`. (Existing files whose row later drops below threshold are handled by the archive pass — they fall out of `presentUuids`? No: they are still in the DB. So instead: if a previously-synced uuid now fails the content gate, leave its existing file as-is — do NOT delete. Only `findRemoved` archives. A stub that never had content simply is never written.)
+4. The `kind === 'db-index'` branch is now dead (no database-type items from DB enumeration) but harmless; leave it.
+
+- [ ] **Step 7: Typecheck, full suite, commit**
+
+Run: `npm run typecheck && npm test`
+Expected: clean; all tests pass (including the new content + config tests).
+
+```bash
+git add src/content.ts test/content.test.ts src/config.ts test/config.test.ts src/index.ts
+git commit -m "feat: re-scope to DB-only discovery with body-content filter and API timeout"
+```
+
+- [ ] **Step 8: Live smoke run (re-verify end to end)**
+
+```bash
+rm -rf /tmp/smoke-vault /tmp/smoke-state.json
+VAULT_PATH=/tmp/smoke-vault STATE_FILE=/tmp/smoke-state.json npm run sync
+```
+Expected: completes within a few minutes (not hours), prints `synced N · skipped M · archived 0 · errors E` with a sane N (real PRDs + substantive epics, not 715), and a state file is written. Verify `EP-`-prefixed filenames, clean GFM tables, and that "Not Started" stubs were skipped.
