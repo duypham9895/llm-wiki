@@ -1396,6 +1396,12 @@ import { downloadImages } from './assets.js';
 import { writeMarkdown, archiveFile } from './writer.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 
+// Image URLs are S3-backed Notion signed URLs that can hang; bound each fetch
+// so one stalled download can't block an unattended cron run forever.
+const IMAGE_FETCH_TIMEOUT_MS = 30_000;
+const fetchWithTimeout: typeof fetch = (input, init) =>
+  fetch(input, { ...init, signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS) });
+
 async function main(): Promise<number> {
   const cfg = loadConfig(process.env, readKeychainToken);
   const notion = new Client({ auth: cfg.token });
@@ -1448,7 +1454,7 @@ async function main(): Promise<number> {
       const stem = handleByUuid.get(item.uuid)!;
       body = await downloadImages(body, {
         id: stem, attachmentsDir, vaultRelativePrefix: '_attachments',
-        fetchFn: fetch, writeFileFn: (p, d) => writeFile(p, d), mkdirFn: (p) => mkdir(p, { recursive: true }).then(() => {}),
+        fetchFn: fetchWithTimeout, writeFileFn: (p, d) => writeFile(p, d), mkdirFn: (p) => mkdir(p, { recursive: true }).then(() => {}),
       });
 
       const sync = buildSyncMeta(item, {
