@@ -18,6 +18,11 @@ export function resolveNotionLinks(
 
 type Props = Record<string, any>;
 
+export function extractUniqueId(properties: Record<string, any> | undefined, key = 'userDefined:ID'): string | null {
+  const u = properties?.[key]?.unique_id; if (!u) return null;
+  return u.prefix ? `${u.prefix}-${u.number}` : String(u.number);
+}
+
 function titleText(p: Props, key: string): string | null {
   const v = p[key]; if (!v) return null;
   const raw = v.title ?? v.rich_text;
@@ -32,8 +37,7 @@ function multiNames(p: Props, key: string): string[] {
   return (p[key]?.multi_select ?? []).map((o: any) => o.name);
 }
 function uniqueId(p: Props, key: string): string | null {
-  const u = p[key]?.unique_id; if (!u) return null;
-  return u.prefix ? `${u.prefix}-${u.number}` : String(u.number);
+  return extractUniqueId(p, key);
 }
 function peopleNames(p: Props, key: string, names: Record<string, string>): string[] {
   return (p[key]?.people ?? []).map((person: any) => names[person.id] ?? person.id);

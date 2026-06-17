@@ -6,7 +6,7 @@ import { enumerateDatabase, searchPrd, resolveUsers } from './notion.js';
 import { mergeDiscovery } from './discover.js';
 import { classify } from './classify.js';
 import { filenameStem } from './naming.js';
-import { makeConverter, blocksToMarkdown, normalizeEscapes, resolveNotionLinks, buildSyncMeta } from './convert.js';
+import { makeConverter, blocksToMarkdown, normalizeEscapes, resolveNotionLinks, buildSyncMeta, extractUniqueId } from './convert.js';
 import { downloadImages } from './assets.js';
 import { writeMarkdown, archiveFile } from './writer.js';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -33,8 +33,7 @@ async function main(): Promise<number> {
   const urlByUuid = new Map<string, string>();
   for (const it of items) {
     const { kind } = classify(it);
-    const id = (it.properties as any)?.['userDefined:ID']?.unique_id;
-    const idStr = id ? `${id.prefix ? id.prefix + '-' : ''}${id.number}` : null;
+    const idStr = extractUniqueId(it.properties as any);
     handleByUuid.set(it.uuid, filenameStem({ kind, id: idStr, title: it.title, uuid: it.uuid }));
     urlByUuid.set(it.uuid, it.url);
   }
