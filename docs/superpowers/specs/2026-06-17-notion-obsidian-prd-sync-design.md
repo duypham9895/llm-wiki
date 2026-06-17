@@ -60,18 +60,25 @@ The "PRD database" is the Notion database **`🚀 Product Backlog (EPIC)`**
 |---|---|---|
 | Auth | Notion **internal integration token** | Unattended cron has no human to re-approve OAuth. Token is long-lived, scoped to shared pages only. |
 | Stack | **Node/TypeScript** — `@notionhq/client` + `notion-to-md` | Markdown fidelity is the whole game (219 tables/PRD). Node's converter is the most mature. |
-| Discovery | DB enumeration **+** `/search "PRD"`, union deduped by UUID | DB pass guarantees canonical coverage; search catches satellites (search alone is fuzzy/relevance-ranked). |
-| Scope | Everything matching "PRD", **classified** not dropped | User wants the broad net; noise is controlled via `kind`/`canonical` tags, not exclusion. |
-| Database-type results | **Index as a list page** (`db-index`), rows not expanded | Captures the DB's existence without flooding the corpus with operational rows. |
-| Archive trigger | **Only when a row is removed from Notion** | `Released`/`Cancelled` PRDs are valid shipped-feature docs; keep them in the active wiki + RAG. |
-| Images | **Download locally** to `_attachments/<id>/` | Notion signed URLs expire ~1h; local copies render forever and are RAG-safe. |
+| Discovery | **Product Backlog DB enumeration only** (no `/search`) | **Revised 2026-06-18 after live run:** `/search "PRD"` matched **828** items (tickets, templates, subtasks) — unusable noise. DB-only is clean and bounded. |
+| Scope | **DB rows with real body content** (body-content filter) | **Revised 2026-06-18 after live run:** the DB has **715 rows**, but **423 are "Not Started" stubs** and only ~148 have a Short Summary. Sync a row only if its page body has meaningful content (≥ threshold of non-whitespace chars); skip empty placeholders. |
+| API timeout | **`@notionhq/client` constructed with `timeoutMs: 30000`** | **Added 2026-06-18 after live run:** a page's block fetch (via `notion-to-md`) hung with no timeout, stalling the whole unattended run. A client-level timeout bounds every API call. |
+| Archive trigger | **Only when a row is removed from Notion** (or drops below the content threshold) | `Released`/`Cancelled` PRDs are valid shipped-feature docs; keep them. A row that loses its body falls out of the synced set like a removal. |
+| Images | **Download locally** to `_attachments/<id>/`, each fetch bounded by a 30s timeout | Notion signed URLs expire ~1h; local copies render forever and are RAG-safe. A hung image download cannot stall the run. |
 | Schedule | **A few times/day via launchd**, incremental | launchd is more reliable than crontab on a sleeping laptop. Incremental via `last_edited`. |
 | Manual run | Also runnable as `npm run sync` | On-demand force sync alongside the schedule. |
 
 ### Confirmed assumptions
-1. Every important doc is **either in the Backlog DB or titled with "PRD"** (so the two-pass discovery catches it).
-2. **Satellites get title-based filenames** (slug + short UUID); only canonical PRDs get clean `EP-` names.
-3. **TRD links defer to a later sub-project** — stored as plain references now, not wikilinks.
+1. The canonical PRDs and substantive epics all live in the **Product Backlog (EPIC) database**; satellite pages outside it are out of scope (the broad `/search` net was abandoned after it returned 828 noisy items).
+2. Every synced row is a DB row, so every file gets a clean **`EP-` id** filename. The `satellite`/`db-index` kinds are no longer produced (no search pass); `kind` is `canonical-prd` or `archived` (by title marker).
+3. A row is "real" if its page **body content** meets a non-whitespace character threshold (default 300; tunable). Stubs below it are skipped and recorded so they are not re-fetched every run.
+4. **TRD links defer to a later sub-project** — stored as plain references now, not wikilinks.
+
+### Superseded (original brainstorming assumptions, kept for history)
+- ~~"Everything matching PRD", classified not dropped~~ → 828 items, abandoned for DB-only.
+- ~~Satellites get title-based filenames~~ → no satellites synced.
+- ~~Database-type results indexed as `db-index` list pages~~ → no search, so no database-type results.
+- ~~Parent/Sub-item hierarchy wikilinks~~ → 713/715 rows are top-level; effectively no hierarchy. `parent`/`sub_items` frontmatter retained but usually empty.
 
 ---
 
