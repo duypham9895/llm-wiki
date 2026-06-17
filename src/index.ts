@@ -2,11 +2,11 @@ import { Client } from '@notionhq/client';
 import { join } from 'node:path';
 import { loadConfig, readKeychainToken } from './config.js';
 import { loadState, saveState, needsSync, findRemoved } from './state.js';
-import { enumerateDatabase, searchPrd, resolveUsers } from './notion.js';
-import { mergeDiscovery } from './discover.js';
+import { enumerateDatabase, resolveUsers } from './notion.js';
 import { classify } from './classify.js';
 import { filenameStem } from './naming.js';
 import { makeConverter, blocksToMarkdown, normalizeEscapes, resolveNotionLinks, buildSyncMeta, extractUniqueId } from './convert.js';
+import { hasRealContent } from './content.js';
 import { downloadImages } from './assets.js';
 import { writeMarkdown, archiveFile } from './writer.js';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -17,19 +17,15 @@ const fetchWithTimeout: typeof fetch = (input, init) =>
 
 async function main(): Promise<number> {
   const cfg = loadConfig(process.env, readKeychainToken);
-  const notion = new Client({ auth: cfg.token });
+  const notion = new Client({ auth: cfg.token, timeoutMs: cfg.apiTimeoutMs });
   const n2m = makeConverter(notion);
   const prdsDir = join(cfg.vaultPath, 'PRDs');
   const attachmentsDir = join(prdsDir, '_attachments');
   const state = await loadState(cfg.stateFile);
   const syncedAt = new Date().toISOString();
 
-  // 1. Discover
-  const [dbItems, searchItems] = await Promise.all([
-    enumerateDatabase(notion, cfg.databaseId),
-    searchPrd(notion, cfg.searchTerm),
-  ]);
-  const items = mergeDiscovery(dbItems, searchItems);
+  // 1. Discover (DB-only; search pass dropped after live run revealed 828 noisy results)
+  const items = await enumerateDatabase(notion, cfg.databaseId);
   const presentUuids = new Set(items.map((i) => i.uuid));
 
   // Precompute handles for wikilink resolution
@@ -58,6 +54,9 @@ async function main(): Promise<number> {
         const raw = await blocksToMarkdown(n2m, item.uuid);
         body = resolveNotionLinks(normalizeEscapes(raw), { handleByUuid, urlByUuid });
       }
+
+      // Skip stubs: 'Not Started' rows with no meaningful body content
+      if (!hasRealContent(body, cfg.minBodyChars)) { skipped++; continue; }
 
       // resolve people referenced by this item's properties
       const pic = ((item.properties as any)?.['Product PIC']?.people ?? []).map((p: any) => p.id);

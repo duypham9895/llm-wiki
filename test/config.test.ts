@@ -18,3 +18,16 @@ test('loadConfig throws when vault path missing', () => {
 test('loadConfig throws when token empty', () => {
   expect(() => loadConfig(fakeEnv, () => '')).toThrow(/token/i);
 });
+
+test('loadConfig defaults minBodyChars=300 and apiTimeoutMs=30000', () => {
+  const cfg = loadConfig(fakeEnv, () => 'secret-token');
+  expect(cfg.minBodyChars).toBe(300);
+  expect(cfg.apiTimeoutMs).toBe(30000);
+});
+
+test('loadConfig parses MIN_BODY_CHARS and API_TIMEOUT_MS from env', () => {
+  const env = { ...fakeEnv, MIN_BODY_CHARS: '500', API_TIMEOUT_MS: '60000' } as NodeJS.ProcessEnv;
+  const cfg = loadConfig(env, () => 'secret-token');
+  expect(cfg.minBodyChars).toBe(500);
+  expect(cfg.apiTimeoutMs).toBe(60000);
+});

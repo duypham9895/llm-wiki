@@ -8,6 +8,8 @@ export interface Config {
   vaultPath: string;
   searchTerm: string;
   stateFile: string;
+  minBodyChars: number;
+  apiTimeoutMs: number;
 }
 
 export function readKeychainToken(): string {
@@ -31,5 +33,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, readToken: () => string): Con
     vaultPath,
     searchTerm: 'PRD',
     stateFile: env.STATE_FILE ?? '.sync-state.json',
+    minBodyChars: env.MIN_BODY_CHARS ? Number(env.MIN_BODY_CHARS) : 300,
+    apiTimeoutMs: env.API_TIMEOUT_MS ? Number(env.API_TIMEOUT_MS) : 30000,
   };
 }
