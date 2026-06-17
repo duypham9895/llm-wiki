@@ -20,7 +20,8 @@ type Props = Record<string, any>;
 
 function titleText(p: Props, key: string): string | null {
   const v = p[key]; if (!v) return null;
-  const arr = v.title ?? v.rich_text ?? [];
+  const raw = v.title ?? v.rich_text;
+  const arr = Array.isArray(raw) ? raw : [];
   const t = arr.map((r: any) => r.plain_text ?? '').join('').trim();
   return t || null;
 }

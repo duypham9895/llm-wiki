@@ -36,3 +36,25 @@ test('buildSyncMeta maps real Notion properties', () => {
   expect(meta.product_pic).toEqual(['Duy Pham']);
   expect(meta.revenue_impact_usd_mo).toBeNull();
 });
+
+test('buildSyncMeta does not throw when a text property has a null array', () => {
+  const item: DiscoveredItem = {
+    uuid: '00000000-0000-0000-0000-000000000000',
+    title: 'X',
+    url: 'https://n',
+    resultType: 'page',
+    inBacklogDb: true,
+    lastEdited: '2026-06-17T00:00:00Z',
+    properties: { 'Short Summary': { type: 'rich_text', rich_text: null } } as any,
+  };
+  const meta = buildSyncMeta(item, {
+    kind: 'canonical-prd',
+    canonical: true,
+    userNames: {},
+    handleByUuid: new Map(),
+    dependsOnUuids: [],
+    trdRefs: [],
+    syncedAt: '2026-06-17T09:00:00Z',
+  });
+  expect(meta.short_summary).toBeNull();
+});
