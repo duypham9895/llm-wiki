@@ -8,6 +8,7 @@ export interface FsLike {
   writeFile: (p: string, d: string) => Promise<void>;
   rename: (a: string, b: string) => Promise<void>;
   mkdir: (p: string, opts?: any) => Promise<unknown>;
+  unlink: (p: string) => Promise<void>;
 }
 
 const defaultFs: FsLike = {
@@ -15,6 +16,7 @@ const defaultFs: FsLike = {
   writeFile: (p, d) => nodeFs.writeFile(p, d, 'utf8'),
   rename: (a, b) => nodeFs.rename(a, b),
   mkdir: (p, o) => nodeFs.mkdir(p, o),
+  unlink: (p) => nodeFs.unlink(p),
 };
 
 export async function writeMarkdown(opts: {
@@ -49,4 +51,5 @@ export async function archiveFile(opts: { dir: string; filename: string; fs?: Fs
   const tmp = join(archiveDir, `${opts.filename}.tmp`);
   await fs.writeFile(tmp, updated);
   await fs.rename(tmp, join(archiveDir, opts.filename));
+  await fs.unlink(src);
 }

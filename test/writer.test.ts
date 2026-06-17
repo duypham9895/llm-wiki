@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { writeMarkdown } from '../src/writer.js';
+import { writeMarkdown, archiveFile } from '../src/writer.js';
 import type { SyncMeta } from '../src/types.js';
 
 function memFs() {
@@ -10,6 +10,7 @@ function memFs() {
     writeFile: async (p: string, d: string) => { files.set(p, d); },
     rename: async (a: string, b: string) => { files.set(b, files.get(a)!); files.delete(a); },
     mkdir: async () => {},
+    unlink: async (p: string) => { if (!files.has(p)) { const e: any = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } files.delete(p); },
   };
 }
 
@@ -27,7 +28,7 @@ test('first write scaffolds empty llm block', async () => {
   expect(name).toBe('EP-1-t.md');
   const content = fs.files.get('/PRDs/EP-1-t.md')!;
   expect(content).toContain('llm:');
-  expect(content).toContain('summary: null');
+  expect(content).toContain('llm:\n  summary: null');
   expect(content).toContain('# Hello');
 });
 
@@ -43,4 +44,25 @@ test('re-write preserves hand-edited llm block', async () => {
   expect(content).toContain('B wrote this');
   expect(content).toContain('# v2');
   expect(content).not.toContain('# v1');
+});
+
+test('archiveFile moves file (source deleted, archive written with removed_from_notion: true)', async () => {
+  const fs = memFs();
+  // Seed a file at /PRDs/EP-1-t.md with removed_from_notion: false in frontmatter
+  const seedContent = `---\nremoved_from_notion: false\ntitle: T\n---\n# Hello\n`;
+  fs.files.set('/PRDs/EP-1-t.md', seedContent);
+  await archiveFile({ dir: '/PRDs', filename: 'EP-1-t.md', fs });
+  // (a) Source must be deleted — proves MOVE not copy
+  expect(fs.files.has('/PRDs/EP-1-t.md')).toBe(false);
+  // (b) Archive file must exist
+  expect(fs.files.has('/PRDs/_Archive/EP-1-t.md')).toBe(true);
+  // (c) Archive content must have removed_from_notion: true
+  const archived = fs.files.get('/PRDs/_Archive/EP-1-t.md')!;
+  expect(archived).toContain('removed_from_notion: true');
+});
+
+test('archiveFile with nonexistent source returns silently without creating archive', async () => {
+  const fs = memFs();
+  await expect(archiveFile({ dir: '/PRDs', filename: 'does-not-exist.md', fs })).resolves.toBeUndefined();
+  expect(fs.files.has('/PRDs/_Archive/does-not-exist.md')).toBe(false);
 });
