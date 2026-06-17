@@ -10,8 +10,14 @@ export function buildSyncBlock(sync: SyncMeta): string {
 
 export function parseExisting(content: string): { llmRaw: string | null } {
   if (!content.startsWith('---\n')) return { llmRaw: null };
-  const end = content.indexOf('\n---', 4);
-  if (end === -1) return { llmRaw: null };
+  // Find the closing fence: a line that is exactly "---" (followed by newline or EOF),
+  // searching only AFTER the opening fence at index 4. This prevents a sync field value
+  // containing "\n---" (but not followed by \n or EOF) from being mistaken as the fence.
+  const fenceRe = /\n---(?:\n|$)/g;
+  fenceRe.lastIndex = 4;
+  const m = fenceRe.exec(content);
+  if (!m) return { llmRaw: null };
+  const end = m.index; // position of the '\n' before the closing '---'
   const fm = content.slice(4, end + 1); // frontmatter text, includes trailing newline
   const llmIdx = fm.search(/^llm:/m);
   if (llmIdx === -1) return { llmRaw: null };

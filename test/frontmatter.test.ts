@@ -41,3 +41,28 @@ test('parseExisting extracts llm block verbatim and composeFile preserves it byt
 test('parseExisting returns null when no llm block', () => {
   expect(parseExisting('---\nsync:\n  id: x\n---\nbody').llmRaw).toBeNull();
 });
+
+test('parseExisting is not fooled by a sync field value containing a newline + ---', () => {
+  // yaml.stringify encodes "\n---\n" via block scalar indentation (indents --- as "    ---"),
+  // so composeFile itself never emits the dangerous bytes via short_summary. The real risk
+  // is files modified by external editors where "---" appears at the start of a line inside
+  // the frontmatter but is followed by non-newline characters (i.e. NOT a real fence line).
+  // The old code used indexOf('\n---', 4) which matched ANY \n--- including "---more text",
+  // truncating the frontmatter early and losing the llm block.
+  // The fix uses /\n---(?:\n|$)/g which only matches a line that is exactly "---".
+  const customLlm = 'llm:\n  summary: "B owns this"\n  tags: [x]\n  related: []\n';
+  // Construct a file where "---more text" appears as a line in the frontmatter
+  // BEFORE the llm block. This is the dangerous byte sequence (\n--- followed by non-\n)
+  // that old code mistakes for the closing fence.
+  const dangerousFile =
+    '---\n' +
+    'sync:\n' +
+    '  id: EP-827\n' +
+    '---more text\n' +  // \n--- followed by 'm' — not a real fence, but old code stops here
+    customLlm +
+    '---\n' +
+    '\n# Body\n';
+  // Confirm the dangerous sequence is genuinely present:
+  expect(dangerousFile).toContain('\n---more');
+  expect(parseExisting(dangerousFile).llmRaw).toBe(customLlm);
+});
