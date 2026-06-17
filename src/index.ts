@@ -1,0 +1,99 @@
+import { Client } from '@notionhq/client';
+import { join } from 'node:path';
+import { loadConfig, readKeychainToken } from './config.js';
+import { loadState, saveState, needsSync, findRemoved } from './state.js';
+import { enumerateDatabase, searchPrd, resolveUsers } from './notion.js';
+import { mergeDiscovery } from './discover.js';
+import { classify } from './classify.js';
+import { filenameStem } from './naming.js';
+import { makeConverter, blocksToMarkdown, normalizeEscapes, resolveNotionLinks, buildSyncMeta } from './convert.js';
+import { downloadImages } from './assets.js';
+import { writeMarkdown, archiveFile } from './writer.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+
+async function main(): Promise<number> {
+  const cfg = loadConfig(process.env, readKeychainToken);
+  const notion = new Client({ auth: cfg.token });
+  const n2m = makeConverter(notion);
+  const prdsDir = join(cfg.vaultPath, 'PRDs');
+  const attachmentsDir = join(prdsDir, '_attachments');
+  const state = await loadState(cfg.stateFile);
+  const syncedAt = new Date().toISOString();
+
+  // 1. Discover
+  const [dbItems, searchItems] = await Promise.all([
+    enumerateDatabase(notion, cfg.databaseId),
+    searchPrd(notion, cfg.searchTerm),
+  ]);
+  const items = mergeDiscovery(dbItems, searchItems);
+  const presentUuids = new Set(items.map((i) => i.uuid));
+
+  // Precompute handles for wikilink resolution
+  const handleByUuid = new Map<string, string>();
+  const urlByUuid = new Map<string, string>();
+  for (const it of items) {
+    const { kind } = classify(it);
+    const id = (it.properties as any)?.['userDefined:ID']?.unique_id;
+    const idStr = id ? `${id.prefix ? id.prefix + '-' : ''}${id.number}` : null;
+    handleByUuid.set(it.uuid, filenameStem({ kind, id: idStr, title: it.title, uuid: it.uuid }));
+    urlByUuid.set(it.uuid, it.url);
+  }
+
+  let synced = 0, skipped = 0, archived = 0;
+  const errors: string[] = [];
+
+  // 2. Sync each item
+  for (const item of items) {
+    try {
+      if (!needsSync(state.pages[item.uuid], item.lastEdited)) { skipped++; continue; }
+      const { kind, canonical } = classify(item);
+
+      let body: string;
+      if (kind === 'db-index') {
+        body = `# ${item.title}\n\n_Notion database — rows not expanded._\n\n[Open in Notion](${item.url})\n`;
+      } else {
+        const raw = await blocksToMarkdown(n2m, item.uuid);
+        body = resolveNotionLinks(normalizeEscapes(raw), { handleByUuid, urlByUuid });
+      }
+
+      // resolve people referenced by this item's properties
+      const pic = ((item.properties as any)?.['Product PIC']?.people ?? []).map((p: any) => p.id);
+      await resolveUsers(notion, pic, state.users);
+
+      const stem = handleByUuid.get(item.uuid)!;
+      body = await downloadImages(body, {
+        id: stem, attachmentsDir, vaultRelativePrefix: '_attachments',
+        fetchFn: fetch, writeFileFn: (p, d) => writeFile(p, d), mkdirFn: (p) => mkdir(p, { recursive: true }).then(() => {}),
+      });
+
+      const sync = buildSyncMeta(item, {
+        kind, canonical, userNames: state.users, handleByUuid,
+        dependsOnUuids: [], trdRefs: [], syncedAt,
+      });
+      const filename = await writeMarkdown({ dir: prdsDir, stem, sync, body });
+      state.pages[item.uuid] = { id: sync.id, filename, last_edited: item.lastEdited, synced_at: syncedAt, kind };
+      synced++;
+    } catch (err) {
+      errors.push(`${item.title} (${item.uuid}): ${(err as Error).message}`);
+    }
+  }
+
+  // 3. Archive removed
+  for (const uuid of findRemoved(state, presentUuids)) {
+    try {
+      await archiveFile({ dir: prdsDir, filename: state.pages[uuid].filename });
+      archived++;
+      delete state.pages[uuid];
+    } catch (err) {
+      errors.push(`archive ${uuid}: ${(err as Error).message}`);
+    }
+  }
+
+  await saveState(cfg.stateFile, state);
+
+  console.log(`synced ${synced} · skipped ${skipped} · archived ${archived} · errors ${errors.length}`);
+  if (errors.length) { console.error('Errors:\n' + errors.map((e) => '  - ' + e).join('\n')); return 1; }
+  return 0;
+}
+
+main().then((code) => process.exit(code)).catch((err) => { console.error(err); process.exit(1); });
