@@ -18,7 +18,7 @@ export function resolveNotionLinks(
 
 type Props = Record<string, any>;
 
-export function extractUniqueId(properties: Record<string, any> | undefined, key = 'userDefined:ID'): string | null {
+export function extractUniqueId(properties: Record<string, any> | undefined, key = 'ID'): string | null {
   const u = properties?.[key]?.unique_id; if (!u) return null;
   return u.prefix ? `${u.prefix}-${u.number}` : String(u.number);
 }
@@ -59,7 +59,7 @@ export function buildSyncMeta(
     .filter((h): h is string => Boolean(h))
     .map((h) => `[[${h}]]`);
   return {
-    id: uniqueId(p, 'userDefined:ID') ?? item.uuid.slice(0, 8),
+    id: extractUniqueId(p) ?? item.uuid.slice(0, 8),
     uuid: item.uuid,
     source_url: item.url,
     title: item.title,

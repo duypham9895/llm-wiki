@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { normalizeEscapes, resolveNotionLinks, buildSyncMeta } from '../src/convert.js';
+import { normalizeEscapes, resolveNotionLinks, buildSyncMeta, extractUniqueId } from '../src/convert.js';
 import type { DiscoveredItem } from '../src/types.js';
 
 test('normalizeEscapes unescapes Notion bracket artifacts', () => {
@@ -35,6 +35,13 @@ test('buildSyncMeta maps real Notion properties', () => {
   expect(meta.short_summary).toBe('Full client lifecycle');
   expect(meta.product_pic).toEqual(['Duy Pham']);
   expect(meta.revenue_impact_usd_mo).toBeNull();
+});
+
+test('extractUniqueId uses the API display-name key "ID", not the legacy "userDefined:ID"', () => {
+  const withRealKey = { 'ID': { type: 'unique_id', unique_id: { prefix: 'EP', number: 827 } } };
+  const withLegacyKey = { 'userDefined:ID': { type: 'unique_id', unique_id: { prefix: 'EP', number: 827 } } };
+  expect(extractUniqueId(withRealKey as any)).toBe('EP-827');
+  expect(extractUniqueId(withLegacyKey as any)).toBeNull();
 });
 
 test('buildSyncMeta does not throw when a text property has a null array', () => {
