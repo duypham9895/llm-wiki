@@ -15,9 +15,10 @@ TOKEN=$(curl -s -X POST "$BASE/api/v1/auths/signin" -H "content-type: applicatio
   | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
 [ -z "$TOKEN" ] && { echo "auth failed"; exit 1; }
 
-# reuse an existing 'PRDs' KB if present, else create
+# reuse an existing 'PRDs' KB if present, else create.
+# GET /api/v1/knowledge/ returns {"items":[...], "total":N} (not a bare list).
 KBID=$(curl -s "$BASE/api/v1/knowledge/" -H "authorization: Bearer $TOKEN" \
-  | python3 -c "import sys,json;ks=json.load(sys.stdin);print(next((k['id'] for k in ks if k['name']=='PRDs'),''))")
+  | python3 -c "import sys,json;d=json.load(sys.stdin);ks=d.get('items',d) if isinstance(d,dict) else d;print(next((k['id'] for k in ks if k.get('name')=='PRDs'),''))")
 if [ -z "$KBID" ]; then
   KBID=$(curl -s -X POST "$BASE/api/v1/knowledge/create" -H "authorization: Bearer $TOKEN" \
     -H "content-type: application/json" -d '{"name":"PRDs","description":"Ringkas PRD corpus"}' \
