@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ringkas.prd-enrich</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string>
+    <string>cd /Users/&lt;USER&gt;/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="&lt;VAULT_PATH&gt;" LLM_BASE_URL="&lt;LLM_BASE_URL&gt;" LLM_MODEL="MiniMax-M2" /opt/homebrew/bin/npm run enrich</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>23</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/prd-enrich.log</string>
+  <key>StandardErrorPath</key><string>/tmp/prd-enrich.err.log</string>
+</dict>
+</plist>
