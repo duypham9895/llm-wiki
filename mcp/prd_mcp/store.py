@@ -21,6 +21,7 @@ class Store:
                 "source_url": ch.source_url, "status": ch.status,
                 "platform": ",".join(ch.platform), "tags": ",".join(ch.tags),
                 "chunk_type": ch.chunk_type, "body_hash": body_hash,
+                "summary": ch.summary,
             })
             documents.append(ch.text)
         self.collection.upsert(ids=ids, embeddings=list(embeddings), metadatas=metadatas, documents=documents)

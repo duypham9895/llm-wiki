@@ -14,6 +14,7 @@ class Chunk:
     chunk_type: str = "body"
     index: int = 0
     text: str = ""
+    summary: str = ""
 
 
 def _split(text: str, size: int, overlap: int) -> list[str]:
@@ -33,7 +34,7 @@ def _split(text: str, size: int, overlap: int) -> list[str]:
 def chunk_doc(doc: Doc, size: int, overlap: int) -> list[Chunk]:
     def base(ct, idx, text):
         return Chunk(doc.stem, doc.id, doc.title, doc.source_url, doc.status,
-                     list(doc.platform), list(doc.tags), ct, idx, text)
+                     list(doc.platform), list(doc.tags), ct, idx, text, doc.summary or "")
     chunks = []
     if doc.summary:
         chunks.append(base("summary", 0, doc.summary))
