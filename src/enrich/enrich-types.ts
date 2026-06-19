@@ -5,6 +5,7 @@ export interface LlmFields {
   related: string[];      // ["[[EP-...-slug]]", ...]
   enriched_at?: string;   // ISO-8601, B bookkeeping
   body_hash?: string;     // sha256 of the body B enriched from
+  extra?: Record<string, unknown>; // unknown llm keys preserved round-trip
 }
 
 // What summarize produces (validated LLM output, pre-normalization for tags).

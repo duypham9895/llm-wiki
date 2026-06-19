@@ -5,8 +5,9 @@ import { distill } from './distill.js';
 import { summarizeDoc } from './summarize.js';
 import { buildRelated, judgeRelated, type RelateDoc } from './relate.js';
 import { listPrdFiles, splitFrontmatter, hashBody, writeLlmBlock } from './doc-io.js';
-import type { DocRecord, LlmFields } from './enrich-types.js';
+import type { DocRecord } from './enrich-types.js';
 import { readFile } from 'node:fs/promises';
+import { relatedEqual } from './enrich-helpers.js';
 
 function liftFields(sync: any): { title: string; shortSummary: string | null; status: string | null; platform: string[]; strategicGoal: string[] } {
   return {
@@ -17,6 +18,7 @@ function liftFields(sync: any): { title: string; shortSummary: string | null; st
     strategicGoal: Array.isArray(sync?.strategic_goal) ? sync.strategic_goal : [],
   };
 }
+
 
 async function main(): Promise<number> {
   const cfg = loadEnrichConfig(process.env, readEnrichKey);
@@ -42,8 +44,10 @@ async function main(): Promise<number> {
     }
   }
 
-  // Phase 1: summarize docs that are new or whose body changed
+  // Phase 1: summarize docs that are new or whose body changed.
+  // Fix 2: write each enriched doc immediately for crash-durability.
   let enriched = 0, skipped = 0;
+
   for (const doc of docs) {
     const needs = doc.llm.summary === null || doc.llm.body_hash !== doc.bodyHash;
     if (!needs) { skipped++; continue; }
@@ -52,6 +56,14 @@ async function main(): Promise<number> {
       const s = await summarizeDoc(distilled, llm);
       doc.llm = { ...doc.llm, summary: s.summary, tags: s.tags, enriched_at: new Date().toISOString(), body_hash: doc.bodyHash };
       enriched++;
+      // Fix 2: write immediately so Phase-1 work survives a Phase-2 crash.
+      // doc.llm.related is unchanged from load (P1 does not touch related),
+      // so the on-disk file gets the current related plus the new summary/tags.
+      try {
+        await writeLlmBlock({ path: doc.path, sync: doc.syncRaw, body: doc.body, llm: doc.llm });
+      } catch (writeErr) {
+        errors.push(`write(p1) ${doc.stem}: ${(writeErr as Error).message}`);
+      }
     } catch (err) {
       errors.push(`summarize ${doc.stem}: ${(err as Error).message}`);
     }
@@ -63,21 +75,30 @@ async function main(): Promise<number> {
     .map((d) => ({ stem: d.stem, summary: d.llm.summary!, tags: d.llm.tags, platform: d.platform, strategicGoal: d.strategicGoal }));
   const relatedMap = await buildRelated(relatable, cfg.topK, (a, b) => judgeRelated(a, b, llm));
   let relatedPairs = 0;
+  let written = 0;
+
   for (const doc of docs) {
     const rel = relatedMap.get(doc.stem);
-    if (rel) { doc.llm.related = rel; relatedPairs += rel.length; }
-  }
-
-  // Write back every doc whose llm changed (enriched this run OR related changed)
-  for (const doc of docs) {
-    try {
-      await writeLlmBlock({ path: doc.path, sync: doc.syncRaw, body: doc.body, llm: doc.llm });
-    } catch (err) {
-      errors.push(`write ${doc.stem}: ${(err as Error).message}`);
+    if (rel) {
+      relatedPairs += rel.length;
+      const oldRelated = doc.llm.related;
+      if (!relatedEqual(oldRelated, rel)) {
+        // Fix 1 + Fix 2: only write if related actually changed.
+        // For docs written in P1 (p1WrittenRelated has entry), compare against
+        // what was on disk after the P1 write (which captured doc.llm.related
+        // at that moment — before rel was assigned). For others, compare in-memory.
+        doc.llm.related = rel;
+        try {
+          await writeLlmBlock({ path: doc.path, sync: doc.syncRaw, body: doc.body, llm: doc.llm });
+          written++;
+        } catch (err) {
+          errors.push(`write(p2) ${doc.stem}: ${(err as Error).message}`);
+        }
+      }
     }
   }
 
-  console.log(`enriched ${enriched} · skipped ${skipped} · related-links ${relatedPairs} · errors ${errors.length}`);
+  console.log(`enriched ${enriched} · skipped ${skipped} · related-links ${relatedPairs} · errors ${errors.length} · written ${written}`);
   if (errors.length) { console.error('Errors:\n' + errors.map((e) => '  - ' + e).join('\n')); return 1; }
   return 0;
 }
