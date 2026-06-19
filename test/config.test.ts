@@ -31,3 +31,14 @@ test('loadConfig parses MIN_BODY_CHARS and API_TIMEOUT_MS from env', () => {
   expect(cfg.minBodyChars).toBe(500);
   expect(cfg.apiTimeoutMs).toBe(60000);
 });
+
+test('loadConfig defaults pageConvertTimeoutMs=180000', () => {
+  const cfg = loadConfig(fakeEnv, () => 'secret-token');
+  expect(cfg.pageConvertTimeoutMs).toBe(180000);
+});
+
+test('loadConfig parses PAGE_CONVERT_TIMEOUT_MS from env', () => {
+  const env = { ...fakeEnv, PAGE_CONVERT_TIMEOUT_MS: '120000' } as NodeJS.ProcessEnv;
+  const cfg = loadConfig(env, () => 'secret-token');
+  expect(cfg.pageConvertTimeoutMs).toBe(120000);
+});

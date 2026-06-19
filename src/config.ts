@@ -10,6 +10,7 @@ export interface Config {
   stateFile: string;
   minBodyChars: number;
   apiTimeoutMs: number;
+  pageConvertTimeoutMs: number;
 }
 
 export function readKeychainToken(): string {
@@ -35,5 +36,6 @@ export function loadConfig(env: NodeJS.ProcessEnv, readToken: () => string): Con
     stateFile: env.STATE_FILE ?? '.sync-state.json',
     minBodyChars: env.MIN_BODY_CHARS ? Number(env.MIN_BODY_CHARS) : 300,
     apiTimeoutMs: env.API_TIMEOUT_MS ? Number(env.API_TIMEOUT_MS) : 30000,
+    pageConvertTimeoutMs: env.PAGE_CONVERT_TIMEOUT_MS ? Number(env.PAGE_CONVERT_TIMEOUT_MS) : 180000,
   };
 }

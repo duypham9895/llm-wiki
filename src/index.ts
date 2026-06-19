@@ -6,6 +6,7 @@ import { enumerateDatabase, resolveUsers } from './notion.js';
 import { classify } from './classify.js';
 import { filenameStem } from './naming.js';
 import { makeConverter, blocksToMarkdown, normalizeEscapes, resolveNotionLinks, buildSyncMeta, extractUniqueId } from './convert.js';
+import { withDeadline } from './timeout.js';
 import { hasRealContent } from './content.js';
 import { downloadImages } from './assets.js';
 import { writeMarkdown, archiveFile } from './writer.js';
@@ -51,7 +52,11 @@ async function main(): Promise<number> {
       if (kind === 'db-index') {
         body = `# ${item.title}\n\n_Notion database — rows not expanded._\n\n[Open in Notion](${item.url})\n`;
       } else {
-        const raw = await blocksToMarkdown(n2m, item.uuid);
+        const raw = await withDeadline(
+          blocksToMarkdown(n2m, item.uuid),
+          cfg.pageConvertTimeoutMs,
+          `convert ${item.title}`,
+        );
         body = resolveNotionLinks(normalizeEscapes(raw), { handleByUuid, urlByUuid });
       }
 
