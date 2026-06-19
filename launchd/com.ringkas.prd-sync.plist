@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ringkas.prd-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string>
+    <string>cd /Users/&lt;USER&gt;/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="&lt;VAULT_PATH&gt;" /opt/homebrew/bin/npm run sync</string>
+  </array>
+  <!-- Once per day, overnight. A full pass block-fetches all ~715 backlog rows
+       to content-gate them, so a run takes ~40 min; a single off-peak run avoids
+       overlapping invocations. Run `npm run sync` manually anytime for an on-demand sync. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>17</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/prd-sync.log</string>
+  <key>StandardErrorPath</key><string>/tmp/prd-sync.err.log</string>
+</dict>
+</plist>

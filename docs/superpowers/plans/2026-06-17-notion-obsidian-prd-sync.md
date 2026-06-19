@@ -689,7 +689,7 @@ git commit -m "feat: classify discovered items into kind + canonical"
 ```json
 {
   "Epic Name": { "type": "title", "title": [{ "plain_text": "PRD 2: Client Management" }] },
-  "userDefined:ID": { "type": "unique_id", "unique_id": { "prefix": "EP", "number": 827 } },
+  "ID": { "type": "unique_id", "unique_id": { "prefix": "EP", "number": 827 } },
   "Status": { "type": "status", "status": { "name": "Requirement in Progress" } },
   "Platform": { "type": "multi_select", "multi_select": [{ "name": "AI Agent" }] },
   "Strategic Goal": { "type": "multi_select", "multi_select": [{ "name": "RISA-NXT" }] },
@@ -808,7 +808,7 @@ export function buildSyncMeta(
     .filter((h): h is string => Boolean(h))
     .map((h) => `[[${h}]]`);
   return {
-    id: uniqueId(p, 'userDefined:ID') ?? item.uuid.slice(0, 8),
+    id: uniqueId(p, 'ID') ?? item.uuid.slice(0, 8),   // 'ID' = Notion API display-name key (NOT the MCP 'userDefined:ID')
     uuid: item.uuid,
     source_url: item.url,
     title: item.title,
@@ -1243,6 +1243,7 @@ export interface FsLike {
   writeFile: (p: string, d: string) => Promise<void>;
   rename: (a: string, b: string) => Promise<void>;
   mkdir: (p: string, opts?: any) => Promise<unknown>;
+  unlink: (p: string) => Promise<void>;
 }
 
 const defaultFs: FsLike = {
@@ -1250,6 +1251,7 @@ const defaultFs: FsLike = {
   writeFile: (p, d) => nodeFs.writeFile(p, d, 'utf8'),
   rename: (a, b) => nodeFs.rename(a, b),
   mkdir: (p, o) => nodeFs.mkdir(p, o),
+  unlink: (p) => nodeFs.unlink(p),
 };
 
 export async function writeMarkdown(opts: {
@@ -1284,6 +1286,7 @@ export async function archiveFile(opts: { dir: string; filename: string; fs?: Fs
   const tmp = join(archiveDir, `${opts.filename}.tmp`);
   await fs.writeFile(tmp, updated);
   await fs.rename(tmp, join(archiveDir, opts.filename));
+  await fs.unlink(src); // true move: delete source only AFTER archive copy is safely in place
 }
 ```
 
@@ -1393,6 +1396,12 @@ import { downloadImages } from './assets.js';
 import { writeMarkdown, archiveFile } from './writer.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 
+// Image URLs are S3-backed Notion signed URLs that can hang; bound each fetch
+// so one stalled download can't block an unattended cron run forever.
+const IMAGE_FETCH_TIMEOUT_MS = 30_000;
+const fetchWithTimeout: typeof fetch = (input, init) =>
+  fetch(input, { ...init, signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS) });
+
 async function main(): Promise<number> {
   const cfg = loadConfig(process.env, readKeychainToken);
   const notion = new Client({ auth: cfg.token });
@@ -1415,7 +1424,7 @@ async function main(): Promise<number> {
   const urlByUuid = new Map<string, string>();
   for (const it of items) {
     const { kind } = classify(it);
-    const id = (it.properties as any)?.['userDefined:ID']?.unique_id;
+    const id = (it.properties as any)?.['ID']?.unique_id;
     const idStr = id ? `${id.prefix ? id.prefix + '-' : ''}${id.number}` : null;
     handleByUuid.set(it.uuid, filenameStem({ kind, id: idStr, title: it.title, uuid: it.uuid }));
     urlByUuid.set(it.uuid, it.url);
@@ -1445,7 +1454,7 @@ async function main(): Promise<number> {
       const stem = handleByUuid.get(item.uuid)!;
       body = await downloadImages(body, {
         id: stem, attachmentsDir, vaultRelativePrefix: '_attachments',
-        fetchFn: fetch, writeFileFn: (p, d) => writeFile(p, d), mkdirFn: (p) => mkdir(p, { recursive: true }).then(() => {}),
+        fetchFn: fetchWithTimeout, writeFileFn: (p, d) => writeFile(p, d), mkdirFn: (p) => mkdir(p, { recursive: true }).then(() => {}),
       });
 
       const sync = buildSyncMeta(item, {
@@ -1624,3 +1633,216 @@ git commit -m "chore: launchd schedule, README, verified smoke run"
 **Type consistency:** `SyncMeta`/`LlmMeta`/`DiscoveredItem`/`SyncState` defined in Task 1 and used consistently. `filenameStem` signature matches between Tasks 4, 12. `writeMarkdown`/`archiveFile` signatures match Tasks 10, 12. `classify` return shape matches Tasks 6, 12. `buildSyncMeta` opts match Tasks 7, 12. ✓
 
 **Known follow-ups (intentionally deferred, not gaps):** `parent`/`sub_items` relation wikilinks and in-body `depends_on` extraction are scaffolded in `SyncMeta` (set to null/[] in Task 7/12) — full relation traversal is a refinement that can land after the core pipeline is green, since it needs the second-pass handle map which Task 12 already builds. Flag for the implementer: wire these once the smoke run confirms the core path.
+
+---
+
+## Task 14: Re-scope discovery (DB-only + body-content filter + API timeout)
+
+**Added 2026-06-18 after the Task 13 live smoke run.** The live run revealed that `/search "PRD"` returns **828** items (tickets/templates/subtasks) and the Product Backlog DB has **715** rows (**423** are "Not Started" stubs). The original "everything matching PRD" scope is unusable. Revised scope (spec §3, revised): **DB rows only, filtered to those with real body content**, with all API calls bounded by a timeout. See the spec's revised Decisions table.
+
+**Files:**
+- Modify: `src/index.ts` (drop search pass; construct client with timeout; add content-filter gate before write)
+- Create: `src/content.ts` (pure `hasRealContent` helper) + `test/content.test.ts`
+- Modify: `src/config.ts` (add `minBodyChars` + `apiTimeoutMs` settings) + `test/config.test.ts`
+
+**Interfaces:**
+- Produces: `hasRealContent(markdown: string, minChars: number): boolean` — strips frontmatter-irrelevant whitespace/markdown punctuation and returns true if the meaningful text length ≥ minChars.
+- `Config` gains `minBodyChars: number` (default 300) and `apiTimeoutMs: number` (default 30000).
+
+- [ ] **Step 1: Write the failing test for `hasRealContent`** (`test/content.test.ts`)
+
+```ts
+import { expect, test } from 'vitest';
+import { hasRealContent } from '../src/content.js';
+
+test('empty / whitespace-only body is not real content', () => {
+  expect(hasRealContent('', 300)).toBe(false);
+  expect(hasRealContent('   \n\n  \t ', 300)).toBe(false);
+});
+
+test('a stub heading alone is below threshold', () => {
+  expect(hasRealContent('# Title\n\n', 300)).toBe(false);
+});
+
+test('a substantial body is real content', () => {
+  const body = '# Background\n\n' + 'This PRD describes the disbursement flow in detail. '.repeat(20);
+  expect(hasRealContent(body, 300)).toBe(true);
+});
+
+test('counts visible text, not markdown punctuation', () => {
+  // 250 pipe/dash table-border chars but little real text → below 300
+  const tableNoise = '| --- | --- |\n'.repeat(20);
+  expect(hasRealContent(tableNoise, 300)).toBe(false);
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run test/content.test.ts`
+Expected: FAIL — cannot find `../src/content.js`.
+
+- [ ] **Step 3: Implement `src/content.ts`**
+
+```ts
+// Decide whether a converted page body has enough real prose to be worth syncing,
+// so 'Not Started' backlog stubs (empty bodies) are skipped.
+export function hasRealContent(markdown: string, minChars: number): boolean {
+  const meaningful = markdown
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')   // drop image embeds
+    .replace(/[#>*_`|\-\\]/g, ' ')          // drop markdown punctuation / table borders
+    .replace(/\s+/g, ' ')                   // collapse whitespace
+    .trim();
+  return meaningful.length >= minChars;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run test/content.test.ts`
+Expected: PASS (4 tests).
+
+- [ ] **Step 5: Add config settings** (modify `src/config.ts`)
+
+Add to the `Config` interface: `minBodyChars: number;` and `apiTimeoutMs: number;`. In `loadConfig`'s returned object add:
+```ts
+    minBodyChars: env.MIN_BODY_CHARS ? Number(env.MIN_BODY_CHARS) : 300,
+    apiTimeoutMs: env.API_TIMEOUT_MS ? Number(env.API_TIMEOUT_MS) : 30000,
+```
+Add a test to `test/config.test.ts` asserting the defaults (300 / 30000) and that env overrides parse to numbers.
+
+- [ ] **Step 6: Re-scope the orchestrator** (modify `src/index.ts`)
+
+1. Construct the client with a timeout so block fetches can't hang:
+   `const notion = new Client({ auth: cfg.token, timeoutMs: cfg.apiTimeoutMs });`
+2. **Drop the search pass.** Discovery becomes DB-only:
+   ```ts
+   const items = await enumerateDatabase(notion, cfg.databaseId);
+   const presentUuids = new Set(items.map((i) => i.uuid));
+   ```
+   (Remove the `Promise.all([... searchPrd ...])` and the `mergeDiscovery` call. `searchPrd`/`mergeDiscovery` remain exported for potential later use but are no longer called here.)
+3. After converting the body (`blocksToMarkdown` → normalize → resolveLinks) and BEFORE downloading images / writing, gate on content:
+   ```ts
+   if (!hasRealContent(body, cfg.minBodyChars)) { skipped++; continue; }
+   ```
+   A row that fails the gate is treated like a stub: not written, not added to `state.pages`. (Existing files whose row later drops below threshold are handled by the archive pass — they fall out of `presentUuids`? No: they are still in the DB. So instead: if a previously-synced uuid now fails the content gate, leave its existing file as-is — do NOT delete. Only `findRemoved` archives. A stub that never had content simply is never written.)
+4. The `kind === 'db-index'` branch is now dead (no database-type items from DB enumeration) but harmless; leave it.
+
+- [ ] **Step 7: Typecheck, full suite, commit**
+
+Run: `npm run typecheck && npm test`
+Expected: clean; all tests pass (including the new content + config tests).
+
+```bash
+git add src/content.ts test/content.test.ts src/config.ts test/config.test.ts src/index.ts
+git commit -m "feat: re-scope to DB-only discovery with body-content filter and API timeout"
+```
+
+- [ ] **Step 8: Live smoke run (re-verify end to end)**
+
+```bash
+rm -rf /tmp/smoke-vault /tmp/smoke-state.json
+VAULT_PATH=/tmp/smoke-vault STATE_FILE=/tmp/smoke-state.json npm run sync
+```
+Expected: completes within a few minutes (not hours), prints `synced N · skipped M · archived 0 · errors E` with a sane N (real PRDs + substantive epics, not 715), and a state file is written. Verify `EP-`-prefixed filenames, clean GFM tables, and that "Not Started" stubs were skipped.
+
+---
+
+## Task 15: Wall-clock timeout around page conversion
+
+**Added 2026-06-18 after Task 14's live run.** The run still stalled: `notion-to-md` converts a nested PRD by making **hundreds of sequential block-fetch calls**, so the client's per-request `timeoutMs` never trips even though the aggregate `blocksToMarkdown(page)` runs for many minutes (or hangs). The fix is a **wall-clock timeout around the entire conversion of one page** (`Promise.race`), generous enough not to kill a legitimately large PRD (PRD 2 is 423 KB and needs real time), but bounded so a hung page is abandoned and the run continues. Per the user's decision: no metadata pre-gate — every row is still attempted; the wall-clock timeout is what guarantees completion.
+
+**Files:**
+- Create: `src/timeout.ts` (pure `withDeadline` helper) + `test/timeout.test.ts`
+- Modify: `src/config.ts` (add `pageConvertTimeoutMs`, default 180000) + `test/config.test.ts`
+- Modify: `src/index.ts` (wrap `blocksToMarkdown` in `withDeadline`; a timeout counts as an item error and continues)
+
+**Interfaces:**
+- Produces: `withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T>` — rejects with an `Error('deadline exceeded after <ms>ms: <label>')` if `promise` doesn't settle within `ms`; otherwise resolves/rejects as `promise` does. The losing timer is cleared so the process can exit.
+- `Config` gains `pageConvertTimeoutMs: number` (default 180000).
+
+- [ ] **Step 1: Write the failing test** (`test/timeout.test.ts`)
+
+```ts
+import { expect, test, vi } from 'vitest';
+import { withDeadline } from '../src/timeout.js';
+
+test('resolves when the promise settles before the deadline', async () => {
+  await expect(withDeadline(Promise.resolve('ok'), 1000, 'x')).resolves.toBe('ok');
+});
+
+test('rejects with deadline error when the promise is too slow', async () => {
+  const slow = new Promise((r) => setTimeout(() => r('late'), 50));
+  await expect(withDeadline(slow, 5, 'convert page')).rejects.toThrow(/deadline exceeded after 5ms: convert page/);
+});
+
+test('propagates the original rejection when the promise fails fast', async () => {
+  await expect(withDeadline(Promise.reject(new Error('boom')), 1000, 'x')).rejects.toThrow('boom');
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run test/timeout.test.ts`
+Expected: FAIL — cannot find `../src/timeout.js`.
+
+- [ ] **Step 3: Implement `src/timeout.ts`**
+
+```ts
+// Bound a whole async operation by wall-clock time. notion-to-md's recursive
+// block fetch makes hundreds of sequential calls, so a per-request timeout does
+// not bound it — only a deadline around the entire promise does.
+export function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`deadline exceeded after ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run test/timeout.test.ts`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Add config setting** (modify `src/config.ts` + `test/config.test.ts`)
+
+Add to `Config`: `pageConvertTimeoutMs: number;`. In `loadConfig`'s returned object:
+```ts
+    pageConvertTimeoutMs: env.PAGE_CONVERT_TIMEOUT_MS ? Number(env.PAGE_CONVERT_TIMEOUT_MS) : 180000,
+```
+Add a config test asserting the default (180000) and an env override.
+
+- [ ] **Step 6: Wrap the conversion** (modify `src/index.ts`)
+
+Import `withDeadline` from `./timeout.js`. Replace:
+```ts
+const raw = await blocksToMarkdown(n2m, item.uuid);
+```
+with:
+```ts
+const raw = await withDeadline(
+  blocksToMarkdown(n2m, item.uuid),
+  cfg.pageConvertTimeoutMs,
+  `convert ${item.title}`,
+);
+```
+A timeout throws inside the existing per-item `try/catch`, so it is recorded in `errors[]` and the loop continues to the next row — the run always finishes. (The content-gate from Task 14 still runs on whatever body did convert.)
+
+- [ ] **Step 7: Typecheck, full suite, commit**
+
+Run: `npm run typecheck && npm test`
+Expected: clean; all tests pass.
+
+```bash
+git add src/timeout.ts test/timeout.test.ts src/config.ts test/config.test.ts src/index.ts
+git commit -m "feat: wall-clock timeout around page conversion so a nested page cannot stall the run"
+```
+
+- [ ] **Step 8: Live smoke run (final verification)**
+
+```bash
+rm -rf /tmp/smoke-vault /tmp/smoke-state.json
+VAULT_PATH=/tmp/smoke-vault STATE_FILE=/tmp/smoke-state.json PAGE_CONVERT_TIMEOUT_MS=120000 npm run sync
+```
+Expected: the run **completes** and prints `synced N · skipped M · archived 0 · errors E`. Pages that hang past the deadline appear in `errors` (acceptable — they are abandoned, not retried forever), substantive pages are written with `EP-` names + clean tables, stubs are skipped by the content gate, and a state file is written. A second run is idempotent (`synced 0 · skipped …`).
