@@ -1744,3 +1744,105 @@ rm -rf /tmp/smoke-vault /tmp/smoke-state.json
 VAULT_PATH=/tmp/smoke-vault STATE_FILE=/tmp/smoke-state.json npm run sync
 ```
 Expected: completes within a few minutes (not hours), prints `synced N · skipped M · archived 0 · errors E` with a sane N (real PRDs + substantive epics, not 715), and a state file is written. Verify `EP-`-prefixed filenames, clean GFM tables, and that "Not Started" stubs were skipped.
+
+---
+
+## Task 15: Wall-clock timeout around page conversion
+
+**Added 2026-06-18 after Task 14's live run.** The run still stalled: `notion-to-md` converts a nested PRD by making **hundreds of sequential block-fetch calls**, so the client's per-request `timeoutMs` never trips even though the aggregate `blocksToMarkdown(page)` runs for many minutes (or hangs). The fix is a **wall-clock timeout around the entire conversion of one page** (`Promise.race`), generous enough not to kill a legitimately large PRD (PRD 2 is 423 KB and needs real time), but bounded so a hung page is abandoned and the run continues. Per the user's decision: no metadata pre-gate — every row is still attempted; the wall-clock timeout is what guarantees completion.
+
+**Files:**
+- Create: `src/timeout.ts` (pure `withDeadline` helper) + `test/timeout.test.ts`
+- Modify: `src/config.ts` (add `pageConvertTimeoutMs`, default 180000) + `test/config.test.ts`
+- Modify: `src/index.ts` (wrap `blocksToMarkdown` in `withDeadline`; a timeout counts as an item error and continues)
+
+**Interfaces:**
+- Produces: `withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T>` — rejects with an `Error('deadline exceeded after <ms>ms: <label>')` if `promise` doesn't settle within `ms`; otherwise resolves/rejects as `promise` does. The losing timer is cleared so the process can exit.
+- `Config` gains `pageConvertTimeoutMs: number` (default 180000).
+
+- [ ] **Step 1: Write the failing test** (`test/timeout.test.ts`)
+
+```ts
+import { expect, test, vi } from 'vitest';
+import { withDeadline } from '../src/timeout.js';
+
+test('resolves when the promise settles before the deadline', async () => {
+  await expect(withDeadline(Promise.resolve('ok'), 1000, 'x')).resolves.toBe('ok');
+});
+
+test('rejects with deadline error when the promise is too slow', async () => {
+  const slow = new Promise((r) => setTimeout(() => r('late'), 50));
+  await expect(withDeadline(slow, 5, 'convert page')).rejects.toThrow(/deadline exceeded after 5ms: convert page/);
+});
+
+test('propagates the original rejection when the promise fails fast', async () => {
+  await expect(withDeadline(Promise.reject(new Error('boom')), 1000, 'x')).rejects.toThrow('boom');
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run test/timeout.test.ts`
+Expected: FAIL — cannot find `../src/timeout.js`.
+
+- [ ] **Step 3: Implement `src/timeout.ts`**
+
+```ts
+// Bound a whole async operation by wall-clock time. notion-to-md's recursive
+// block fetch makes hundreds of sequential calls, so a per-request timeout does
+// not bound it — only a deadline around the entire promise does.
+export function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`deadline exceeded after ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run test/timeout.test.ts`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Add config setting** (modify `src/config.ts` + `test/config.test.ts`)
+
+Add to `Config`: `pageConvertTimeoutMs: number;`. In `loadConfig`'s returned object:
+```ts
+    pageConvertTimeoutMs: env.PAGE_CONVERT_TIMEOUT_MS ? Number(env.PAGE_CONVERT_TIMEOUT_MS) : 180000,
+```
+Add a config test asserting the default (180000) and an env override.
+
+- [ ] **Step 6: Wrap the conversion** (modify `src/index.ts`)
+
+Import `withDeadline` from `./timeout.js`. Replace:
+```ts
+const raw = await blocksToMarkdown(n2m, item.uuid);
+```
+with:
+```ts
+const raw = await withDeadline(
+  blocksToMarkdown(n2m, item.uuid),
+  cfg.pageConvertTimeoutMs,
+  `convert ${item.title}`,
+);
+```
+A timeout throws inside the existing per-item `try/catch`, so it is recorded in `errors[]` and the loop continues to the next row — the run always finishes. (The content-gate from Task 14 still runs on whatever body did convert.)
+
+- [ ] **Step 7: Typecheck, full suite, commit**
+
+Run: `npm run typecheck && npm test`
+Expected: clean; all tests pass.
+
+```bash
+git add src/timeout.ts test/timeout.test.ts src/config.ts test/config.test.ts src/index.ts
+git commit -m "feat: wall-clock timeout around page conversion so a nested page cannot stall the run"
+```
+
+- [ ] **Step 8: Live smoke run (final verification)**
+
+```bash
+rm -rf /tmp/smoke-vault /tmp/smoke-state.json
+VAULT_PATH=/tmp/smoke-vault STATE_FILE=/tmp/smoke-state.json PAGE_CONVERT_TIMEOUT_MS=120000 npm run sync
+```
+Expected: the run **completes** and prints `synced N · skipped M · archived 0 · errors E`. Pages that hang past the deadline appear in `errors` (acceptable — they are abandoned, not retried forever), substantive pages are written with `EP-` names + clean tables, stubs are skipped by the content gate, and a state file is written. A second run is idempotent (`synced 0 · skipped …`).
