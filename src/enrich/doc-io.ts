@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import * as nodeFs from 'node:fs/promises';
-import { readdir } from 'node:fs/promises';
+import { readFile, writeFile, rename, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { parseExisting, composeFile } from '../frontmatter.js';
@@ -13,9 +12,9 @@ export interface FsLikeMin {
   rename: (a: string, b: string) => Promise<void>;
 }
 const defaultFs: FsLikeMin = {
-  readFile: (p) => nodeFs.readFile(p, 'utf8'),
-  writeFile: (p, d) => nodeFs.writeFile(p, d, 'utf8'),
-  rename: (a, b) => nodeFs.rename(a, b),
+  readFile: (p) => readFile(p, 'utf8'),
+  writeFile: (p, d) => writeFile(p, d, 'utf8'),
+  rename: (a, b) => rename(a, b),
 };
 
 export function hashBody(body: string): string {
@@ -45,8 +44,8 @@ export function splitFrontmatter(content: string): { sync: unknown; llm: LlmFiel
 export function buildLlmRaw(llm: LlmFields): string {
   // omit undefined bookkeeping keys for cleanliness
   const obj: Record<string, unknown> = { summary: llm.summary, tags: llm.tags, related: llm.related };
-  if (llm.enriched_at) obj.enriched_at = llm.enriched_at;
-  if (llm.body_hash) obj.body_hash = llm.body_hash;
+  if (llm.enriched_at !== undefined) obj.enriched_at = llm.enriched_at;
+  if (llm.body_hash !== undefined) obj.body_hash = llm.body_hash;
   return stringify({ llm: obj }, { lineWidth: 0 });
 }
 

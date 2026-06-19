@@ -60,3 +60,12 @@ test('writeLlmBlock fails safe on unparseable frontmatter (does not overwrite)',
   await expect(writeLlmBlock({ path: '/v/PRDs/EP-1.md', sync: {}, body: 'body', llm: { summary: 'x', tags: [], related: [] }, fs })).rejects.toThrow();
   expect(fs.files.get('/v/PRDs/EP-1.md')).toBe(broken); // untouched
 });
+
+test('buildLlmRaw includes enriched_at/body_hash when present, omits when undefined', () => {
+  const withFields = buildLlmRaw({ summary: 's', tags: ['a'], related: [], enriched_at: '2026-06-19T00:00:00Z', body_hash: 'abc' });
+  expect(withFields).toContain('enriched_at:');
+  expect(withFields).toContain('body_hash: abc');
+  const without = buildLlmRaw({ summary: 's', tags: ['a'], related: [] });
+  expect(without).not.toContain('enriched_at:');
+  expect(without).not.toContain('body_hash:');
+});
