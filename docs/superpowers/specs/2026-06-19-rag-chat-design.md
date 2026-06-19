@@ -1,5 +1,8 @@
 # RAG Chat (Sub-project C)
 
+> **SUPERSEDED 2026-06-19:** A 20-minute Open WebUI spike on the real corpus showed an off-the-shelf app delivers excellent grounded answers + inline [1] citations + a polished UI for ~zero build. Decision: **adopt Open WebUI** instead of this custom build. This spec is retained as the requirements rubric that defined 'what good looks like' and let us judge the spike. The accepted tradeoff: filename-only citations (no dual Notion+Obsidian links) and no B-enrichment use in retrieval. See `docs/superpowers/plans/2026-06-19-rag-chat-openwebui-setup.md`.
+
+
 **Date:** 2026-06-19
 **Status:** Design approved, pending implementation plan
 **Scope:** Sub-project C of the `llm-wiki-prd` initiative. A chat layer that answers questions over the enriched PRD corpus produced by A + B.
