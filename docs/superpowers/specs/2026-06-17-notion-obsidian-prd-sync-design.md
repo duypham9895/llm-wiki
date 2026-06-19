@@ -65,7 +65,7 @@ The "PRD database" is the Notion database **`🚀 Product Backlog (EPIC)`**
 | API timeout | **`@notionhq/client` constructed with `timeoutMs: 30000`** | **Added 2026-06-18 after live run:** a page's block fetch (via `notion-to-md`) hung with no timeout, stalling the whole unattended run. A client-level timeout bounds every API call. |
 | Archive trigger | **Only when a row is removed from Notion** (or drops below the content threshold) | `Released`/`Cancelled` PRDs are valid shipped-feature docs; keep them. A row that loses its body falls out of the synced set like a removal. |
 | Images | **Download locally** to `_attachments/<id>/`, each fetch bounded by a 30s timeout | Notion signed URLs expire ~1h; local copies render forever and are RAG-safe. A hung image download cannot stall the run. |
-| Schedule | **A few times/day via launchd**, incremental | launchd is more reliable than crontab on a sleeping laptop. Incremental via `last_edited`. |
+| Schedule | **Once/day overnight via launchd**, incremental | **Revised 2026-06-18 after live run:** a full pass block-fetches all ~715 backlog rows to content-gate them (~40 min), so a single off-peak run (3:17am) avoids overlapping invocations. launchd survives laptop sleep; incremental via `last_edited`. On-demand `npm run sync` anytime. A cheap metadata pre-gate (skip no-summary + Not-Started rows) is the known lever to shorten this if more frequent runs are wanted later. |
 | Manual run | Also runnable as `npm run sync` | On-demand force sync alongside the schedule. |
 
 ### Confirmed assumptions
