@@ -26,6 +26,11 @@ if [ -z "$KBID" ]; then
 fi
 echo "KB: $KBID"
 
+# Idempotent reload: clear the KB's existing files first so re-runs UPDATE rather than
+# DUPLICATE. POST /knowledge/{id}/reset removes all files from the collection.
+curl -s -X POST "$BASE/api/v1/knowledge/${KBID}/reset" -H "authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+echo "cleared KB before reload"
+
 n=0; fail=0
 for f in "$VAULT_PRDS"/*.md; do
   base=$(basename "$f"); case "$base" in _*) continue;; esac
@@ -37,4 +42,12 @@ for f in "$VAULT_PRDS"/*.md; do
   n=$((n+1)); printf "\r[%d] loaded  " "$n"
 done
 echo ""
+
+# Ensure the KB stays public-read so the shared PRD Assistant model can retrieve it for
+# all users (reset clears files, not grants, but re-assert to be safe + self-contained).
+curl -s -X POST "$BASE/api/v1/knowledge/${KBID}/update" -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"name":"PRDs","description":"Ringkas PRD corpus","access_control":null,"access_grants":[{"principal_type":"user","principal_id":"*","permission":"read"}]}' \
+  >/dev/null 2>&1 || true
+
 echo "loaded $n PRDs into KB $KBID (failures: $fail)"

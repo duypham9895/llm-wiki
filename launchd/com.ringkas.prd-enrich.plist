@@ -3,13 +3,15 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.ringkas.prd-enrich</string>
+  <!-- Runs after A's sync (11:00, ~40 min). Absolute Volta npm path; real vault.
+       MiniMax router, model minimax/MiniMax-M3, with stream:false handled in code. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string><string>-lc</string>
-    <string>cd /Users/&lt;USER&gt;/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="&lt;VAULT_PATH&gt;" LLM_BASE_URL="&lt;LLM_BASE_URL&gt;" LLM_MODEL="MiniMax-M2" /opt/homebrew/bin/npm run enrich</string>
+    <string>cd /Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="/Users/edwardpham/Documents/Backup/Obsidian/ringkas" LLM_BASE_URL="https://9router-1.dat-nguyen.me/v1" LLM_MODEL="minimax/MiniMax-M3" /Users/edwardpham/.volta/bin/npm run enrich</string>
   </array>
   <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>23</integer></dict>
+  <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
   <key>StandardOutPath</key><string>/tmp/prd-enrich.log</string>
   <key>StandardErrorPath</key><string>/tmp/prd-enrich.err.log</string>
 </dict>

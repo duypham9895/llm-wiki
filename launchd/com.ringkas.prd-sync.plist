@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.ringkas.prd-sync</string>
+  <!-- Runs while the Mac is awake (laptop sleeps overnight, so daytime not 3am).
+       A full sync takes ~40 min; finishes well before B at 11:45.
+       Absolute paths only — launchd has a minimal env (no shell PATH, node is Volta-managed). -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string><string>-lc</string>
-    <string>cd /Users/&lt;USER&gt;/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="&lt;VAULT_PATH&gt;" /opt/homebrew/bin/npm run sync</string>
+    <string>cd /Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; VAULT_PATH="/Users/edwardpham/Documents/Backup/Obsidian/ringkas" /Users/edwardpham/.volta/bin/npm run sync</string>
   </array>
-  <!-- Once per day, overnight. A full pass block-fetches all ~715 backlog rows
-       to content-gate them, so a run takes ~40 min; a single off-peak run avoids
-       overlapping invocations. Run `npm run sync` manually anytime for an on-demand sync. -->
   <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>17</integer></dict>
+  <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
   <key>StandardOutPath</key><string>/tmp/prd-sync.log</string>
   <key>StandardErrorPath</key><string>/tmp/prd-sync.err.log</string>
 </dict>

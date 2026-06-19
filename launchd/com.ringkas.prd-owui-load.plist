@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ringkas.prd-owui-load</string>
+  <!-- Runs after B's enrich (11:45). Clears + reloads the Open WebUI "PRDs" knowledge base
+       from the real vault (idempotent: load_prds.sh resets the KB first, so no duplicates).
+       Re-embeds via OpenAI. The Open WebUI container must be running. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string>
+    <string>cd /Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki &amp;&amp; OWUI_EMAIL="duy@ringkas.local" OWUI_PASS="ringkas-prd" ./chat-owui/load_prds.sh "/Users/edwardpham/Documents/Backup/Obsidian/ringkas/PRDs"</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>10</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/prd-owui-load.log</string>
+  <key>StandardErrorPath</key><string>/tmp/prd-owui-load.err.log</string>
+</dict>
+</plist>
