@@ -33,7 +33,7 @@ Corpus size: ~132 PRDs, bodies 1.4 KB – 175 KB.
 |---|---|---|
 | Interface | **Chainlit web chat** | Browser Q&A with citations; matches the user's prior `chainlit-qna-ringkas` / `llm-pdf-qa-workshop` projects. |
 | Language/stack | **Python** (Chainlit + ChromaDB) | C's stack; the vault is the language-neutral seam with A/B. |
-| Embedding source | **User's MiniMax endpoint** (OpenAI-compatible `/v1/embeddings`) | One provider for embeddings + chat. **Risk, verified early:** many chat routers lack an embeddings endpoint — a one-call probe runs before building the indexer (see §7). Isolated behind `llm.py` so the source is swappable (e.g. local `sentence-transformers`) if absent. |
+| Embedding source | **OpenAI `text-embedding-3-small`, called directly** (1536-dim) | **Revised 2026-06-19 after the day-one probe:** the MiniMax router exposes 32 models, ALL chat/generation — none embed (`/v1/embeddings` errors `No credentials for provider: openai`). So embeddings use OpenAI directly (key in keychain `ringkas-prd-embed`/`openai-api-key`), while chat/answers stay on the MiniMax router. Probe-verified: returns 1536-dim vectors, ~6 tokens/short-string. Isolated behind `llm.py` (two credentials: OpenAI for embed, MiniMax for chat). |
 | Vector store | **ChromaDB** (local, persistent) | Used in the user's prior project; on-disk persistence + metadata filtering; ideal for 132 docs, zero infra. |
 | What to embed | **Body chunks + the B summary**, per doc | Chunks catch detail; the summary catches gist. Both carry full metadata. |
 | Retrieval (v1) | **Pure vector top-k** (default k=8), dedupe to distinct PRDs | YAGNI: vector search alone handles most questions at this scale. Metadata IS stored, so adding tag/status pre-filtering later needs no re-index. |
@@ -41,9 +41,9 @@ Corpus size: ~132 PRDs, bodies 1.4 KB – 175 KB.
 | Citations | **Title + Notion `source_url` + `[[Obsidian stem]]`**, built by code from metadata | Maximally traceable; deterministic links (never LLM-generated → never hallucinated). |
 | Indexing | **Separate incremental indexer** (`python -m chat.index`) | Re-embeds only docs whose `body_hash` changed; chained after the A+B nightly pipeline. The chat app only queries the pre-built store (fast startup). |
 
-### To confirm before / during implementation
-1. That the MiniMax endpoint exposes an OpenAI-compatible **`/v1/embeddings`** (base URL `https://9router-1.dat-nguyen.me/v1`). Probed on day one of implementation; if absent, swap the embedding source in `llm.py` only.
-2. The exact **embedding model id** the endpoint expects.
+### Resolved by the day-one probe (no longer open)
+1. ✅ MiniMax router has **no embedding model** (32 models, all chat) → embeddings use **OpenAI `text-embedding-3-small`** directly (1536-dim, probe-verified).
+2. ✅ Two credentials: OpenAI key (`ringkas-prd-embed`/`openai-api-key`) for embeddings; MiniMax key (`ringkas-prd-enrich`/`llm-api-key`) for chat answers. Both keychain-stored and verified.
 
 ---
 
@@ -179,7 +179,7 @@ No live LLM/embedding calls in the automated suite — the live MiniMax behavior
 
 ## 9. One-Time Setup (prerequisite for implementation)
 
-1. Confirm the embedding endpoint: probe `POST {base}/v1/embeddings` (base `https://9router-1.dat-nguyen.me/v1`) and capture the **embedding model id**. If absent, switch `llm.py`'s embed path to a local model (`sentence-transformers`) — no other module changes.
-2. The LLM API key is already in the keychain (`ringkas-prd-enrich` / `llm-api-key`, shared with B) — or store a C-specific entry if preferred.
+1. ✅ Done: probe confirmed the router has no embedding model; embeddings use OpenAI `text-embedding-3-small` directly. Store the OpenAI key: `security add-generic-password -s ringkas-prd-embed -a openai-api-key -w 'sk-...'` (done & verified).
+2. The MiniMax chat key is already in the keychain (`ringkas-prd-enrich` / `llm-api-key`, shared with B). C reads TWO keys: OpenAI (embeddings) + MiniMax (chat).
 3. Python env (Poetry, as in the prior project) with `chainlit`, `chromadb`, an HTTP client, `pytest`.
 4. Capture vault path + base URL + model ids + Chroma path into `config.py` settings.
