@@ -78,6 +78,12 @@ async function main(): Promise<number> {
         dependsOnUuids: [], trdRefs: [], syncedAt,
       });
       const filename = await writeMarkdown({ dir: prdsDir, stem, sync, body });
+      if (filename === null) {
+        // Fail-safe skip (spec §7): existing file's llm block was unparseable, so it was
+        // not overwritten. Leave its prior state entry untouched and count it as skipped.
+        skipped++;
+        continue;
+      }
       state.pages[item.uuid] = { id: sync.id, filename, last_edited: item.lastEdited, synced_at: syncedAt, kind };
       synced++;
     } catch (err) {

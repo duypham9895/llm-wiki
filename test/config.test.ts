@@ -8,7 +8,6 @@ test('loadConfig fills defaults and injected token', () => {
   expect(cfg.token).toBe('secret-token');
   expect(cfg.databaseId).toBe('3f6ac861-35fd-48d0-9252-99a9e202b776');
   expect(cfg.vaultPath).toBe('/tmp/vault');
-  expect(cfg.searchTerm).toBe('PRD');
 });
 
 test('loadConfig throws when vault path missing', () => {

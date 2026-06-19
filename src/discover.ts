@@ -1,5 +1,6 @@
 import type { DiscoveredItem } from './types.js';
 
+// NOTE: not currently called — DB-only discovery (see spec §3, revised 2026-06-18). Retained for a possible future search-based scope.
 export function mergeDiscovery(
   dbItems: DiscoveredItem[], searchItems: DiscoveredItem[],
 ): DiscoveredItem[] {

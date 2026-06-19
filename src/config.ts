@@ -6,7 +6,6 @@ export interface Config {
   collectionId: string;
   parentPageId: string;
   vaultPath: string;
-  searchTerm: string;
   stateFile: string;
   minBodyChars: number;
   apiTimeoutMs: number;
@@ -32,7 +31,6 @@ export function loadConfig(env: NodeJS.ProcessEnv, readToken: () => string): Con
     collectionId: 'cc477810-e934-412f-b99b-16f4029fba6c',
     parentPageId: 'ff996b90-3c40-4b76-a40d-ad92bae7a1d7',
     vaultPath,
-    searchTerm: 'PRD',
     stateFile: env.STATE_FILE ?? '.sync-state.json',
     minBodyChars: env.MIN_BODY_CHARS ? Number(env.MIN_BODY_CHARS) : 300,
     apiTimeoutMs: env.API_TIMEOUT_MS ? Number(env.API_TIMEOUT_MS) : 30000,

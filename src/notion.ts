@@ -47,6 +47,7 @@ export async function enumerateDatabase(notion: Client, databaseId: string): Pro
   return out;
 }
 
+// NOTE: not currently called — DB-only discovery (see spec §3, revised 2026-06-18). Retained for a possible future search-based scope.
 export async function searchPrd(notion: Client, term: string): Promise<DiscoveredItem[]> {
   const out: DiscoveredItem[] = [];
   let cursor: string | undefined;

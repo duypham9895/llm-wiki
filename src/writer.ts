@@ -21,16 +21,27 @@ const defaultFs: FsLike = {
 
 export async function writeMarkdown(opts: {
   dir: string; stem: string; sync: SyncMeta; body: string; fs?: FsLike;
-}): Promise<string> {
+}): Promise<string | null> {
   const fs = opts.fs ?? defaultFs;
   const filename = `${opts.stem}.md`;
   const path = join(opts.dir, filename);
   let llmRaw: string | null = null;
   try {
     const existing = await fs.readFile(path);
-    llmRaw = parseExisting(existing).llmRaw;
+    const parsed = parseExisting(existing);
+    if (parsed.parseError) {
+      // Spec §7: the file EXISTS but its frontmatter/llm block could not be parsed.
+      // Fail safe — do NOT overwrite (that would silently destroy B's enrichment).
+      // Log and skip; the caller must treat a null return as "skipped".
+      console.error(
+        `[writer] SKIP ${path}: existing frontmatter is unparseable — not overwriting to preserve the llm block (spec §7).`,
+      );
+      return null;
+    }
+    llmRaw = parsed.llmRaw;
   } catch (err: any) {
     if (err.code !== 'ENOENT') throw err; // never silently swallow real read errors
+    // ENOENT = file does not exist = first write = fine (scaffold a fresh llm block).
   }
   await fs.mkdir(opts.dir, { recursive: true });
   const content = composeFile(opts.sync, llmRaw, opts.body);

@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { writeMarkdown, archiveFile } from '../src/writer.js';
 import type { SyncMeta } from '../src/types.js';
 
@@ -44,6 +44,32 @@ test('re-write preserves hand-edited llm block', async () => {
   expect(content).toContain('B wrote this');
   expect(content).toContain('# v2');
   expect(content).not.toContain('# v1');
+});
+
+test('I2: existing file with malformed frontmatter is NOT overwritten (fail safe, spec §7)', async () => {
+  const fs = memFs();
+  const path = '/PRDs/EP-1-t.md';
+  // An existing file whose frontmatter cannot be parsed (would lose B's llm if scaffolded over).
+  const original = '---\nsync:\n  id: x\n bad: : :\nllm:\n  summary: "B owns this"\n---\n\n# Precious body\n';
+  fs.files.set(path, original);
+
+  const errs: string[] = [];
+  const spy = vi.spyOn(console, 'error').mockImplementation((m: any) => { errs.push(String(m)); });
+  try {
+    const result = await writeMarkdown({ dir: '/PRDs', stem: 'EP-1-t', sync, body: '# Overwrite attempt\n', fs });
+    // Signals the skip:
+    expect(result).toBeNull();
+  } finally {
+    spy.mockRestore();
+  }
+  // Original bytes are untouched — the file was NOT overwritten.
+  expect(fs.files.get(path)).toBe(original);
+  expect(fs.files.get(path)).toContain('B owns this');
+  expect(fs.files.get(path)).not.toContain('Overwrite attempt');
+  // No .tmp left behind:
+  expect(fs.files.has(`${path}.tmp`)).toBe(false);
+  // A clear warning naming the file was logged to stderr:
+  expect(errs.some((e) => e.includes(path))).toBe(true);
 });
 
 test('archiveFile moves file (source deleted, archive written with removed_from_notion: true)', async () => {
