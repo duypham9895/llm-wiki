@@ -38,23 +38,29 @@ export function makeLlmClient(cfg: {
   const sleepFn = cfg.sleepFn ?? defaultSleep;
 
   async function callOnce(messages: ChatMessage[]): Promise<unknown> {
-    const res = (await withDeadline(
-      fetchFn(`${cfg.baseUrl}/chat/completions`, {
+    const controller = new AbortController();
+    const doCall = async (): Promise<unknown> => {
+      const res = await fetchFn(`${cfg.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
         body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2, stream: false }),
-      }),
-      cfg.llmTimeoutMs,
-      'llm chat',
-    )) as Response;
-    if (!res.ok) {
-      const e: any = new Error(`llm http ${res.status}`);
-      e.status = res.status;
-      throw e;
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const e: any = new Error(`llm http ${res.status}`);
+        e.status = res.status;
+        throw e;
+      }
+      const data: any = await res.json();      // now INSIDE the deadline
+      const content: string = data?.choices?.[0]?.message?.content ?? '';
+      return extractJson(content);
+    };
+    try {
+      return await withDeadline(doCall(), cfg.llmTimeoutMs, 'llm chat');
+    } catch (err) {
+      controller.abort();  // close the socket when the deadline (or anything) fails the call
+      throw err;
     }
-    const data: any = await res.json();
-    const content: string = data?.choices?.[0]?.message?.content ?? '';
-    return extractJson(content);
   }
 
   return {

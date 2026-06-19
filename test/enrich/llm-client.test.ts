@@ -66,3 +66,16 @@ test('request body explicitly disables streaming (stream: false)', async () => {
   expect(sentBody.stream).toBe(false);
   expect(sentBody.model).toBe('m');
 });
+
+test('a hung body read is bounded by the deadline (does not hang forever)', async () => {
+  const fetchFn = (async () => ({
+    ok: true,
+    status: 200,
+    json: () => new Promise(() => {}), // never resolves — simulates a stalled body
+  })) as unknown as typeof fetch;
+  type Out = { summary: string };
+  const isOut = (v: unknown): v is Out => typeof v === 'object' && v !== null && typeof (v as any).summary === 'string';
+  const c = makeLlmClient({ apiKey: 'k', baseUrl: 'https://x/v1', model: 'm', llmTimeoutMs: 30, maxRetries: 1, fetchFn, sleepFn: async () => {} });
+  await expect(c.chatJSON<Out>([{ role: 'user', content: 'hi' }], { validate: isOut, label: 't' }))
+    .rejects.toThrow(/deadline exceeded/);
+});
