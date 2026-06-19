@@ -23,3 +23,25 @@ Logs: `/tmp/prd-sync.log`, `/tmp/prd-sync.err.log`.
 ## Output
 `PRDs/*.md` (one file per PRD), `PRDs/_attachments/<id>/`, `PRDs/_Archive/`.
 `sync.*` frontmatter is owned by this tool; `llm.*` is reserved for enrichment and never overwritten.
+
+## Enrichment (sub-project B)
+
+After A syncs, B fills each PRD's `llm:` frontmatter block with an LLM summary,
+tags, and related-PRD backlinks.
+
+### Setup (once)
+Store the LLM API key: `security add-generic-password -s ringkas-prd-enrich -a llm-api-key -w '<KEY>'`
+
+### Run
+```bash
+VAULT_PATH="/path/to/Vault" LLM_BASE_URL="https://your-endpoint/v1" LLM_MODEL="MiniMax-M2" npm run enrich
+```
+
+### Schedule
+`launchd/com.ringkas.prd-enrich.plist` runs at 04:23 (after A's 03:17 sync). Edit the placeholders, then:
+```bash
+cp launchd/com.ringkas.prd-enrich.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.ringkas.prd-enrich.plist
+```
+
+B only writes the `llm:` block; A's `sync:` block and body are never touched.
