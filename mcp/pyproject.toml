@@ -11,6 +11,12 @@ mcp = "^1.2.0"
 chromadb = "^0.5.0"
 httpx = "^0.27.0"
 pyyaml = "^6.0"
+# chromadb 0.5.x hard-requires onnxruntime (for its built-in embedder, which we
+# never use — we embed via OpenAI). Pin to versions with published macOS arm64
+# wheels and a numpy<2 ABI so a fresh `poetry install` is reproducible and the
+# import is clean (onnxruntime 1.16.x was built against numpy 1.x).
+numpy = "<2"
+onnxruntime = "<1.17"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
