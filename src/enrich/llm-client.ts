@@ -42,7 +42,7 @@ export function makeLlmClient(cfg: {
       fetchFn(`${cfg.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
-        body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2 }),
+        body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2, stream: false }),
       }),
       cfg.llmTimeoutMs,
       'llm chat',

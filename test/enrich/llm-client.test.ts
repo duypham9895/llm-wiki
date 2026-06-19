@@ -54,3 +54,15 @@ test('timeout/infra error fails fast without content-retries', async () => {
   ).rejects.toThrow('the operation timed out');
   expect(callCount).toBe(1);
 });
+
+test('request body explicitly disables streaming (stream: false)', async () => {
+  let sentBody: any = null;
+  const fetchFn = (async (_url: string, init: any) => {
+    sentBody = JSON.parse(init.body);
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"summary":"ok"}' } }] }) };
+  }) as unknown as typeof fetch;
+  const c = makeLlmClient({ apiKey: 'k', baseUrl: 'https://x/v1', model: 'm', llmTimeoutMs: 1000, maxRetries: 2, fetchFn, sleepFn: async () => {} });
+  await c.chatJSON<Out>([{ role: 'user', content: 'hi' }], { validate: isOut, label: 't' });
+  expect(sentBody.stream).toBe(false);
+  expect(sentBody.model).toBe('m');
+});
