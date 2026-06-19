@@ -83,10 +83,11 @@ async function main(): Promise<number> {
       relatedPairs += rel.length;
       const oldRelated = doc.llm.related;
       if (!relatedEqual(oldRelated, rel)) {
-        // Fix 1 + Fix 2: only write if related actually changed.
-        // For docs written in P1 (p1WrittenRelated has entry), compare against
-        // what was on disk after the P1 write (which captured doc.llm.related
-        // at that moment — before rel was assigned). For others, compare in-memory.
+        // Dirty-gate: only write in Phase 2 if the computed related[] differs from
+        // what this doc already had (oldRelated, captured above before reassignment).
+        // Docs whose related is unchanged are not rewritten here; a doc enriched in
+        // Phase 1 was already persisted with its summary/tags, so its final on-disk
+        // state stays complete whether or not this Phase-2 write fires.
         doc.llm.related = rel;
         try {
           await writeLlmBlock({ path: doc.path, sync: doc.syncRaw, body: doc.body, llm: doc.llm });
