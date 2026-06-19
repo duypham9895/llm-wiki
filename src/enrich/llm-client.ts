@@ -9,13 +9,25 @@ export interface LlmClient {
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Extract the first JSON object from a model response (tolerates ```json fences / prose).
+// Throws an error tagged with contentInvalid=true when the content cannot be parsed,
+// so the retry classifier can distinguish parse failures from infra/timeout errors.
 function extractJson(content: string): unknown {
   const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = fenced ? fenced[1] : content;
   const start = candidate.indexOf('{');
   const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1 || end < start) throw new Error('no JSON object in response');
-  return JSON.parse(candidate.slice(start, end + 1));
+  if (start === -1 || end === -1 || end < start) {
+    const e: any = new Error('no JSON object in response');
+    e.contentInvalid = true;
+    throw e;
+  }
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch (parseErr: any) {
+    const e: any = new Error('JSON parse error: ' + parseErr.message);
+    e.contentInvalid = true;
+    throw e;
+  }
 }
 
 export function makeLlmClient(cfg: {
@@ -53,11 +65,14 @@ export function makeLlmClient(cfg: {
         try {
           const parsed = await callOnce(msgs);
           if (opts.validate(parsed)) return parsed;
-          throw new Error(`validation failed: ${opts.label}`);
+          // Validation failure: tag it so the classifier treats it as a content failure.
+          const ve: any = new Error(`validation failed: ${opts.label}`);
+          ve.contentInvalid = true;
+          throw ve;
         } catch (err: any) {
           const status = err?.status;
           const httpRetriable = status === 429 || (typeof status === 'number' && status >= 500);
-          const contentRetriable = !status; // parse/validate failure
+          const contentRetriable = err?.contentInvalid === true; // ONLY explicitly tagged parse/validation failures
           if (attempt >= cfg.maxRetries || (!httpRetriable && !contentRetriable)) throw err;
           if (contentRetriable) {
             msgs = [...messages, { role: 'user', content: 'Your previous reply was not valid JSON matching the requested schema. Reply with ONLY the JSON object.' }];

@@ -41,3 +41,16 @@ test('retries on HTTP 500 then succeeds', async () => {
   const r = await c.chatJSON<Out>([{ role: 'user', content: 'hi' }], { validate: isOut, label: 't' });
   expect(r.summary).toBe('ok');
 });
+
+test('timeout/infra error fails fast without content-retries', async () => {
+  let callCount = 0;
+  const fetchFn = (async () => {
+    callCount++;
+    throw new Error('the operation timed out');
+  }) as unknown as typeof fetch;
+  const c = makeLlmClient({ apiKey: 'k', baseUrl: 'https://x/v1', model: 'm', llmTimeoutMs: 1000, maxRetries: 3, fetchFn, sleepFn: async () => {} });
+  await expect(
+    c.chatJSON<Out>([{ role: 'user', content: 'hi' }], { validate: isOut, label: 't' }),
+  ).rejects.toThrow('the operation timed out');
+  expect(callCount).toBe(1);
+});
