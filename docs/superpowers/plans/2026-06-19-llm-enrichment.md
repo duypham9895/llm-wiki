@@ -543,11 +543,18 @@ export function makeLlmClient(cfg: {
         try {
           const parsed = await callOnce(msgs);
           if (opts.validate(parsed)) return parsed;
-          throw new Error(`validation failed: ${opts.label}`);
+          const ve: any = new Error(`validation failed: ${opts.label}`);
+          ve.contentInvalid = true; // tag genuine validation failures (see note)
+          throw ve;
         } catch (err: any) {
           const status = err?.status;
           const httpRetriable = status === 429 || (typeof status === 'number' && status >= 500);
-          const contentRetriable = !status; // parse/validate failure
+          // CORRECTION (found in B-Task-5 review): use an explicit `contentInvalid` tag, NOT `!status`.
+          // `!status` wrongly classifies a withDeadline TIMEOUT (no .status) as a content failure, retrying
+          // it with a bogus "return valid JSON" message and burning the retry budget. extractJson's parse
+          // failures and the validation failure above must set `err.contentInvalid = true`; a timeout/infra
+          // error has neither .status nor .contentInvalid, so it propagates fail-fast. See committed code.
+          const contentRetriable = err?.contentInvalid === true;
           if (attempt >= cfg.maxRetries || (!httpRetriable && !contentRetriable)) throw err;
           if (contentRetriable) {
             msgs = [...messages, { role: 'user', content: 'Your previous reply was not valid JSON matching the requested schema. Reply with ONLY the JSON object.' }];
