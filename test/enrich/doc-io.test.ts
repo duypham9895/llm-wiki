@@ -1,0 +1,62 @@
+import { expect, test } from 'vitest';
+import { hashBody, splitFrontmatter, buildLlmRaw, writeLlmBlock } from '../../src/enrich/doc-io.js';
+
+const fileWith = (llmLines: string) =>
+`---
+sync:
+  id: EP-1
+  uuid: u
+  title: "T"
+  status: In Development
+${''}llm:
+${llmLines}---
+
+# Body line
+more body
+`;
+
+test('splitFrontmatter pulls sync, llm, and body', () => {
+  const content = fileWith('  summary: null\n  tags: []\n  related: []\n');
+  const { sync, llm, body } = splitFrontmatter(content);
+  expect((sync as any).id).toBe('EP-1');
+  expect(llm.summary).toBeNull();
+  expect(body).toContain('# Body line');
+});
+
+test('hashBody is stable and content-sensitive', () => {
+  expect(hashBody('a')).toBe(hashBody('a'));
+  expect(hashBody('a')).not.toBe(hashBody('b'));
+});
+
+function memFs() {
+  const files = new Map<string, string>();
+  return {
+    files,
+    readFile: async (p: string) => { if (!files.has(p)) { const e: any = new Error('no'); e.code = 'ENOENT'; throw e; } return files.get(p)!; },
+    writeFile: async (p: string, d: string) => { files.set(p, d); },
+    rename: async (a: string, b: string) => { files.set(b, files.get(a)!); files.delete(a); },
+  };
+}
+
+test('writeLlmBlock replaces only the llm block; sync and body survive', async () => {
+  const fs = memFs();
+  const original = fileWith('  summary: null\n  tags: []\n  related: []\n');
+  fs.files.set('/v/PRDs/EP-1.md', original);
+  const { sync, body } = splitFrontmatter(original);
+  await writeLlmBlock({ path: '/v/PRDs/EP-1.md', sync, body, llm: { summary: 'done', tags: ['saudi'], related: ['[[EP-2]]'], enriched_at: '2026-06-19T00:00:00Z', body_hash: 'abc' }, fs });
+  const out = fs.files.get('/v/PRDs/EP-1.md')!;
+  expect(out).toContain('summary: done');
+  expect(out).toContain('saudi');
+  expect(out).toContain('[[EP-2]]');
+  expect(out).toContain('id: EP-1');       // sync survived
+  expect(out).toContain('# Body line');    // body survived
+  expect(out).toContain('more body');
+});
+
+test('writeLlmBlock fails safe on unparseable frontmatter (does not overwrite)', async () => {
+  const fs = memFs();
+  const broken = '---\nsync:\n  id: EP-1\n   bad-indent: x\nllm:\n  summary: null\n---\nbody\n';
+  fs.files.set('/v/PRDs/EP-1.md', broken);
+  await expect(writeLlmBlock({ path: '/v/PRDs/EP-1.md', sync: {}, body: 'body', llm: { summary: 'x', tags: [], related: [] }, fs })).rejects.toThrow();
+  expect(fs.files.get('/v/PRDs/EP-1.md')).toBe(broken); // untouched
+});
