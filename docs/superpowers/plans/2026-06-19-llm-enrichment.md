@@ -515,24 +515,37 @@ export function makeLlmClient(cfg: {
   const fetchFn = cfg.fetchFn ?? fetch;
   const sleepFn = cfg.sleepFn ?? defaultSleep;
 
+  // CORRECTIONS (found by B-Task-11 live run):
+  // 1. `stream: false` — the user's router defaults to SSE streaming; without this it returns
+  //    `data: {...chunk}` and res.json() throws. With it, a normal buffered JSON body.
+  // 2. The deadline must wrap the WHOLE call (fetch + res.json() body read), not just the fetch.
+  //    fetch resolves on HEADERS; if the endpoint sends 200 then stalls mid-body, res.json() hung
+  //    forever outside the deadline (caused a 15-min idle hang on the live run).
+  // 3. Pass an AbortSignal and abort() on failure so a stalled socket is actually closed, not leaked.
   async function callOnce(messages: ChatMessage[]): Promise<unknown> {
-    const res = (await withDeadline(
-      fetchFn(`${cfg.baseUrl}/chat/completions`, {
+    const controller = new AbortController();
+    const doCall = async (): Promise<unknown> => {
+      const res = await fetchFn(`${cfg.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
-        body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2 }),
-      }),
-      cfg.llmTimeoutMs,
-      'llm chat',
-    )) as Response;
-    if (!res.ok) {
-      const e: any = new Error(`llm http ${res.status}`);
-      e.status = res.status;
-      throw e;
+        body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2, stream: false }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const e: any = new Error(`llm http ${res.status}`);
+        e.status = res.status;
+        throw e;
+      }
+      const data: any = await res.json(); // INSIDE the deadline now
+      const content: string = data?.choices?.[0]?.message?.content ?? '';
+      return extractJson(content);
+    };
+    try {
+      return await withDeadline(doCall(), cfg.llmTimeoutMs, 'llm chat');
+    } catch (err) {
+      controller.abort(); // close the socket; re-throw the ORIGINAL (deadline) error
+      throw err;
     }
-    const data: any = await res.json();
-    const content: string = data?.choices?.[0]?.message?.content ?? '';
-    return extractJson(content);
   }
 
   return {
