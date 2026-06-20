@@ -2334,17 +2334,33 @@ async def test_me_persists_idle_slide(client, settings, sessionmaker_):
     async with sessionmaker_() as s:
         row = (await s.execute(select(SessionRow))).scalars().first()
         after = row.idle_expires_at
-    # the slide is persisted (committed), not rolled back at request end
-    assert after >= before
+    # The slide must be PERSISTED (committed), not rolled back at request end.
+    # Strict `>`: real wall-clock elapses between login and /me, so a committed
+    # slide is strictly greater; if current_user's commit were removed the slide
+    # rolls back and after == before — which a `>=` assertion would wrongly pass.
+    assert after > before
 
 
-async def test_register_is_rate_limited(client):
-    """register is brute-forceable -> per-IP throttled (default 5/min)."""
-    codes = []
+async def test_register_is_rate_limited_with_retry_after(client):
+    """register is brute-forceable -> per-IP throttled (default 5/min) + Retry-After."""
+    last = None
     for _ in range(7):
-        r = await client.post("/api/auth/register", json={"email": "rl@ringkas.co.id", "password": "x" * 12})
-        codes.append(r.status_code)
-    assert 429 in codes  # the bucket (5) is exhausted within the burst
+        last = await client.post("/api/auth/register", json={"email": "rl@ringkas.co.id", "password": "x" * 12})
+        if last.status_code == 429:
+            break
+    assert last.status_code == 429
+    assert last.json()["error"]["code"] == "rate_limited"
+    assert "retry-after" in {k.lower() for k in last.headers}
+
+
+async def test_validation_error_uses_envelope(client):
+    """A malformed body returns the shared {error:{code,message}} envelope, not
+    FastAPI's default {detail:[...]} (spec §5)."""
+    r = await client.post("/api/auth/login", json={"email": "not-an-email", "password": "x"})
+    assert r.status_code == 422
+    body = r.json()
+    assert "error" in body and "code" in body["error"]
+    assert "detail" not in body
 
 
 async def test_change_password_is_rate_limited(client, settings):
@@ -2641,7 +2657,7 @@ NOTE for implementer: `idna` and `pydantic[email]` are already declared in Task 
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/web/test_auth_endpoints.py -v`
-Expected: 13 passed.
+Expected: 14 passed.
 
 - [ ] **Step 7: Run the whole web suite (no regressions)**
 
@@ -3530,7 +3546,26 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
         resp = JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
         if exc.status_code == 401:
             resp.delete_cookie(key=settings.cookie_name, path="/")
+        if exc.code == "rate_limited":
+            # spec §9/§10: 429 carries Retry-After. The in-process bucket refills
+            # at per_min/60 tokens/sec, so ~60/per_min seconds buys one token.
+            resp.headers["Retry-After"] = str(max(1, 60 // max(1, settings.rate_limit_per_min)))
         return resp
+
+    # spec §5: EVERY 4xx/5xx shares {error:{code,message}}. FastAPI's own
+    # validation + HTTP errors would otherwise emit their default shapes, so wrap
+    # them into the same envelope.
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "validation_error", "message": "invalid request body"}})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_handler(request: Request, exc: StarletteHTTPException):
+        code = {401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        return JSONResponse(status_code=exc.status_code, content={"error": {"code": code, "message": str(exc.detail)}})
 
     from prd_mcp.web.auth import router as auth_router
     from prd_mcp.web.admin import router as admin_router
