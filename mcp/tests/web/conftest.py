@@ -65,3 +65,27 @@ async def sessionmaker_(engine):
 async def db(sessionmaker_):
     async with sessionmaker_() as session:
         yield session
+
+
+import httpx
+import pytest_asyncio
+from prd_mcp.web.app import create_app
+from prd_mcp.web import db as db_mod, seed as seed_mod
+
+
+@pytest_asyncio.fixture
+async def app(settings, sessionmaker_):
+    db_mod.set_sessionmaker(sessionmaker_)
+    application = create_app(settings, sessionmaker_, run_startup=False)
+    async with sessionmaker_() as s:
+        await seed_mod.run_seed(s, settings)
+    return application
+
+
+@pytest_asyncio.fixture
+async def client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"X-Requested-With": "prd-app"}
+    ) as c:
+        yield c
