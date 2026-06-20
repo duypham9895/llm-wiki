@@ -15,8 +15,28 @@ def main() -> int:
                      help="re-embed every doc (ignore body_hash skip-guard)")
     serve = sub.add_parser("serve", help="run the MCP server")
     serve.add_argument("--http", action="store_true", help="streamable-http transport (token-gated)")
+    web = sub.add_parser("web", help="run the FastAPI auth web app (uvicorn, single worker)")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8300)
     args = parser.parse_args()
 
+    if args.cmd == "web":
+        import uvicorn
+        from prd_mcp.web.settings import load_settings
+        from prd_mcp.web.db import make_engine, make_sessionmaker
+        from prd_mcp.web.app import create_app
+
+        web_settings = load_settings()  # reads os.environ; NO keychain, NO Chroma
+        engine = make_engine(web_settings.database_url)
+        sm = make_sessionmaker(engine)
+        application = create_app(web_settings, sm, run_startup=True)
+        uvicorn.run(
+            application, host=args.host, port=args.port,
+            workers=1, forwarded_allow_ips="127.0.0.1",  # trust XFF only from Caddy on loopback
+        )
+        return 0
+
+    # index/serve only past this point — these require the keychain + Chroma:
     cfg = load_config(os.environ, read_secret)
     store = Store.open(cfg.chroma_path)
 

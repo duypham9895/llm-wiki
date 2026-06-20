@@ -1,69 +1,148 @@
-"""FastAPI app factory. Task 8 mounts auth + the error envelope; Tasks 9-10 add
-the admin router, CSRF/rate-limit/CORS/proxy middleware, healthz, and purge task."""
+"""FastAPI app factory: routers + error envelope + CSRF/CORS middleware +
+healthz + hourly session purge.
+
+Client-IP trust (for rate limiting) is established at the uvicorn layer via
+`--forwarded-allow-ips=127.0.0.1` (set in cli.py), NOT a per-app middleware —
+that keeps trust config in one place and avoids uvicorn-version drift in the
+ProxyHeadersMiddleware constructor signature.
+"""
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from prd_mcp.web import db as db_mod
+from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
 from prd_mcp.web.security import make_password_hasher
 from prd_mcp.web.settings import WebSettings
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+class CSRFMiddleware(BaseHTTPMiddleware):
+    """Reject state-changing requests lacking the custom header."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method not in _SAFE_METHODS:
+            if request.headers.get("x-requested-with") != "prd-app":
+                return JSONResponse(status_code=403, content={"error": {"code": "csrf", "message": "missing or invalid CSRF header"}})
+        response = await call_next(request)
+        return response
+
+
+class HSTSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
 
 
 def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True) -> FastAPI:
     app = FastAPI(title="PRD Auth")
     app.state.settings = settings
     app.state.ratelimiter = RateLimiter(settings.rate_limit_per_min)
-    # Build the argon2 hasher ONCE (it precomputes a dummy hash); rebuilding it
-    # per-request would run a second argon2 op on every login/register.
-    app.state.password_hasher = make_password_hasher(settings)
+    app.state.password_hasher = make_password_hasher(settings)  # built ONCE (see Task 8)
     db_mod.set_sessionmaker(sessionmaker)
+
+    # Starlette applies add_middleware in REVERSE order, so the LAST added is
+    # outermost. We want CORS outermost (so even a CSRF-rejected cross-origin
+    # response carries CORS headers and the browser surfaces our JSON error),
+    # then HSTS, then CSRF innermost. Add order below = CSRF, HSTS, CORS.
+    app.add_middleware(CSRFMiddleware)
+    if settings.is_prod:
+        app.add_middleware(HSTSMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.cors_origin],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.exception_handler(AppError)
     async def _app_error_handler(request: Request, exc: AppError):
-        headers = {}
-        if exc.status_code == 429:
-            # Standard Retry-After: 60 seconds (token bucket refills in 1 min).
-            headers["Retry-After"] = "60"
-        resp = JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
-            headers=headers,
-        )
+        resp = JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
         # Clear the session cookie only when the session itself is invalid
-        # (expired / revoked / not present). A wrong current_password on
-        # change-password is `invalid_credentials` (the user IS authenticated
-        # — their session is fine). Clearing the cookie there would log the
-        # user out on every wrong-password attempt, defeating the rate-limit.
+        # (expired/revoked/absent). `invalid_credentials` on change-password means
+        # the user IS authenticated — their session is fine; clearing there would
+        # log them out on every wrong-password attempt, defeating the rate-limit.
         if exc.code == "unauthorized":
             resp.delete_cookie(key=settings.cookie_name, path="/")
+        if exc.code == "rate_limited":
+            # spec §9/§10: 429 carries Retry-After. The in-process bucket refills
+            # at per_min/60 tokens/sec, so ~60/per_min seconds buys one token.
+            resp.headers["Retry-After"] = str(max(1, 60 // max(1, settings.rate_limit_per_min)))
         return resp
 
+    # spec §5: EVERY 4xx/5xx shares {error:{code,message}}. FastAPI's own
+    # validation + HTTP errors would otherwise emit their default shapes, so wrap
+    # them into the same envelope.
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
     @app.exception_handler(RequestValidationError)
-    async def _validation_error_handler(request: Request, exc: RequestValidationError):
-        # Replace FastAPI's default {detail:[...]} with our canonical envelope.
-        return JSONResponse(
-            status_code=422,
-            content={"error": {"code": "validation_error", "message": str(exc.errors()[0]["msg"])}},
-        )
+    async def _validation_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "validation_error", "message": "invalid request body"}})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_handler(request: Request, exc: StarletteHTTPException):
+        code = {401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        return JSONResponse(status_code=exc.status_code, content={"error": {"code": code, "message": str(exc.detail)}})
 
     from prd_mcp.web.auth import router as auth_router
-
-    app.include_router(auth_router)
-
     from prd_mcp.web.admin import router as admin_router
 
+    app.include_router(auth_router)
     app.include_router(admin_router)
+
+    @app.get("/healthz")
+    async def healthz():
+        try:
+            async with sessionmaker() as s:
+                await s.execute(text("SELECT 1"))
+            return {"db": "ok"}
+        except Exception:
+            # 5xx must share the {error:{code,message}} envelope (spec §5/§9).
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"code": "service_unavailable", "message": "database unavailable"}},
+            )
 
     if run_startup:
         @app.on_event("startup")
-        async def _startup():  # pragma: no cover - exercised in deployment
+        async def _startup():  # pragma: no cover - deployment path
             from prd_mcp.web import seed as seed_mod
 
             async with sessionmaker() as s:
                 await seed_mod.run_seed(s, settings)
+            app.state._purge_task = asyncio.create_task(_purge_loop(sessionmaker))
+
+        @app.on_event("shutdown")
+        async def _shutdown():  # pragma: no cover
+            task = getattr(app.state, "_purge_task", None)
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     return app
+
+
+async def _purge_loop(sessionmaker):  # pragma: no cover - timing loop
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            async with sessionmaker() as s:
+                await sessions_mod.purge_expired(s, now=datetime.now(timezone.utc))
+                await s.commit()
+        except Exception:
+            pass
