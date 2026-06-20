@@ -54,6 +54,10 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
 
     app.include_router(auth_router)
 
+    from prd_mcp.web.admin import router as admin_router
+
+    app.include_router(admin_router)
+
     if run_startup:
         @app.on_event("startup")
         async def _startup():  # pragma: no cover - exercised in deployment
