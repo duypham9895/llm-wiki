@@ -531,6 +531,14 @@ def test_keyword_retrieve_lowercases_splits_drops_short_tokens():
     assert "SP3K Notification" in out[0].text
 
 
+def test_keyword_retrieve_snippet_prefers_summary_when_it_contains_term():
+    # Spec §3: summary FIRST when it contains the matched word, even if a body exists.
+    store = FakeStore(kw_rows=[kwrow("EP-1-a", "The SP3K rollout summary")])
+    out = keyword_retrieve("sp3k", store, 10, "/v",
+                           read_body_fn=lambda stem, prds, **kw: "a long body that ALSO has sp3k in it")
+    assert out[0].text == "The SP3K rollout summary"  # summary chosen, not the body window
+
+
 def test_keyword_retrieve_snippet_falls_back_to_summary_when_body_missing():
     store = FakeStore(kw_rows=[kwrow("EP-1-a", "The Summary Text")])
     out = keyword_retrieve("sp3k", store, 10, "/v",
@@ -619,15 +627,18 @@ def retrieve(query: str, store, embed_fn, k: int, threshold: float):
 
 
 def _snippet(body: str, first_term: str, summary: str, title: str) -> str:
-    # Prefer a body window around the first matched term. If the term is NOT in
-    # the body (it matched via title/id/tags in the keyword chunk), fall back to
-    # the summary, then the title — never an arbitrary body[:200] that doesn't
-    # contain the match (Codex F3).
-    if body and first_term:
-        idx = body.lower().find(first_term)
-        if idx >= 0:
-            start = max(0, idx - 100)
-            return body[start:idx + 120]
+    # Spec order (design §3): summary FIRST when it contains the matched word
+    # (the LLM-written summary is a cleaner, curated snippet), else a body window
+    # around the match, else summary/title as-is. Never an arbitrary body[:200]
+    # that doesn't contain the match (Codex F3).
+    if first_term:
+        if summary and first_term in summary.lower():
+            return summary
+        if body:
+            idx = body.lower().find(first_term)
+            if idx >= 0:
+                start = max(0, idx - 100)
+                return body[start:idx + 120]
     if summary:
         return summary
     if title:
@@ -663,7 +674,7 @@ def keyword_retrieve(query: str, store, k: int, prds_dir: str,
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/test_retrieve.py -v`
-Expected: PASS (8 tests).
+Expected: PASS (9 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1071,6 +1082,34 @@ def test_keyword_chunk_not_embedded_and_gets_zero_vector():
     assert upserted["embs"][body_idx] != [0.0] * EMBED_DIM
 
 
+def test_keyword_placeholder_matches_embedder_dim_not_hardcoded():
+    # CRITICAL regression guard: with a 2-dim fake embedder, the keyword chunk's
+    # placeholder MUST be 2-dim (matching the collection), NOT a hardcoded 1536.
+    # This test FAILS if _embed_with_keyword_placeholder hardcodes EMBED_DIM.
+    from prd_mcp.index import run_index
+    from prd_mcp.vault import Doc
+
+    class Cfg:
+        prds_dir = "/v"; chunk_size = 1000; chunk_overlap = 150
+
+    def embed2(texts):  # 2-dim embedder
+        return [[float(len(t)), 0.0] for t in texts]
+
+    upserted = {}
+    class FakeStore:
+        def stored_hashes(self): return {}
+        def delete_by_doc(self, stem): pass
+        def upsert(self, chunks, embs, body_hash): upserted["chunks"] = chunks; upserted["embs"] = embs
+
+    doc = Doc(stem="EP-1-a", id="EP-1", title="T", source_url="u", status="x",
+              platform=[], tags=["t"], summary="s", body_hash="h1", body="real body text")
+    run_index(Cfg(), FakeStore(), embed2,
+              read_doc_fn=lambda p: doc, list_docs_fn=lambda d: ["/v/EP-1-a.md"])
+    kw_idx = [i for i, c in enumerate(upserted["chunks"]) if c.chunk_type == "keyword"][0]
+    assert upserted["embs"][kw_idx] == [0.0, 0.0]  # 2-dim, matches body — NOT 1536
+    assert all(len(v) == 2 for v in upserted["embs"])  # whole collection is uniform 2-dim
+
+
 def test_force_reindexes_unchanged_docs():
     from prd_mcp.index import run_index, EMBED_DIM
     from prd_mcp.vault import Doc
@@ -1097,7 +1136,7 @@ def test_force_reindexes_unchanged_docs():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd mcp && poetry run pytest tests/test_index.py -k "keyword_chunk or force" -v`
+Run: `cd mcp && poetry run pytest tests/test_index.py -k "keyword or placeholder or force" -v`
 Expected: FAIL — `ImportError: cannot import name 'EMBED_DIM'` and `run_index() got an unexpected keyword argument 'force'`.
 
 - [ ] **Step 3: Implement in `mcp/prd_mcp/index.py`**
