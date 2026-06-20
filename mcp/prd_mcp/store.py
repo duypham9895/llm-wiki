@@ -38,8 +38,21 @@ class Store:
 
     def query(self, embedding, k: int) -> list:
         res = self.collection.query(query_embeddings=[list(embedding)], n_results=k,
+                                    where={"chunk_type": {"$ne": "keyword"}},
                                     include=["documents", "metadatas", "distances"])
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
         dists = (res.get("distances") or [[]])[0]
         return [{"text": t, "metadata": m, "distance": d} for t, m, d in zip(docs, metas, dists)]
+
+    def keyword_query(self, terms: list, k: int) -> list:
+        if not terms:
+            return []
+        where_doc = ({"$contains": terms[0]} if len(terms) == 1
+                     else {"$and": [{"$contains": t} for t in terms]})
+        res = self.collection.get(where={"chunk_type": "keyword"},
+                                  where_document=where_doc,
+                                  include=["documents", "metadatas"], limit=k)
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        return [{"text": t, "metadata": m} for t, m in zip(docs, metas)]
