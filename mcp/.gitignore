@@ -6,3 +6,6 @@ __pycache__/
 
 # MCP's own Chroma index (built nightly; never committed)
 .chroma-mcp/
+
+# Deployment secrets — never commit the real .env
+deploy/.env
