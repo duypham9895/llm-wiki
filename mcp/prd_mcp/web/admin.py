@@ -36,7 +36,6 @@ from prd_mcp.web.schemas import (
     SetRolesIn,
     SettingsIn,
     SettingsOut,
-    UserOut,
 )
 from prd_mcp.web.auth import user_to_out
 
