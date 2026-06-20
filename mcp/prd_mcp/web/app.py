@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
@@ -24,6 +25,8 @@ from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
 from prd_mcp.web.security import make_password_hasher
 from prd_mcp.web.settings import WebSettings
+
+logger = logging.getLogger("prd_mcp.web")
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
@@ -97,6 +100,16 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
     async def _http_handler(request: Request, exc: StarletteHTTPException):
         code = {401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
         return JSONResponse(status_code=exc.status_code, content={"error": {"code": code, "message": str(exc.detail)}})
+
+    # spec §5: catch-all so unhandled RuntimeError/etc. return the envelope
+    # instead of Starlette's plaintext "Internal Server Error". Starlette routes
+    # specific-exception handlers via ExceptionMiddleware (innermost) and the
+    # bare Exception handler via ServerErrorMiddleware (outermost), so AppError /
+    # RequestValidationError / StarletteHTTPException still win their own handlers.
+    @app.exception_handler(Exception)
+    async def _unhandled_handler(request: Request, exc: Exception):
+        logger.exception("unhandled error processing %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"error": {"code": "internal_error", "message": "internal server error"}})
 
     from prd_mcp.web.auth import router as auth_router
     from prd_mcp.web.admin import router as admin_router
