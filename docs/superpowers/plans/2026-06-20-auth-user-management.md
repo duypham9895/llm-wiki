@@ -1603,6 +1603,11 @@ async def assert_admin_invariant(db) -> None:
 
 
 async def _load_active_user_by_session(request: Request, db, settings: WebSettings) -> tuple[User, str] | None:
+    # Returns None for ALL of absent / expired / revoked / disabled-user, so
+    # current_user raises ONE uniform 401 `unauthorized`. This is deliberate
+    # (spec §9 groups "Expired/invalid/revoked session → 401, clears the cookie"
+    # as a single outcome): a distinct `session_expired` code would leak whether
+    # a token ever existed. Do NOT split these into separate codes.
     token = request.cookies.get(settings.cookie_name)
     if not token:
         return None
@@ -3580,7 +3585,11 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
                 await s.execute(text("SELECT 1"))
             return {"db": "ok"}
         except Exception:
-            return JSONResponse(status_code=503, content={"db": "unreachable"})
+            # 5xx must share the {error:{code,message}} envelope (spec §5/§9).
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"code": "service_unavailable", "message": "database unavailable"}},
+            )
 
     if run_startup:
         @app.on_event("startup")
