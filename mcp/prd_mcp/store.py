@@ -36,6 +36,11 @@ class Store:
             out[md["doc_stem"]] = md["body_hash"]
         return out
 
+    def has_keyword_chunk(self, doc_stem: str) -> bool:
+        got = self.collection.get(where={"$and": [{"doc_stem": doc_stem}, {"chunk_type": "keyword"}]},
+                                  include=[], limit=1)
+        return bool(got.get("ids"))
+
     def query(self, embedding, k: int) -> list:
         res = self.collection.query(query_embeddings=[list(embedding)], n_results=k,
                                     where={"chunk_type": {"$ne": "keyword"}},

@@ -75,3 +75,11 @@ def test_keyword_query_respects_k_limit(tmp_path):
         s.upsert(ch, [[0.0, 1.0]] * len(ch), "h")
     rows = s.keyword_query(["shared"], 2)
     assert len(rows) == 2  # capped at k even though 3 match
+
+
+def test_store_has_keyword_chunk(tmp_path):
+    s = Store.open(str(tmp_path / "c"))
+    ch = mk("EP-1-a", "alpha beta")
+    s.upsert(ch, [[1.0, 0.0]] * len(ch), "hash-1")
+    assert s.has_keyword_chunk("EP-1-a") is True
+    assert s.has_keyword_chunk("EP-2-missing") is False

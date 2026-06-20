@@ -124,6 +124,51 @@ def test_keyword_placeholder_matches_embedder_dim_not_hardcoded():
     assert all(len(v) == 2 for v in upserted["embs"])  # whole collection is uniform 2-dim
 
 
+def test_keyword_only_doc_is_skipped():
+    from prd_mcp.index import run_index
+    from prd_mcp.vault import Doc
+
+    class Cfg:
+        prds_dir = "/v"; chunk_size = 1000; chunk_overlap = 150
+
+    class FakeStore:
+        def __init__(self): self.upserts = []
+        def stored_hashes(self): return {}
+        def delete_by_doc(self, stem): pass
+        def upsert(self, chunks, embs, body_hash): self.upserts.append((chunks, embs, body_hash))
+
+    doc = Doc(stem="EP-1-a", id="EP-1", title="T", source_url="u", status="x",
+              platform=[], tags=[], summary=None, body_hash="h1", body="")
+    store = FakeStore()
+    res = run_index(Cfg(), store, lambda t: [[0.0, 0.0] for _ in t],
+                    read_doc_fn=lambda p: doc, list_docs_fn=lambda d: ["/v/EP-1-a.md"])
+    assert res == {"indexed": 0, "skipped": 1, "removed": 0, "errors": 0}
+    assert store.upserts == []
+
+
+def test_incremental_backfills_missing_keyword_chunk():
+    from prd_mcp.index import run_index
+    from prd_mcp.vault import Doc
+
+    class Cfg:
+        prds_dir = "/v"; chunk_size = 1000; chunk_overlap = 150
+
+    class FakeStore:
+        def __init__(self): self.upserts = []
+        def stored_hashes(self): return {"EP-1-a": "h1"}
+        def has_keyword_chunk(self, stem): return False
+        def delete_by_doc(self, stem): pass
+        def upsert(self, chunks, embs, body_hash): self.upserts.append(body_hash)
+
+    doc = Doc(stem="EP-1-a", id="EP-1", title="T", source_url="u", status="x",
+              platform=[], tags=["t"], summary="s", body_hash="h1", body="b")
+    store = FakeStore()
+    res = run_index(Cfg(), store, lambda t: [[0.0, 0.0] for _ in t],
+                    read_doc_fn=lambda p: doc, list_docs_fn=lambda d: ["/v/EP-1-a.md"])
+    assert res["indexed"] == 1 and res["skipped"] == 0
+    assert store.upserts == ["h1"]
+
+
 def test_force_reindexes_unchanged_docs():
     from prd_mcp.index import run_index, EMBED_DIM
     from prd_mcp.vault import Doc
@@ -134,6 +179,7 @@ def test_force_reindexes_unchanged_docs():
     class FakeStore:
         def __init__(self): self.upserts = []
         def stored_hashes(self): return {"EP-1-a": "h1"}  # already indexed, same hash
+        def has_keyword_chunk(self, stem): return True
         def delete_by_doc(self, stem): pass
         def upsert(self, chunks, embs, body_hash): self.upserts.append(body_hash)
 

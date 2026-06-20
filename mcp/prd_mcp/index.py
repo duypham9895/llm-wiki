@@ -29,11 +29,15 @@ def run_index(cfg, store, embed_fn, read_doc_fn=read_doc, list_docs_fn=list_docs
         try:
             d = read_doc_fn(path)
             seen.add(d.stem)
-            if not force and stored.get(d.stem) == d.body_hash and d.body_hash is not None:
+            if (not force and stored.get(d.stem) == d.body_hash
+                    and d.body_hash is not None and store.has_keyword_chunk(d.stem)):
                 skipped += 1
                 continue
             chunks = chunk_doc(d, cfg.chunk_size, cfg.chunk_overlap)
             if not chunks:
+                skipped += 1
+                continue
+            if not any(c.chunk_type != "keyword" for c in chunks):
                 skipped += 1
                 continue
             embeddings = _embed_with_keyword_placeholder(chunks, embed_fn)
