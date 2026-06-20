@@ -3,7 +3,7 @@ per-email increasing-backoff counter. State is in memory and resets on restart â
 accepted on a single-owner box. All methods take an explicit monotonic `now`."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
