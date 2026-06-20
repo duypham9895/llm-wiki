@@ -83,6 +83,7 @@ fastapi = "^0.115.0"
 uvicorn = {extras = ["standard"], version = "^0.30.0"}
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.30"}
 asyncpg = "^0.29.0"
+psycopg = {extras = ["binary"], version = "^3.1.0"}
 alembic = "^1.13.0"
 argon2-cffi = "^23.1.0"
 pydantic-settings = "^2.3.0"
@@ -91,13 +92,17 @@ pydantic = {extras = ["email"], version = "^2.7.0"}
 idna = "^3.7"
 ```
 
-> **Why `pydantic[email]` and `idna`:** `schemas.py` (Task 6) uses `pydantic.EmailStr`, which imports the optional `email-validator` package — without the `[email]` extra, importing `schemas.py` raises `ImportError` at module load. `auth.py` (Task 8) imports `idna` for punycode domain normalization; it is only a transitive dep of httpx, so declare it explicitly. Both MUST be in this Task-1 dependency block (do not defer to a later `poetry lock`).
+> **Why these:**
+> - `pydantic[email]` — `schemas.py` (Task 6) uses `pydantic.EmailStr`, which imports the optional `email-validator` package; without the `[email]` extra, importing `schemas.py` raises `ImportError` at module load.
+> - `idna` — `auth.py` (Task 8) imports it for punycode domain normalization; only a transitive dep of httpx, so declare it explicitly.
+> - `psycopg[binary]` — Alembic migrations run with a SYNCHRONOUS driver. `migrations/env.py` rewrites the URL to `postgresql+psycopg://` (psycopg3) explicitly; asyncpg cannot drive Alembic's sync engine, so without psycopg3 `alembic upgrade head` (Task 11 entrypoint) fails before the app starts.
+>
+> All three MUST be in this Task-1 dependency block (do not defer to a later `poetry lock`).
 
-In `[tool.poetry.group.dev.dependencies]` add after `pytest = "^8.0"`:
+In `[tool.poetry.group.dev.dependencies]` add after `pytest = "^8.0"` (NOTE: `httpx` is already in the main `[tool.poetry.dependencies]` from the v1 build — do NOT add it again here, Poetry rejects duplicate keys):
 
 ```toml
 pytest-asyncio = "^0.23.0"
-httpx = "^0.27.0"
 testcontainers = {extras = ["postgres"], version = "^4.5.0"}
 greenlet = "^3.0.0"
 ```
@@ -175,34 +180,36 @@ Fails fast on missing required vars rather than booting with silent "" defaults.
 """
 from __future__ import annotations
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class WebSettings(BaseSettings):
-    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", populate_by_name=True)
+    # case_sensitive=False makes field `database_url` read env `DATABASE_URL`
+    # automatically — no explicit Field(alias=...) needed (and avoiding alias
+    # sidesteps a pydantic-v2 serialization-alias footgun with model_copy()).
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
 
     # Required (no defaults -> missing => validation error => fail fast)
-    database_url: str = Field(alias="DATABASE_URL")
-    cors_origin: str = Field(alias="CORS_ORIGIN")
-    admin_email: str = Field(alias="ADMIN_EMAIL")
-    admin_password: str = Field(alias="ADMIN_PASSWORD")
+    database_url: str
+    cors_origin: str
+    admin_email: str
+    admin_password: str
 
-    # Optional with defaults
-    cookie_name: str = Field(default="prd_session", alias="COOKIE_NAME")
-    allowed_email_domains: str = Field(default="", alias="ALLOWED_EMAIL_DOMAINS")
-    registration_enabled: bool = Field(default=False, alias="REGISTRATION_ENABLED")
-    session_idle_hours: int = Field(default=24, alias="SESSION_IDLE_HOURS")
-    session_absolute_days: int = Field(default=30, alias="SESSION_ABSOLUTE_DAYS")
-    last_seen_throttle_min: int = Field(default=5, alias="LAST_SEEN_THROTTLE_MIN")
-    rate_limit_per_min: int = Field(default=5, alias="RATE_LIMIT_PER_MIN")
-    password_min_length: int = Field(default=12, alias="PASSWORD_MIN_LENGTH")
-    env: str = Field(default="prod", alias="ENV")
+    # Optional with defaults (env var name = UPPERCASE of the field name)
+    cookie_name: str = "prd_session"
+    allowed_email_domains: str = ""
+    registration_enabled: bool = False
+    session_idle_hours: int = 24
+    session_absolute_days: int = 30
+    last_seen_throttle_min: int = 5
+    rate_limit_per_min: int = 5
+    password_min_length: int = 12
+    env: str = "prod"
 
     # argon2 cost (overridable so tests can use cheap rounds)
-    argon2_time_cost: int = Field(default=3, alias="ARGON2_TIME_COST")
-    argon2_memory_kib: int = Field(default=65536, alias="ARGON2_MEMORY_KIB")
-    argon2_parallelism: int = Field(default=4, alias="ARGON2_PARALLELISM")
+    argon2_time_cost: int = 3
+    argon2_memory_kib: int = 65536
+    argon2_parallelism: int = 4
 
     @property
     def allowed_domains_seed(self) -> list[str]:
@@ -214,10 +221,16 @@ class WebSettings(BaseSettings):
 
 
 def load_settings(env_map: dict | None = None) -> WebSettings:
-    """Build settings from an explicit mapping (tests) or os.environ (default)."""
+    """Build settings from an explicit mapping (tests) or os.environ (default).
+
+    With no aliases, the model's fields are lowercase. Callers pass UPPERCASE
+    env-style keys (DATABASE_URL=...), so map them to lowercase field names
+    before constructing. pydantic still coerces "true"/"30"/etc. from strings.
+    """
     if env_map is None:
-        return WebSettings()  # reads os.environ
-    return WebSettings(**env_map)
+        return WebSettings()  # reads os.environ (case-insensitive)
+    kwargs = {k.lower(): v for k, v in env_map.items()}
+    return WebSettings(**kwargs)
 ```
 
 - [ ] **Step 5: Run settings test to verify it passes**
@@ -268,7 +281,15 @@ async def get_db() -> AsyncIterator[AsyncSession]:
     if _sessionmaker is None:  # pragma: no cover - misconfiguration guard
         raise RuntimeError("sessionmaker not initialized; call set_sessionmaker in create_app")
     async with _sessionmaker() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            # Guarantee the "rolls back with 409/422" contract for any handler
+            # that raised after a flush — never let a flushed-but-uncommitted
+            # mutation leak. (async-with close also rolls back an open txn, but
+            # this makes the rollback explicit and ordering-independent.)
+            await session.rollback()
+            raise
 ```
 
 - [ ] **Step 7: Commit**
@@ -290,6 +311,7 @@ git commit -m "feat(web): add auth deps, web package scaffold, settings, db engi
 - Create: `mcp/migrations/versions/0001_initial.py`
 - Test: `mcp/tests/web/conftest.py`
 - Test: `mcp/tests/web/test_models.py`
+- Test: `mcp/tests/web/test_migration.py`
 
 **Interfaces:**
 - Consumes: `db.Base` (Task 1).
@@ -613,8 +635,9 @@ Create `mcp/migrations/env.py`:
 ```python
 """Alembic environment — sync engine, URL from ALEMBIC_DATABASE_URL or DATABASE_URL.
 
-Migrations run with a synchronous psycopg driver (Alembic's default model); the
-app uses asyncpg at runtime. We strip the +asyncpg suffix here.
+Migrations run with the SYNCHRONOUS psycopg3 driver; the app uses asyncpg at
+runtime. We rewrite the URL's driver to `+psycopg` (psycopg3) so SQLAlchemy does
+not default to psycopg2 (which is not a declared dependency).
 """
 import os
 from logging.config import fileConfig
@@ -634,7 +657,10 @@ target_metadata = Base.metadata
 
 def _url() -> str:
     url = os.environ.get("ALEMBIC_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
-    return url.replace("+asyncpg", "").replace("+psycopg2", "")
+    # Force the sync psycopg3 driver regardless of how the URL was written.
+    for drv in ("+asyncpg", "+psycopg2", "+psycopg"):
+        url = url.replace(drv, "")
+    return url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 
 def run_migrations_offline() -> None:
@@ -758,14 +784,31 @@ def downgrade() -> None:
 
 Add to `mcp/tests/web/test_models.py`:
 
-```python
-async def test_migration_produces_same_tables_as_metadata(pg_url):
-    """alembic upgrade head must build exactly the tables the ORM declares."""
-    import os
-    import subprocess
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from prd_mcp.web.db import Base
+Create a SEPARATE file `mcp/tests/web/test_migration.py` (isolated so its destructive `DROP SCHEMA` on the shared session container runs apart from the per-test `engine` fixture):
 
+```python
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from prd_mcp.web.db import Base
+import prd_mcp.web.models  # noqa: F401  (register tables on Base.metadata)
+
+# mcp/ package root = three parents up from tests/web/test_migration.py
+MCP_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.asyncio
+async def test_migration_produces_same_tables_as_metadata(pg_url):
+    """`alembic upgrade head` must build exactly the tables the ORM declares.
+
+    env.py rewrites the +asyncpg URL to the sync +psycopg driver, so passing the
+    asyncpg pg_url through ALEMBIC_DATABASE_URL is correct.
+    """
     env = dict(os.environ, ALEMBIC_DATABASE_URL=pg_url)
     # fresh DB state: drop everything first via a throwaway engine
     eng = create_async_engine(pg_url)
@@ -773,7 +816,12 @@ async def test_migration_produces_same_tables_as_metadata(pg_url):
         await conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
     await eng.dispose()
 
-    r = subprocess.run(["poetry", "run", "alembic", "upgrade", "head"], cwd="."  , env=env, capture_output=True, text=True)
+    # cwd = the mcp/ dir (where alembic.ini lives), resolved absolutely so this
+    # works regardless of where pytest was launched from.
+    r = subprocess.run(
+        ["poetry", "run", "alembic", "upgrade", "head"],
+        cwd=str(MCP_ROOT), env=env, capture_output=True, text=True,
+    )
     assert r.returncode == 0, r.stderr
 
     eng = create_async_engine(pg_url)
@@ -787,17 +835,17 @@ async def test_migration_produces_same_tables_as_metadata(pg_url):
     assert expected.issubset(tables), f"missing {expected - tables}"
 ```
 
-NOTE for implementer: this test mutates the shared session container schema, so it must run last and the `engine` fixture (which recreates schema per-use) isolates other tests. If ordering proves flaky, mark it `@pytest.mark.order(-1)` or move it to its own file `test_migration.py`. Keep the assertion (migration parity) regardless.
+NOTE for implementer: `test_migration.py` is a SEPARATE file (not appended to `test_models.py`) precisely because its `DROP SCHEMA public CASCADE` mutates the shared session-scoped container. The `engine` fixture other tests use does its own `drop_all/create_all`, so it heals afterward; still, keeping this test isolated avoids cross-test ordering coupling. Keep the parity assertion regardless.
 
 - [ ] **Step 8: Run the full web suite**
 
 Run: `cd mcp && poetry run pytest tests/web/ -v`
-Expected: all green (settings 4 + models 6).
+Expected: all green (settings 4 + models 5 + migration 1).
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd mcp && git add prd_mcp/web/models.py alembic.ini migrations/ tests/web/conftest.py tests/web/test_models.py
+cd mcp && git add prd_mcp/web/models.py alembic.ini migrations/ tests/web/conftest.py tests/web/test_models.py tests/web/test_migration.py
 git commit -m "feat(web): ORM models + Alembic initial migration + testcontainers conftest"
 ```
 
@@ -1973,8 +2021,9 @@ Create `mcp/prd_mcp/web/seed.py`:
 ```python
 """Idempotent boot seeding + the startup integrity guard.
 
-Order on every boot: permissions -> system roles (re-asserted) -> break-glass
-admin (only when no active admin-equivalent) -> assert_global_pair_integrity.
+Order on every boot: permissions -> system roles (re-asserted) -> app_settings
+(first-boot only) -> break-glass admin (only when no active admin-equivalent) ->
+assert_global_pair_integrity.
 """
 from __future__ import annotations
 
@@ -2039,8 +2088,13 @@ async def seed_bootstrap_admin(db, settings: WebSettings) -> None:
         user.roles.append(admin_role)
         db.add(user)
     else:
-        # reactivate + ensure admin role; do NOT reset an existing password
+        # Break-glass recovery: we only reach this branch when NO active admin
+        # exists, so restore a KNOWN-GOOD credential from .env — reactivate AND
+        # reset the password to argon2(ADMIN_PASSWORD) (spec §4). The "never reset
+        # a healthy admin" guarantee is upheld by the early return above: a healthy
+        # instance never enters seed_bootstrap_admin's mutation path at all.
         user.status = "active"
+        user.password_hash = hasher.hash(settings.admin_password)
         if admin_role not in user.roles:
             user.roles.append(admin_role)
     await db.flush()
@@ -2231,6 +2285,9 @@ async def test_login_then_me_then_logout(client, settings):
     assert "roles.manage" in me.json()["permissions"]
     out = await client.post("/api/auth/logout")
     assert out.status_code == 204
+    # logout MUST emit a Set-Cookie that clears the session cookie (the 204 it
+    # returns carries the deletion; a regression here silently leaves it set).
+    assert "set-cookie" in {k.lower() for k in out.headers}
     assert (await client.get("/api/auth/me")).status_code == 401
 
 
@@ -2272,6 +2329,7 @@ from fastapi.responses import JSONResponse
 from prd_mcp.web import db as db_mod
 from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
+from prd_mcp.web.security import make_password_hasher
 from prd_mcp.web.settings import WebSettings
 
 
@@ -2279,6 +2337,9 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
     app = FastAPI(title="PRD Auth")
     app.state.settings = settings
     app.state.ratelimiter = RateLimiter(settings.rate_limit_per_min)
+    # Build the argon2 hasher ONCE (it precomputes a dummy hash); rebuilding it
+    # per-request would run a second argon2 op on every login/register.
+    app.state.password_hasher = make_password_hasher(settings)
     db_mod.set_sessionmaker(sessionmaker)
 
     @app.exception_handler(AppError)
@@ -2339,8 +2400,8 @@ from prd_mcp.web.schemas import (
     validate_password,
 )
 from prd_mcp.web.security import (
+    PasswordHasher,
     clear_session_cookie,
-    make_password_hasher,
     set_session_cookie,
 )
 from prd_mcp.web.settings import WebSettings
@@ -2350,6 +2411,11 @@ router = APIRouter(prefix="/api/auth")
 
 def _settings(request: Request) -> WebSettings:
     return request.app.state.settings
+
+
+def _hasher(request: Request) -> PasswordHasher:
+    # The single app-wide hasher built in create_app (avoids a per-request dummy hash).
+    return request.app.state.password_hasher
 
 
 def user_to_out(user: User) -> UserOut:
@@ -2386,7 +2452,7 @@ async def _load_settings_row(db) -> AppSettings | None:
 @router.post("/register", status_code=202, response_model=AcceptedOut)
 async def register(payload: RegisterIn, request: Request, db=Depends(get_db)) -> AcceptedOut:
     settings = _settings(request)
-    hasher = make_password_hasher(settings)
+    hasher = _hasher(request)
     # Equivalent work on every branch: always compute an argon2 hash.
     computed_hash = hasher.hash(payload.password)
     row = await _load_settings_row(db)
@@ -2409,8 +2475,8 @@ async def register(payload: RegisterIn, request: Request, db=Depends(get_db)) ->
 @router.post("/login")
 async def login(payload: LoginIn, request: Request, response: Response, db=Depends(get_db)):
     settings = _settings(request)
-    hasher = make_password_hasher(settings)
-    rl: "RateLimiter" = request.app.state.ratelimiter  # type: ignore  # noqa: F821
+    hasher = _hasher(request)
+    rl = request.app.state.ratelimiter
     ip = request.client.host if request.client else "unknown"
     if not rl.check_ip(ip, now=time.monotonic()):
         from prd_mcp.web.errors import AppError
@@ -2440,14 +2506,17 @@ async def login(payload: LoginIn, request: Request, response: Response, db=Depen
 
 
 @router.post("/logout", status_code=204)
-async def logout(request: Request, response: Response, db=Depends(get_db)):
+async def logout(request: Request, db=Depends(get_db)):
     settings = _settings(request)
     token = request.cookies.get(settings.cookie_name)
     if token:
         await sessions_mod.revoke_session(db, token)
         await db.commit()
-    clear_session_cookie(response, settings)
-    return Response(status_code=204)
+    # Build the 204 FIRST, then clear the cookie ON IT — clearing a separate
+    # `response` object and returning a fresh one would drop the Set-Cookie.
+    resp = Response(status_code=204)
+    clear_session_cookie(resp, settings)
+    return resp
 
 
 @router.get("/me", response_model=UserOut)
@@ -2457,10 +2526,10 @@ async def me(user: User = Depends(current_user)) -> UserOut:
 
 @router.post("/change-password", status_code=204)
 async def change_password(
-    payload: ChangePasswordIn, request: Request, response: Response, db=Depends(get_db), user: User = Depends(current_user)
+    payload: ChangePasswordIn, request: Request, db=Depends(get_db), user: User = Depends(current_user)
 ):
     settings = _settings(request)
-    hasher = make_password_hasher(settings)
+    hasher = _hasher(request)
     if not hasher.verify(user.password_hash, payload.current_password):
         raise invalid_credentials()
     validate_password(payload.new_password, settings)
@@ -2576,6 +2645,41 @@ async def test_approve_with_half_admin_role_set_is_422(client, settings, session
     r = await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [bad_id]})
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "admin_pair"
+
+
+async def test_approve_non_pending_user_is_409(client, settings, sessionmaker_):
+    """approve is pending->active ONLY; re-approving an active user is rejected."""
+    await _login_admin(client, settings)
+    member_id = await _role_id(sessionmaker_, "member")
+    uid = await _make_pending(sessionmaker_, "twice@ringkas.co.id")
+    first = await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [member_id]})
+    assert first.status_code == 200
+    again = await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [member_id]})
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "invalid_state"
+
+
+async def test_approve_persists_after_commit(client, settings, sessionmaker_):
+    """The approval must be committed (get_db only yields) — re-read sees active."""
+    await _login_admin(client, settings)
+    member_id = await _role_id(sessionmaker_, "member")
+    uid = await _make_pending(sessionmaker_, "persist@ringkas.co.id")
+    await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [member_id]})
+    async with sessionmaker_() as s:
+        u = (await s.execute(select(User).where(User.email == "persist@ringkas.co.id"))).scalar_one()
+        assert u.status == "active"
+        assert u.approved_at is not None
+        assert u.approved_by is not None  # spec §4: approver recorded
+
+
+async def test_reject_non_pending_user_is_409(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    member_id = await _role_id(sessionmaker_, "member")
+    uid = await _make_pending(sessionmaker_, "rejactive@ringkas.co.id")
+    await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [member_id]})
+    r = await client.post(f"/api/admin/users/{uid}/reject")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_state"
 
 
 async def test_disable_last_admin_is_409(client, settings, sessionmaker_):
@@ -2790,21 +2894,19 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.db import get_db
 from prd_mcp.web.errors import (
     AppError,
-    pair_error,
     role_in_use_error,
     system_role_error,
 )
 from prd_mcp.web.models import Permission, Role, User, AppSettings
 from prd_mcp.web.rbac import (
-    ADMIN_PAIR,
     assert_admin_invariant,
     assert_pair_integrity,
     effective_permissions,
@@ -2823,7 +2925,6 @@ from prd_mcp.web.schemas import (
     UserOut,
 )
 from prd_mcp.web.auth import user_to_out
-from prd_mcp.web.security import make_password_hasher
 
 router = APIRouter(prefix="/api/admin")
 
@@ -2858,12 +2959,23 @@ def _union_perm_names(roles: list[Role]) -> set[str]:
 # ---- users (require users.manage) ----
 
 @router.get("/users", dependencies=[Depends(require_permission("users.manage"))])
-async def list_users(db=Depends(get_db), status: str | None = None):
-    stmt = select(User)
+async def list_users(
+    db=Depends(get_db),
+    status: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    base = select(User)
     if status:
-        stmt = stmt.where(User.status == status)
-    users = (await db.execute(stmt)).scalars().all()
-    return {"users": [user_to_out(u).model_dump(mode="json") for u in users]}
+        base = base.where(User.status == status)
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    rows = (await db.execute(base.order_by(User.created_at).limit(limit).offset(offset))).scalars().all()
+    return {
+        "users": [user_to_out(u).model_dump(mode="json") for u in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/users/{user_id}", dependencies=[Depends(require_permission("users.manage"))])
@@ -2871,15 +2983,27 @@ async def get_user(user_id: uuid.UUID, db=Depends(get_db)):
     return user_to_out(await _user_or_404(db, user_id)).model_dump(mode="json")
 
 
-@router.post("/users/{user_id}/approve", dependencies=[Depends(require_permission("users.manage"))])
-async def approve_user(user_id: uuid.UUID, payload: ApproveIn, db=Depends(get_db)):
+@router.post("/users/{user_id}/approve")
+async def approve_user(
+    user_id: uuid.UUID,
+    payload: ApproveIn,
+    db=Depends(get_db),
+    actor: User = Depends(require_permission("users.manage")),
+):
     user = await _user_or_404(db, user_id)
+    # approve is pending->active ONLY. Without this guard, approving an ACTIVE
+    # last-admin with non-admin roles would strip their admin perms while skipping
+    # the last-admin check (approve isn't in that guarded set) -> lockout.
+    if user.status != "pending":
+        raise AppError(409, "invalid_state", "only pending users can be approved")
     roles = await _roles_or_404(db, payload.role_ids)
     assert_pair_integrity(_union_perm_names(roles))  # 422 before any state change
     user.status = "active"
     user.approved_at = datetime.now(timezone.utc)
+    user.approved_by = actor.id  # spec §4: approver recorded
     user.roles[:] = roles
-    await db.flush()
+    await db.commit()  # get_db only yields; without commit the approval rolls back
+    await db.refresh(user)
     return user_to_out(user).model_dump(mode="json")
 
 
@@ -2898,6 +3022,10 @@ async def disable_user(user_id: uuid.UUID, db=Depends(get_db)):
 @router.post("/users/{user_id}/enable", dependencies=[Depends(require_permission("users.manage"))])
 async def enable_user(user_id: uuid.UUID, db=Depends(get_db)):
     user = await _user_or_404(db, user_id)
+    # Re-activating must not produce a half-admin: if a disabled user's effective
+    # perms hold exactly one of the admin pair, reactivating them would violate
+    # pair-integrity (which only the request layer enforces). Check before activating.
+    assert_pair_integrity(effective_permissions(user))  # 422 if half-admin
     user.status = "active"
     await db.commit()
     await db.refresh(user)
@@ -2907,10 +3035,11 @@ async def enable_user(user_id: uuid.UUID, db=Depends(get_db)):
 @router.post("/users/{user_id}/reject", dependencies=[Depends(require_permission("users.manage"))])
 async def reject_user(user_id: uuid.UUID, db=Depends(get_db)):
     user = await _user_or_404(db, user_id)
-    # reject only applies to pending; deleting an active admin must still respect the invariant
+    # reject is pending->deleted ONLY (spec §5). Guard so it can't become a
+    # backdoor delete path for active users that skips delete_user's semantics.
+    if user.status != "pending":
+        raise AppError(409, "invalid_state", "only pending users can be rejected")
     await db.delete(user)
-    await db.flush()
-    await assert_admin_invariant(db)
     await db.commit()
     return {"status": "rejected"}
 
@@ -2922,7 +3051,7 @@ async def reset_password(user_id: uuid.UUID, payload: SetPasswordIn, request: Re
 
     validate_password(payload.password, settings)
     user = await _user_or_404(db, user_id)
-    user.password_hash = make_password_hasher(settings).hash(payload.password)
+    user.password_hash = request.app.state.password_hasher.hash(payload.password)
     await sessions_mod.revoke_user_sessions(db, user.id)
     await db.commit()
     return {"status": "ok"}
@@ -3206,8 +3335,14 @@ Expected: FAIL — CSRF not enforced yet (login returns 200/401 not 403), `/heal
 Replace `mcp/prd_mcp/web/app.py` with:
 
 ```python
-"""FastAPI app factory: routers + error envelope + CSRF/CORS/proxy middleware +
-healthz + hourly session purge."""
+"""FastAPI app factory: routers + error envelope + CSRF/CORS middleware +
+healthz + hourly session purge.
+
+Client-IP trust (for rate limiting) is established at the uvicorn layer via
+`--forwarded-allow-ips=127.0.0.1` (set in cli.py), NOT a per-app middleware —
+that keeps trust config in one place and avoids uvicorn-version drift in the
+ProxyHeadersMiddleware constructor signature.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -3220,15 +3355,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from starlette.middleware.base import BaseHTTPMiddleware
 
-try:  # uvicorn ships this; guard so import never hard-fails in tests
-    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
-except Exception:  # pragma: no cover
-    ProxyHeadersMiddleware = None
-
 from prd_mcp.web import db as db_mod
 from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
+from prd_mcp.web.security import make_password_hasher
 from prd_mcp.web.settings import WebSettings
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -3256,11 +3387,16 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
     app = FastAPI(title="PRD Auth")
     app.state.settings = settings
     app.state.ratelimiter = RateLimiter(settings.rate_limit_per_min)
+    app.state.password_hasher = make_password_hasher(settings)  # built ONCE (see Task 8)
     db_mod.set_sessionmaker(sessionmaker)
 
-    # Middleware order: ProxyHeaders (outermost) -> CORS -> CSRF -> [HSTS in prod].
-    if ProxyHeadersMiddleware is not None:
-        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["127.0.0.1"])
+    # Starlette applies add_middleware in REVERSE order, so the LAST added is
+    # outermost. We want CORS outermost (so even a CSRF-rejected cross-origin
+    # response carries CORS headers and the browser surfaces our JSON error),
+    # then HSTS, then CSRF innermost. Add order below = CSRF, HSTS, CORS.
+    app.add_middleware(CSRFMiddleware)
+    if settings.is_prod:
+        app.add_middleware(HSTSMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.cors_origin],
@@ -3268,9 +3404,6 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.add_middleware(CSRFMiddleware)
-    if settings.is_prod:
-        app.add_middleware(HSTSMiddleware)
 
     @app.exception_handler(AppError)
     async def _app_error_handler(request: Request, exc: AppError):
@@ -3325,19 +3458,29 @@ async def _purge_loop(sessionmaker):  # pragma: no cover - timing loop
             pass
 ```
 
-NOTE for implementer: ProxyHeadersMiddleware's constructor arg name has varied across uvicorn versions (`trusted_hosts`). If the installed uvicorn rejects it, fall back to passing `--forwarded-allow-ips=127.0.0.1` at the uvicorn CLI (Task 10 cli) and drop the middleware add — the CLI flag achieves the same trust boundary. Keep ONE of the two; document which in the commit.
+- [ ] **Step 5: Add the `web` subcommand to cli.py (and gate the keychain/Chroma init)**
 
-- [ ] **Step 5: Add the `web` subcommand to cli.py**
-
-In `mcp/prd_mcp/cli.py`, add a new subparser inside `main()` after the `serve` subparser block:
+The existing `main()` (verified) runs these two lines UNCONDITIONALLY near the top, before any `args.cmd` dispatch:
 
 ```python
+    cfg = load_config(os.environ, read_secret)
+    store = Store.open(cfg.chroma_path)
+```
+
+`prd-mcp web` runs on the Linux VPS where there is NO macOS keychain and NO Chroma index, so these lines would crash it. This step has TWO required edits — the gate is NOT optional.
+
+First, replace the subparser section so `web` is registered (after the `serve` subparser):
+
+```python
+    serve = sub.add_parser("serve", help="run the MCP server")
+    serve.add_argument("--http", action="store_true", help="streamable-http transport (token-gated)")
     web = sub.add_parser("web", help="run the FastAPI auth web app (uvicorn, single worker)")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8300)
+    args = parser.parse_args()
 ```
 
-And add this branch BEFORE the `# serve` block (so `web` is handled and returns):
+Then replace the unconditional `cfg=`/`store=` lines with a `web`-handling branch that returns BEFORE them, so the keychain/Chroma init only runs for `index`/`serve`:
 
 ```python
     if args.cmd == "web":
@@ -3346,18 +3489,22 @@ And add this branch BEFORE the `# serve` block (so `web` is handled and returns)
         from prd_mcp.web.db import make_engine, make_sessionmaker
         from prd_mcp.web.app import create_app
 
-        web_settings = load_settings()  # reads os.environ
+        web_settings = load_settings()  # reads os.environ; NO keychain, NO Chroma
         engine = make_engine(web_settings.database_url)
         sm = make_sessionmaker(engine)
         application = create_app(web_settings, sm, run_startup=True)
         uvicorn.run(
             application, host=args.host, port=args.port,
-            workers=1, forwarded_allow_ips="127.0.0.1",
+            workers=1, forwarded_allow_ips="127.0.0.1",  # trust XFF only from Caddy on loopback
         )
         return 0
+
+    # index/serve only past this point — these require the keychain + Chroma:
+    cfg = load_config(os.environ, read_secret)
+    store = Store.open(cfg.chroma_path)
 ```
 
-NOTE for implementer: `cli.py`'s existing flow calls `load_config(os.environ, read_secret)` + `Store.open` at the top of `main()` for the index/serve commands. The `web` command must NOT require the keychain/Chroma. Guard those two lines so they only run for `index`/`serve` (e.g. move `cfg = load_config(...)` and `store = Store.open(...)` inside an `if args.cmd in ("index", "serve"):` block, or handle `web` and `return` before they execute). Verify `prd-mcp index` and `prd-mcp serve` still work after the change (run `poetry run prd-mcp --help` and `poetry run prd-mcp index --help`).
+(The `web` branch must sit ABOVE the `cfg`/`store` lines; everything below — the `if args.cmd == "index":` and serve blocks — is unchanged.)
 
 - [ ] **Step 6: Run the full web suite**
 
@@ -3557,12 +3704,16 @@ After Task 11, run the cross-model whole-branch review (BOTH Claude + Codex) per
 
 **Cross-cutting checks for the final review (the spec's invariants that span tasks):**
 1. NO endpoint guarded by role NAME — every guard is `require_permission(<perm>)`.
-2. `assert_pair_integrity` is called on ALL of: role create, role update, user approve, user set-roles. (422, before any 409.)
+2. `assert_pair_integrity` is called on ALL of: role create, role update, user approve, user set-roles, AND user enable (re-activation). (422, before any 409.)
 3. `assert_admin_invariant` is called inside the txn on ALL of: disable, delete user, set-roles, role.update, role.delete.
-4. Login: load → ALWAYS argon2-verify (dummy same params) → THEN status — no early status exit; identical 401.
-5. Register: every branch returns identical `202 {status:'accepted'}` with an argon2 hash computed (timing).
-6. Sessions: only `sessions.py` touches the table; login mints a fresh token ignoring any presented cookie.
-7. `security.py` is the only module hashing passwords/tokens; cookie `Secure` only when `is_prod`.
-8. Settings seed from env on first boot only; DB authoritative after (the redeploy-doesn't-clobber test exists).
-9. CSRF: every mutation requires `X-Requested-With: prd-app`; no state-changing GET.
-10. The PRD core (`retrieve/answer/store/read/index/server/vault/chunk/llm/config/keychain`) is byte-for-byte unchanged.
+4. State preconditions: `approve` and `reject` act ONLY on `pending` users (409 `invalid_state` otherwise) — approve can't strip an active last-admin, reject can't become a backdoor delete.
+5. Every mutating handler COMMITS (get_db only yields); `approve` records `approved_by`+`approved_at`. The `get_db` dependency rolls back on any raised exception so a flushed-then-rejected (422/409) mutation never leaks.
+6. Login: load → ALWAYS argon2-verify (dummy same params) → THEN status — no early status exit; identical 401.
+7. Register: every branch returns identical `202 {status:'accepted'}` with an argon2 hash computed (timing).
+8. Sessions: only `sessions.py` touches the table; login mints a fresh token ignoring any presented cookie; logout emits the cookie-clearing Set-Cookie on the returned 204.
+9. `security.py` is the only module hashing passwords/tokens; the argon2 hasher is built ONCE on `app.state` (no per-request dummy hash); cookie `Secure` only when `is_prod`.
+10. Settings seed from env on first boot only; DB authoritative after (the redeploy-doesn't-clobber test exists).
+11. Break-glass: reactivation path resets the password from `ADMIN_PASSWORD` (recovery), reached ONLY when no active admin exists; a healthy admin is never touched.
+12. CSRF: every mutation requires `X-Requested-With: prd-app`; no state-changing GET. CORS outermost (exact-origin), CSRF inner.
+13. Alembic migrations run on the sync psycopg3 driver (`+psycopg`); `alembic upgrade head` succeeds in the Task 11 entrypoint.
+14. The PRD core (`retrieve/answer/store/read/index/server/vault/chunk/llm/config/keychain`) is unchanged; `cli.py` only gains the `web` branch, gated so `index`/`serve` keychain+Chroma init is skipped for `web`.
