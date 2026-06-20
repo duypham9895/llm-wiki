@@ -29,8 +29,9 @@ This phase adds the three Atlas patterns that close those gaps, scaled to a sing
 | Decision | Choice | Rationale |
 |---|---|---|
 | keyword_search backend | **Chroma `where_document={"$contains": term}`** over an **index-time lowercased search field** | Reuses the index we already build nightly; **measured 1–3 ms/query**. A separate SQLite-FTS index would match the speed but add a second store to sync, for ranking/stemming we don't need at 287 docs. Case-insensitivity must be solved at index time (see Edge 1) — a query-time lowercase scan measured 165–580 ms and grows with the corpus. |
-| Case handling | **Index a lowercased `search_text` per chunk = lower(body + title + id + tags); match lower(query) against it** | `$contains` is case-sensitive (`SP3K`→37 hits, `sp3k`→3, `Sp3k`→0). Folding case at index time keeps the 1–3 ms speed AND lets keyword_search match identifiers that live in metadata (the canonical `id`, `title`, `tags`), not just body text. Requires extending the indexer + a one-time reindex. |
-| Multi-word keyword queries | **AND-of-words (token match)**, not raw-phrase substring | `$contains` on a raw phrase fails across chunk boundaries (`"bank report dashboard"`→0 hits). Split the query into words; a chunk matches if its `search_text` contains *every* word (any order). Matches what PMs expect from "search". |
+| Case handling | **Add one synthetic "keyword chunk" PER PRD whose DOCUMENT text = `lower(body + title + id + tags)`; match `lower(query)` via `where_document $contains`** | `$contains` is case-sensitive (`SP3K`→37, `sp3k`→3, `Sp3k`→0) AND **only works on document text, never metadata** (Chroma rejects `$contains` in a `where` metadata clause — verified). So the lowercased search field must BE a chunk's document, not a metadata tag. One keyword chunk per PRD, found via `where={chunk_type:"keyword"}` + `where_document`. **Measured 1.6–4.6 ms at 287 docs**; case-insensitive; covers id/title/tags. Requires extending the indexer + a one-time reindex. |
+| Keyword chunk vs semantic search | **Every vector query (`search_prds`/`ask_prds`) MUST filter `where={chunk_type:{"$ne":"keyword"}}`** | The keyword chunk carries a placeholder vector; without the filter it would surface as garbage in semantic results. Invariant + test. |
+| Multi-word keyword queries | **AND-of-words via `where_document={"$and":[{"$contains":w}, ...]}`** (verified), dropping tokens <2 chars | `$contains` on a raw phrase fails across chunk boundaries (`"bank report dashboard"`→0). Split + AND the words. Tokens of 1 char (`"a"`,`"of"`) match almost everything → drop them; if all tokens drop, return empty. |
 | Relevance signal | **Whole-result `verdict`: `match` / `no_match` / `degraded`** | Agents branch on the verdict, never the score. |
 | Verdict mechanism | **Score threshold (default ≈ −0.15), NOT an LLM grader** | Threshold separates real junk (weather/pizza/python all ≤ −0.5) from in-domain queries. **Tuned from measured data, NOT ~0.05**: legit PM queries land low (`login` −0.06, `API` −0.20, `user permissions` +0.07), so a 0.05 cutoff would wrongly reject them. ≈ −0.15 keeps borderline-but-real queries as `match` while still rejecting clear out-of-domain junk. Re-tuned against a labeled set in the plan; `degraded` reserves the seam for an optional LLM grader later. |
 | read_prd source | **The vault file via existing `vault.read_doc()`**, not index chunks | Index body chunks carry 150-char overlap; joining them double-counts overlap regions. The vault is the canonical, exact body. Search uses the index; read uses the source. |
@@ -60,15 +61,17 @@ what lets Phase 3's web-API reuse the same functions).
 ```
 mcp/prd_mcp/
   config.py    + score_threshold: float = -0.15  (env PRD_SCORE_THRESHOLD)
-  chunk.py     ~ Chunk gains search_text (lower(body|summary + title + id + tags)) per chunk
-  store.py     + keyword_query(terms: list[str], k) -> rows   (AND-of-words $contains over
-               |   search_text metadata; includes documents+metadata for the snippet)
-               ~ upsert writes the search_text metadata field
-  index.py     ~ unchanged logic, but re-embeds carry the new search_text (a one-time full reindex
-               |   populates it for existing docs — the body_hash skip-guard means a forced reindex)
-  retrieve.py  ~ retrieve(...) -> (results, verdict)        (threshold over best score; empty-query guard)
-               + keyword_retrieve(query, store, k) -> distinct-PRD hits with match snippet
-               |   (splits query into words, lowercases, AND-matches)
+  chunk.py     + build_keyword_chunk(doc) -> Chunk(chunk_type="keyword",
+               |   text=lower(body + " " + title + " " + id + " " + tags))  ONE per PRD
+  store.py     + keyword_query(terms: list[str], k) -> rows
+               |   where={chunk_type:"keyword"} + where_document={$and:[{$contains:w}...]}
+               ~ query(...) adds where={chunk_type:{$ne:"keyword"}}  (exclude keyword chunk from
+               |   semantic results — REQUIRED invariant)
+  index.py     ~ each doc now also emits its keyword chunk; a one-time forced full reindex
+               |   populates keyword chunks for existing docs (body_hash skip-guard → forced)
+  retrieve.py  ~ retrieve(...) -> (results, verdict)   (threshold over best score; empty-query guard)
+               + keyword_retrieve(query, store, k) -> distinct-PRD hits with snippet
+               |   (lower+split query, drop <2-char tokens, AND-match; snippet from vault/original text)
   read.py      NEW  read_prd(prd_id, read_doc_fn, list_docs_fn) -> dict   (full body from vault,
                |   resolved by exact sync.id; found:false on miss)
   answer.py    ~ answer(...) short-circuits when verdict == no_match: honest non-answer, NO chat_fn
@@ -76,11 +79,12 @@ mcp/prd_mcp/
 ```
 
 ### Snippet construction (keyword_search)
-A window of body text around the first matched word (e.g. ±120 chars), drawn from the **original**
-chunk text (not the lowercased `search_text`), so the agent triages from a readable snippet without
-reading the whole body — and the `k`-cap (insertion-order in Chroma) is not a silent quality cliff.
-Results dedupe to distinct PRDs. When the only match is in metadata (title/id/tags, not the body),
-fall back to the chunk's leading text for the snippet.
+The keyword chunk's own text is lowercased (useless for display), so the snippet is built from
+**original-case text**: take the matched PRD's `summary` (already in metadata, real case) when it
+contains the first matched word, else read the PRD body via the vault and cut a ±120-char window
+around the first match, else fall back to the `summary` (or title) as-is. The agent triages from a
+readable snippet without reading the whole body — and the `k`-cap (insertion-order in Chroma) is
+not a silent quality cliff. Results dedupe to distinct PRDs.
 
 ## 4. Tool Contracts
 
@@ -128,13 +132,14 @@ exposed to clients; one bad doc never aborts; a tool error never crashes the ser
 ## 5. Data Flow
 
 ```
-keyword_search:  query -> (empty? -> []) -> lower+split into words -> store.keyword_query(words, k)
-                 -> AND-of-words $contains over search_text -> dedupe distinct PRDs + snippet -> results
-search_prds:     query -> (empty? -> no_match) -> embed -> store.query -> retrieve(): best score
-                 vs threshold -> (results, verdict)
+keyword_search:  query -> (empty? -> []) -> lower+split, drop <2-char tokens -> (none left? -> [])
+                 -> store.keyword_query(words): where chunk_type=keyword + where_document $and $contains
+                 -> dedupe distinct PRDs + original-case snippet -> results
+search_prds:     query -> (empty? -> no_match) -> embed -> store.query (WHERE chunk_type != keyword)
+                 -> retrieve(): best score vs threshold -> (results, verdict)
 ask_prds:        same retrieve -> verdict==no_match ? honest no-answer (no LLM) : build_prompt -> chat
 read_prd:        id -> resolve by exact sync.id -> vault.read_doc() -> { found, body, metadata }
-index (one-time): forced full reindex re-embeds every doc and writes the new search_text field;
+index (one-time): forced full reindex re-embeds every doc AND emits one keyword chunk per doc;
                  thereafter nightly incremental-by-body_hash as before.
 ```
 
@@ -144,12 +149,14 @@ index (one-time): forced full reindex re-embeds every doc and writes the new sea
 |---|---|
 | keyword_search no match | `{results: [], count: 0}` — empty, not an error |
 | keyword_search / search_prds empty or whitespace query | `{results: [], count: 0}` / `verdict: "no_match"` — guarded BEFORE any embed or store call |
+| keyword_search query is all short/stopword tokens (<2 chars) | `{results: [], count: 0}` — tokens dropped, nothing left to AND |
+| keyword chunk leaking into semantic search | prevented: every vector query filters `chunk_type != keyword` (invariant + test) |
 | read_prd unknown id | `{found: false, body: "", ...}` — honest; server stays up |
 | read_prd on an un-enriched doc (no summary) | still returns the full `body`; `summary`/`tags` may be empty — not an error |
 | search_prds all below threshold | `verdict: "no_match"`, `results: []` |
 | search_prds over un-enriched docs | empty `summary` field, never a crash (missing metadata defaults to `""`) |
 | ask_prds on no_match | honest "no PRD covers this", `grounded:false`, **no LLM call** |
-| Index missing the search_text field (pre-reindex) | keyword_search falls back to matching the chunk `document` text; full coverage after the one-time reindex |
+| Index missing keyword chunks (pre-reindex) | keyword_search returns empty until the one-time forced reindex populates them; the reindex is a required Phase 1 step, not optional |
 | Index empty / missing | existing clear MCP error ("index not built — run `prd-mcp index`") |
 | Embed / LLM failure | existing bounded retry + wall-clock timeout |
 
@@ -160,9 +167,9 @@ automated tests.
 
 | Layer | Tests |
 |---|---|
-| chunk | `chunk_doc` populates `search_text` = lower(text + title + id + tags); an un-enriched doc (no summary) still chunks its body. |
-| store | `keyword_query` matches the lowercased `search_text`; **case-insensitive** (`"sp3k"` finds an `SP3K` doc); **AND-of-words** (`["bank","dashboard"]` needs both, any order); matches an id/title that is NOT in body text; respects `k`; distinct stems; row carries original document text for the snippet. |
-| retrieve | verdict `match` when a fake hit ≥ threshold, `no_match` when all below; **empty/whitespace query → `no_match` with NO embed call** (assert embed_fn not called); `keyword_retrieve` splits+lowercases the query, dedupes to distinct PRDs, snippet drawn from original (not lowercased) text; metadata-only match falls back to leading-text snippet. |
+| chunk | `build_keyword_chunk` emits ONE `chunk_type="keyword"` chunk whose text = lower(body + title + id + tags); an un-enriched doc (no summary) still produces its keyword chunk from the body. |
+| store | `keyword_query` matches the keyword chunk via `where_document`; **case-insensitive** (`"sp3k"` finds an `SP3K` doc); **AND-of-words** (`["bank","dashboard"]` needs both, any order); matches an id/title NOT in body text; respects `k`; distinct stems. **`query()` (semantic) EXCLUDES `chunk_type="keyword"`** (a keyword chunk with a near vector is never returned). |
+| retrieve | verdict `match` when a fake hit ≥ threshold, `no_match` when all below; **empty/whitespace query → `no_match` with NO embed call** (assert embed_fn not called); `keyword_retrieve` lowercases + splits, **drops <2-char tokens** (all-short query → empty), dedupes to distinct PRDs, snippet drawn from original-case summary/body (never the lowercased keyword chunk). |
 | read | `read_prd` returns the full body + metadata for a fixture doc resolved by exact `sync.id`; `found:false` for an unknown id; an **un-enriched** fixture (no summary) still returns its `body`; two ids where one is a prefix of the other resolve to distinct docs (no prefix-collision). |
 | answer | `no_match` verdict → honest non-answer and the fake `chat_fn` is **not** called; `match` → normal grounded flow. |
 | server | `keyword_search` and `read_prd` return the documented shapes; empty query → empty results without a store call; `search_prds` output includes `verdict`. Fakes for store/llm. |
@@ -179,9 +186,15 @@ automated tests.
 | 6 | **Empty/whitespace query** currently embeds "" and returns junk | Low — misleading result | Guard before embed/store: `no_match` / empty |
 | 7 | `read_prd` **id resolution** by stem-prefix could collide (`EP-43` vs `EP-437`) | Low (0 collisions today) | Resolve by exact `sync.id` field |
 | 8 | **Removed-from-Notion** docs | None today (A deletes them) | read_prd/search see only the vault; removed docs are gone by design — documented, no code |
+| 9 | **`$contains` works ONLY on document text, not metadata** (Chroma rejects `$contains` in a `where` clause — verified) | **High** — would break the original "search_text in metadata" design | Lowercased search field is a **keyword chunk's document**, not metadata |
+| 10 | The keyword chunk has a **placeholder vector** | **High** — would pollute every semantic result with garbage | Every vector `store.query` filters `where chunk_type != keyword`; explicit invariant + test |
+| 11 | **Short/stopword tokens** (`"a"`, `"of"`) match almost everything | Medium — noise in AND-of-words | Drop tokens <2 chars; if none remain, return empty |
+| 12 | Largest PRD keyword chunk ≈ **500 KB** of lowercased text | Low — storage/scan cost | Acceptable (Chroma handles it; scan stays ms-fast); note for future capping |
+| 13 | **Special chars in query** (`c++`, `(test)`, `don't`, unicode) | None — verified | `$contains` is literal substring, NOT regex; passes through safely, no sanitization needed |
 
-**Scope note:** Edges 1–2 make the indexer + a **one-time forced reindex** part of Phase 1 (not
-just new tools) — the lowercased `search_text` field must be written for all 287 existing docs.
+**Scope note:** Edges 1–2 and 9–10 make the indexer + a **one-time forced reindex** part of Phase 1
+(not just new tools): every PRD gets a synthetic lowercased keyword chunk, and all 287 existing
+docs must be reindexed to populate them.
 
 ## 9. Out of Scope (YAGNI / deferred)
 
