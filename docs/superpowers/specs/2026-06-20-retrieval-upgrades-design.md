@@ -28,20 +28,29 @@ This phase adds the three Atlas patterns that close those gaps, scaled to a sing
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| keyword_search backend | **Chroma `where_document={"$contains": q}`** | Reuses the index we already build nightly; **measured 1–3 ms/query vs ~20 ms for a from-scratch Python scan** on the real corpus. A separate SQLite-FTS index would match the speed but add a second store to populate + sync, for ranking/stemming we don't need at 287 docs. |
-| Relevance signal | **Whole-result `verdict`: `match` / `no_match` / `degraded`** | Agents branch on the verdict, never the score. Measured separation is clean: in-domain queries score positive (~0.28–0.45), out-of-domain junk negative (~−0.5 to −0.6). |
-| Verdict mechanism | **Score threshold (default ~0.05), NOT an LLM grader** | Threshold already separates cleanly on real data — fast, free, deterministic. `degraded` stays in the enum so an optional LLM grader can be added later without a contract change. |
+| keyword_search backend | **Chroma `where_document={"$contains": term}`** over an **index-time lowercased search field** | Reuses the index we already build nightly; **measured 1–3 ms/query**. A separate SQLite-FTS index would match the speed but add a second store to sync, for ranking/stemming we don't need at 287 docs. Case-insensitivity must be solved at index time (see Edge 1) — a query-time lowercase scan measured 165–580 ms and grows with the corpus. |
+| Case handling | **Index a lowercased `search_text` per chunk = lower(body + title + id + tags); match lower(query) against it** | `$contains` is case-sensitive (`SP3K`→37 hits, `sp3k`→3, `Sp3k`→0). Folding case at index time keeps the 1–3 ms speed AND lets keyword_search match identifiers that live in metadata (the canonical `id`, `title`, `tags`), not just body text. Requires extending the indexer + a one-time reindex. |
+| Multi-word keyword queries | **AND-of-words (token match)**, not raw-phrase substring | `$contains` on a raw phrase fails across chunk boundaries (`"bank report dashboard"`→0 hits). Split the query into words; a chunk matches if its `search_text` contains *every* word (any order). Matches what PMs expect from "search". |
+| Relevance signal | **Whole-result `verdict`: `match` / `no_match` / `degraded`** | Agents branch on the verdict, never the score. |
+| Verdict mechanism | **Score threshold (default ≈ −0.15), NOT an LLM grader** | Threshold separates real junk (weather/pizza/python all ≤ −0.5) from in-domain queries. **Tuned from measured data, NOT ~0.05**: legit PM queries land low (`login` −0.06, `API` −0.20, `user permissions` +0.07), so a 0.05 cutoff would wrongly reject them. ≈ −0.15 keeps borderline-but-real queries as `match` while still rejecting clear out-of-domain junk. Re-tuned against a labeled set in the plan; `degraded` reserves the seam for an optional LLM grader later. |
 | read_prd source | **The vault file via existing `vault.read_doc()`**, not index chunks | Index body chunks carry 150-char overlap; joining them double-counts overlap regions. The vault is the canonical, exact body. Search uses the index; read uses the source. |
+| read_prd id resolution | **Exact match on `sync.id`** (read each doc's frontmatter id), not filename-stem prefix | Today 287/287 ids are unique with zero prefix-collisions and every stem starts with its id, so a prefix scheme works *now* — but matching the exact `id` field future-proofs against `EP-43` vs `EP-437`. |
 | read_prd shape | **Single `read_prd(id)`**, no batch/neighbors/dedup | Atlas's `read_units(ids[], neighbors, already_read_ids)` is YAGNI at 287 docs / ~30 KB bodies. Contract leaves room for a batch variant later. |
+| Degenerate queries | **Empty/whitespace query → `no_match` (search) / empty (keyword) WITHOUT an embed or store call** | `retrieve("")` currently embeds the empty string and returns a junk "result". Guard at the top of both retrieve paths. |
 | Contract compatibility | **Additive** | `search_prds` keeps every existing field and *adds* `verdict`; existing callers don't break. |
 
-### Measured grounding (real index, 2026-06-20)
-- keyword_search latency: `$contains` 1.1–3.1 ms vs python full-scan 18–27 ms (≈8–20× faster; both
-  trivially fast — the deciding factor is simplicity, not speed).
-- verdict separation (top score): referral 0.451, bank-report-dashboard 0.277, SP3K −0.248,
-  weather −0.541, python-debug −0.497, pizza −0.575. A threshold near 0 splits good from junk;
-  SP3K correctly lands below it (no PRD covers it).
-- read_prd: `EP-437` → 34 index chunks (1 summary + 33 overlapping body) vs one clean vault file.
+### Measured grounding (real index, 2026-06-20; 287 PRDs, 7,810 chunks, 7.6 MB)
+- **keyword_search latency:** `$contains` 1.1–3.1 ms vs a query-time case-insensitive full-scan
+  165–580 ms (the latter grows with the corpus — hence the index-time search field).
+- **case-sensitivity:** `SP3K`→37 chunks, `sp3k`→3, `Sp3k`→0 (Edge 1 — the headline risk).
+- **multi-word:** `"SP3K notification"`→0, `"bank report dashboard"`→0 as raw substrings (Edge 3).
+- **verdict separation (top score):** referral 0.451, bank-report-dashboard 0.277, SP3K −0.248;
+  out-of-domain junk weather −0.541, python-debug −0.497, pizza −0.575; **borderline in-domain**
+  login −0.06, API −0.20, user-permissions +0.07 (why the threshold is ≈ −0.15, not 0.05).
+- **read_prd:** `EP-437` → 34 index chunks (1 summary + 33 overlapping body) vs one clean vault
+  file; 287/287 ids unique, 0 prefix-collisions, 0 stems mismatching their id.
+- **enrichment gaps:** 4/287 docs have no `llm.summary`/`body_hash` (B stragglers; recurs) — search
+  must degrade gracefully and read_prd must still return the body.
 
 ## 3. Architecture
 
@@ -50,30 +59,42 @@ what lets Phase 3's web-API reuse the same functions).
 
 ```
 mcp/prd_mcp/
-  config.py    + score_threshold: float = 0.05  (env PRD_SCORE_THRESHOLD)
-  store.py     + keyword_query(query, k) -> rows   (Chroma $contains; includes documents+metadata)
-  retrieve.py  ~ retrieve(...) -> (results, verdict)        (threshold over best score)
+  config.py    + score_threshold: float = -0.15  (env PRD_SCORE_THRESHOLD)
+  chunk.py     ~ Chunk gains search_text (lower(body|summary + title + id + tags)) per chunk
+  store.py     + keyword_query(terms: list[str], k) -> rows   (AND-of-words $contains over
+               |   search_text metadata; includes documents+metadata for the snippet)
+               ~ upsert writes the search_text metadata field
+  index.py     ~ unchanged logic, but re-embeds carry the new search_text (a one-time full reindex
+               |   populates it for existing docs — the body_hash skip-guard means a forced reindex)
+  retrieve.py  ~ retrieve(...) -> (results, verdict)        (threshold over best score; empty-query guard)
                + keyword_retrieve(query, store, k) -> distinct-PRD hits with match snippet
-  read.py      NEW  read_prd(prd_id, read_doc_fn, list_docs_fn) -> dict   (full body from vault)
+               |   (splits query into words, lowercases, AND-matches)
+  read.py      NEW  read_prd(prd_id, read_doc_fn, list_docs_fn) -> dict   (full body from vault,
+               |   resolved by exact sync.id; found:false on miss)
   answer.py    ~ answer(...) short-circuits when verdict == no_match: honest non-answer, NO chat_fn
   server.py    + keyword_search tool, + read_prd tool; search_prds gains `verdict`
 ```
 
 ### Snippet construction (keyword_search)
-A window of body text around the first case-insensitive match (e.g. ±120 chars), so the agent
-triages from the snippet without reading the whole body — and the `k`-cap (insertion-order in
-Chroma) is not a silent quality cliff. Results dedupe to distinct PRDs.
+A window of body text around the first matched word (e.g. ±120 chars), drawn from the **original**
+chunk text (not the lowercased `search_text`), so the agent triages from a readable snippet without
+reading the whole body — and the `k`-cap (insertion-order in Chroma) is not a silent quality cliff.
+Results dedupe to distinct PRDs. When the only match is in metadata (title/id/tags, not the body),
+fall back to the chunk's leading text for the snippet.
 
 ## 4. Tool Contracts
 
 ### `keyword_search`
 ```
-description: "Exact-substring search over PRD bodies for literal identifiers — codes, numbers,
-              product names, abbreviations (e.g. EP-457, SP3K, KPR, LTV) that semantic search
-              ranks poorly. Returns matching PRDs with a snippet around each hit. Pair with
-              search_prds for concept queries; union both for mixed queries."
+description: "Case-insensitive keyword search over PRD body, title, id, and tags — for literal
+              identifiers (codes, numbers, product names, abbreviations: EP-457, SP3K, KPR, LTV)
+              that semantic search ranks poorly. Multi-word queries match documents containing ALL
+              the words (any order). Returns matching PRDs with a snippet. Pair with search_prds
+              for concept queries; union both for mixed queries."
 input:  { query: string (required), k: integer (optional, default 10, max 20) }
 output: { results: [ { id, title, status, tags, source_url, obsidian_link, snippet } ], count: N }
+// Case-insensitive (matches an index-time lowercased search field). Multi-word = AND-of-words.
+// Empty/whitespace query -> { results: [], count: 0 } without touching the store.
 ```
 
 ### `read_prd`
@@ -107,10 +128,14 @@ exposed to clients; one bad doc never aborts; a tool error never crashes the ser
 ## 5. Data Flow
 
 ```
-keyword_search:  query -> store.keyword_query($contains, k) -> dedupe distinct PRDs + snippet -> results
-search_prds:     query -> embed -> store.query -> retrieve(): best score vs threshold -> (results, verdict)
+keyword_search:  query -> (empty? -> []) -> lower+split into words -> store.keyword_query(words, k)
+                 -> AND-of-words $contains over search_text -> dedupe distinct PRDs + snippet -> results
+search_prds:     query -> (empty? -> no_match) -> embed -> store.query -> retrieve(): best score
+                 vs threshold -> (results, verdict)
 ask_prds:        same retrieve -> verdict==no_match ? honest no-answer (no LLM) : build_prompt -> chat
-read_prd:        id -> resolve to vault path -> vault.read_doc() -> { found, body, metadata }
+read_prd:        id -> resolve by exact sync.id -> vault.read_doc() -> { found, body, metadata }
+index (one-time): forced full reindex re-embeds every doc and writes the new search_text field;
+                 thereafter nightly incremental-by-body_hash as before.
 ```
 
 ## 6. Error Handling
@@ -118,9 +143,13 @@ read_prd:        id -> resolve to vault path -> vault.read_doc() -> { found, bod
 | Situation | Behavior |
 |---|---|
 | keyword_search no match | `{results: [], count: 0}` — empty, not an error |
+| keyword_search / search_prds empty or whitespace query | `{results: [], count: 0}` / `verdict: "no_match"` — guarded BEFORE any embed or store call |
 | read_prd unknown id | `{found: false, body: "", ...}` — honest; server stays up |
+| read_prd on an un-enriched doc (no summary) | still returns the full `body`; `summary`/`tags` may be empty — not an error |
 | search_prds all below threshold | `verdict: "no_match"`, `results: []` |
+| search_prds over un-enriched docs | empty `summary` field, never a crash (missing metadata defaults to `""`) |
 | ask_prds on no_match | honest "no PRD covers this", `grounded:false`, **no LLM call** |
+| Index missing the search_text field (pre-reindex) | keyword_search falls back to matching the chunk `document` text; full coverage after the one-time reindex |
 | Index empty / missing | existing clear MCP error ("index not built — run `prd-mcp index`") |
 | Embed / LLM failure | existing bounded retry + wall-clock timeout |
 
@@ -131,13 +160,30 @@ automated tests.
 
 | Layer | Tests |
 |---|---|
-| store | `keyword_query` finds a known literal; respects `k`; returns distinct stems; row includes document text for the snippet. |
-| retrieve | verdict `match` when a fake hit ≥ threshold, `no_match` when all below; `keyword_retrieve` dedupes to distinct PRDs and builds a snippet around the match. |
-| read | `read_prd` returns the full body + metadata for a fixture doc; `found:false` for an unknown id. |
+| chunk | `chunk_doc` populates `search_text` = lower(text + title + id + tags); an un-enriched doc (no summary) still chunks its body. |
+| store | `keyword_query` matches the lowercased `search_text`; **case-insensitive** (`"sp3k"` finds an `SP3K` doc); **AND-of-words** (`["bank","dashboard"]` needs both, any order); matches an id/title that is NOT in body text; respects `k`; distinct stems; row carries original document text for the snippet. |
+| retrieve | verdict `match` when a fake hit ≥ threshold, `no_match` when all below; **empty/whitespace query → `no_match` with NO embed call** (assert embed_fn not called); `keyword_retrieve` splits+lowercases the query, dedupes to distinct PRDs, snippet drawn from original (not lowercased) text; metadata-only match falls back to leading-text snippet. |
+| read | `read_prd` returns the full body + metadata for a fixture doc resolved by exact `sync.id`; `found:false` for an unknown id; an **un-enriched** fixture (no summary) still returns its `body`; two ids where one is a prefix of the other resolve to distinct docs (no prefix-collision). |
 | answer | `no_match` verdict → honest non-answer and the fake `chat_fn` is **not** called; `match` → normal grounded flow. |
-| server | `keyword_search` and `read_prd` return the documented shapes; `search_prds` output includes `verdict`. Fakes for store/llm. |
+| server | `keyword_search` and `read_prd` return the documented shapes; empty query → empty results without a store call; `search_prds` output includes `verdict`. Fakes for store/llm. |
 
-## 8. Out of Scope (YAGNI / deferred)
+## 8. Edge Cases (probed against the live index 2026-06-20; all covered above)
+
+| # | Edge case | Risk | Handling |
+|---|---|---|---|
+| 1 | `$contains` is **case-sensitive** (`SP3K`→37, `sp3k`→3, `Sp3k`→0) | **High** — PMs type lowercase | Index-time lowercased `search_text`; match `lower(query)` against it |
+| 2 | Canonical **id lives in metadata**, not body text | Medium — `keyword_search("EP-501")` could miss the real EP-501 | `search_text` includes id + title + tags, so identifiers are matched |
+| 3 | **Multi-word** phrases split across chunks (`"bank report dashboard"`→0) | Medium — silent empty results | AND-of-words token matching, not raw-phrase substring |
+| 4 | **Threshold ~0.05 too aggressive** (`login` −0.06, `API` −0.20 are real) | Medium — wrongly rejects valid queries | Threshold ≈ −0.15, re-tuned against a labeled set; junk still ≤ −0.5 |
+| 5 | **Un-enriched docs** (4/287, recurs) have no summary/body_hash | Low — empty summary | Search degrades to empty summary; read_prd returns body regardless |
+| 6 | **Empty/whitespace query** currently embeds "" and returns junk | Low — misleading result | Guard before embed/store: `no_match` / empty |
+| 7 | `read_prd` **id resolution** by stem-prefix could collide (`EP-43` vs `EP-437`) | Low (0 collisions today) | Resolve by exact `sync.id` field |
+| 8 | **Removed-from-Notion** docs | None today (A deletes them) | read_prd/search see only the vault; removed docs are gone by design — documented, no code |
+
+**Scope note:** Edges 1–2 make the indexer + a **one-time forced reindex** part of Phase 1 (not
+just new tools) — the lowercased `search_text` field must be written for all 287 existing docs.
+
+## 9. Out of Scope (YAGNI / deferred)
 
 - A separate FTS index (SQLite FTS5 / inverted index) — `$contains` is fast enough and reuses the
   existing store. Revisit only if keyword **ranking** quality becomes a real need.
