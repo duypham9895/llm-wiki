@@ -10,7 +10,9 @@ from prd_mcp.server import build_server
 def main() -> int:
     parser = argparse.ArgumentParser(prog="prd-mcp")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("index", help="build/refresh the PRD index")
+    idx = sub.add_parser("index", help="build/refresh the PRD index")
+    idx.add_argument("--force", action="store_true",
+                     help="re-embed every doc (ignore body_hash skip-guard)")
     serve = sub.add_parser("serve", help="run the MCP server")
     serve.add_argument("--http", action="store_true", help="streamable-http transport (token-gated)")
     args = parser.parse_args()
@@ -20,7 +22,7 @@ def main() -> int:
 
     if args.cmd == "index":
         llm = make_client(cfg)
-        res = run_index(cfg, store, llm.embed)
+        res = run_index(cfg, store, llm.embed, force=args.force)
         print(f"indexed {res['indexed']} · skipped {res['skipped']} · "
               f"removed {res['removed']} · errors {res['errors']}")
         return 1 if res["errors"] else 0

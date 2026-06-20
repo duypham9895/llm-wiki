@@ -19,6 +19,7 @@ class Config:
     request_timeout: int
     max_retries: int
     http_token: str
+    score_threshold: float
 
 
 def load_config(env: dict, read_secret_fn) -> Config:
@@ -41,4 +42,5 @@ def load_config(env: dict, read_secret_fn) -> Config:
         request_timeout=int(env.get("REQUEST_TIMEOUT", "60")),
         max_retries=int(env.get("MAX_RETRIES", "3")),
         http_token=env.get("MCP_AUTH_TOKEN", ""),
+        score_threshold=float(env.get("PRD_SCORE_THRESHOLD", "-0.15")),
     )

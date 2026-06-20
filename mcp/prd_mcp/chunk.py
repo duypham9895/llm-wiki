@@ -40,4 +40,12 @@ def chunk_doc(doc: Doc, size: int, overlap: int) -> list[Chunk]:
         chunks.append(base("summary", 0, doc.summary))
     for i, part in enumerate(_split(doc.body, size, overlap)):
         chunks.append(base("body", i, part))
+    chunks.append(build_keyword_chunk(doc))
     return chunks
+
+
+def build_keyword_chunk(doc: Doc) -> Chunk:
+    parts = [doc.body or "", doc.title or "", doc.id or "", " ".join(doc.tags or [])]
+    text = " ".join(p for p in parts if p).lower()
+    return Chunk(doc.stem, doc.id, doc.title, doc.source_url, doc.status,
+                 list(doc.platform), list(doc.tags), "keyword", 0, text, doc.summary or "")

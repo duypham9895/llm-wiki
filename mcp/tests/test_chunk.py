@@ -34,3 +34,43 @@ def test_empty_body():
     cs = chunk_doc(mk("", summary="only"), 1000, 150)
     assert not any(c.chunk_type == "body" for c in cs)
     assert any(c.chunk_type == "summary" for c in cs)
+
+
+def test_build_keyword_chunk_lowercased_and_includes_metadata():
+    from prd_mcp.chunk import build_keyword_chunk
+    from prd_mcp.vault import Doc
+    d = Doc(stem="EP-7-x", id="EP-7", title="Referral CODE", source_url="u",
+            status="Released", platform=["CRM"], tags=["KPR", "Affiliate"],
+            summary="S", body_hash="h", body="The SP3K Notification flow")
+    ch = build_keyword_chunk(d)
+    assert ch.chunk_type == "keyword"
+    assert ch.index == 0
+    # everything lowercased; body + title + id + tags all present
+    assert "sp3k notification" in ch.text
+    assert "referral code" in ch.text
+    assert "ep-7" in ch.text
+    assert "kpr" in ch.text and "affiliate" in ch.text
+    assert ch.text == ch.text.lower()
+
+
+def test_chunk_doc_appends_one_keyword_chunk():
+    from prd_mcp.chunk import chunk_doc
+    from prd_mcp.vault import Doc
+    d = Doc(stem="EP-7-x", id="EP-7", title="T", source_url="u", status="x",
+            platform=[], tags=["a"], summary="Sum", body_hash="h", body="hello world")
+    chunks = chunk_doc(d, 1000, 150)
+    kw = [c for c in chunks if c.chunk_type == "keyword"]
+    assert len(kw) == 1
+    assert chunks[-1].chunk_type == "keyword"  # appended last
+
+
+def test_chunk_doc_keyword_chunk_for_unenriched_doc():
+    # No summary -> still emits a keyword chunk built from the body.
+    from prd_mcp.chunk import chunk_doc
+    from prd_mcp.vault import Doc
+    d = Doc(stem="EP-9-y", id="EP-9", title="Title", source_url="u", status="x",
+            platform=[], tags=[], summary=None, body_hash=None, body="some body text")
+    chunks = chunk_doc(d, 1000, 150)
+    kw = [c for c in chunks if c.chunk_type == "keyword"]
+    assert len(kw) == 1
+    assert "some body text" in kw[0].text

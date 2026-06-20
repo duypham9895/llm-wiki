@@ -22,8 +22,8 @@ def format_sources(retrieved: list) -> list:
     return out
 
 
-def answer(question: str, retrieved: list, chat_fn) -> dict:
-    if not retrieved:
+def answer(question: str, retrieved: list, verdict: str, chat_fn) -> dict:
+    if verdict == "no_match" or not retrieved:
         return {"answer": "No PRD covers this.", "sources": [], "grounded": False}
     prose = chat_fn(build_messages(question, retrieved))
     return {"answer": prose, "sources": format_sources(retrieved), "grounded": True}
