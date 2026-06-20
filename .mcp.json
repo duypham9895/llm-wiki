@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ringkas-prds": {
+      "command": "/Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki/mcp/.venv/bin/prd-mcp",
+      "args": ["serve"],
+      "cwd": "/Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki/mcp",
+      "env": {
+        "VAULT_PATH": "/Users/edwardpham/Documents/Backup/Obsidian/ringkas"
+      }
+    }
+  }
+}

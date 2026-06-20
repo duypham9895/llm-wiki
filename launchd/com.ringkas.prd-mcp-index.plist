@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ringkas.prd-mcp-index</string>
+  <!-- 4th nightly job: re-embeds the MCP's OWN Chroma index (<vault>/.chroma-mcp)
+       incrementally by body_hash, after the A (11:00) -> B (11:45) -> C (12:10) chain,
+       so the index reflects the freshest enrichment. Uses the venv console script
+       directly (no poetry indirection) for a stable absolute path. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string>
+    <string>cd /Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki/mcp &amp;&amp; VAULT_PATH="/Users/edwardpham/Documents/Backup/Obsidian/ringkas" /Users/edwardpham/Documents/Workspace/Ringkas/Programming/Personal/llm-wiki/mcp/.venv/bin/prd-mcp index</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>20</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/prd-mcp-index.log</string>
+  <key>StandardErrorPath</key><string>/tmp/prd-mcp-index.err.log</string>
+</dict>
+</plist>
