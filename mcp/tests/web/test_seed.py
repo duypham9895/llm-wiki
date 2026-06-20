@@ -80,3 +80,17 @@ async def test_app_settings_not_clobbered_on_redeploy(db, settings):
     await seed.run_seed(db, first)
     row = (await db.execute(select(AppSettings))).scalar_one()
     assert row.registration_enabled is False
+
+
+async def test_global_pair_integrity_fails_on_half_admin_role_with_no_user(db, settings):
+    """A custom role holding exactly one admin-pair perm, assigned to NO user,
+    must still fail the startup guard via the role-scan branch (the user-scan
+    branch does not fire here since the role is unassigned)."""
+    await seed.run_seed(db, settings)
+    rm = (await db.execute(select(Permission).where(Permission.name == "roles.manage"))).scalar_one()
+    half = Role(name="half_admin_unassigned")
+    half.permissions.append(rm)
+    db.add(half)
+    await db.commit()
+    with pytest.raises(RuntimeError):
+        await seed.assert_global_pair_integrity(db)
