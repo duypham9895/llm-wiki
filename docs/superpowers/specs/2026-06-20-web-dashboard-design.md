@@ -64,9 +64,11 @@ streaming + multi-turn, then adds an HTTP door and a frontend, and a pipeline or
 ```
 mcp/prd_mcp/                         SHARED CORE (extended, still MCP/web-agnostic)
   answer.py     + rewrite_query(history, latest, chat_fn) -> str   (standalone search query)
-                + answer_stream(question, retrieved, verdict, chat_stream_fn) -> Iterator[str]
-                  TOKEN-ONLY: yields answer-text tokens; on no_match yields the fixed non-answer and
-                  does NOT call chat_stream_fn (mirrors answer()'s short-circuit). Sources/grounded
+                + async answer_stream(question, retrieved, verdict, chat_stream_fn) -> AsyncIterator[str]
+                  ASYNC GENERATOR, TOKEN-ONLY: `async for tok in chat_stream_fn(...)` and yields each
+                  token; on no_match yields the fixed non-answer and does NOT call chat_stream_fn
+                  (mirrors answer()'s short-circuit). Async because chat_stream_fn is async (below).
+                  Sources/grounded
                   are NOT yielded here — the chat route already holds `retrieved`+`verdict` (step 4)
                   and builds the sources/grounded payload itself via answer.format_sources().
                   (existing answer() retained unchanged for the non-streaming MCP path)
@@ -196,7 +198,7 @@ All state-changing requests require Phase 2's CSRF header `X-Requested-With: prd
 2. acquire the per-conversation generation lock (Postgres advisory lock keyed on conversation_id,
    OR a `conversations.generating` flag set in a transaction); if already held -> 409 conversation_busy
 3. load prior turns of THIS conversation BEFORE inserting the new row (history excludes the current
-   message), ordered by (created_at, id); THEN persist the user message row (committed in its own txn)
+   message), ordered by `seq`; THEN persist the user message row with the next `seq` (committed in its own txn)
 4. standalone_query = await to_thread(rewrite_query, history, content, llm.chat)  [event: rewrite]
    (empty history -> rewrite_query returns `content` unchanged, no LLM call)
 5. (results, verdict) = await to_thread(retrieve, standalone_query, store, llm.embed, top_k, threshold)
