@@ -178,8 +178,8 @@ automated tests.
 
 | # | Edge case | Risk | Handling |
 |---|---|---|---|
-| 1 | `$contains` is **case-sensitive** (`SP3K`→37, `sp3k`→3, `Sp3k`→0) | **High** — PMs type lowercase | Index-time lowercased `search_text`; match `lower(query)` against it |
-| 2 | Canonical **id lives in metadata**, not body text | Medium — `keyword_search("EP-501")` could miss the real EP-501 | `search_text` includes id + title + tags, so identifiers are matched |
+| 1 | `$contains` is **case-sensitive** (`SP3K`→37, `sp3k`→3, `Sp3k`→0) | **High** — PMs type lowercase | Per-PRD keyword chunk holds lowercased text; match `lower(query)` against it (see Edge 9) |
+| 2 | Canonical **id lives in metadata**, not body text | Medium — `keyword_search("EP-501")` could miss the real EP-501 | Keyword chunk text includes id + title + tags, so identifiers are matched |
 | 3 | **Multi-word** phrases split across chunks (`"bank report dashboard"`→0) | Medium — silent empty results | AND-of-words token matching, not raw-phrase substring |
 | 4 | **Threshold ~0.05 too aggressive** (`login` −0.06, `API` −0.20 are real) | Medium — wrongly rejects valid queries | Threshold ≈ −0.15, re-tuned against a labeled set; junk still ≤ −0.5 |
 | 5 | **Un-enriched docs** (4/287, recurs) have no summary/body_hash | Low — empty summary | Search degrades to empty summary; read_prd returns body regardless |
