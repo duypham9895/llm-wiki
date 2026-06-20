@@ -731,7 +731,7 @@ def answer(question: str, retrieved: list, verdict: str, chat_fn) -> dict:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/test_answer.py -v`
-Expected: PASS (4 tests: 2 unchanged helpers + 3 answer... wait, 2 helpers + 3 answer = 5). Expected: PASS (all answer tests).
+Expected: PASS (5 tests: 2 unchanged helpers + 3 answer tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1001,7 +1001,7 @@ def build_server(cfg, store, llm) -> FastMCP:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/test_server.py -v`
-Expected: PASS (13 tests).
+Expected: PASS (11 tests).
 
 - [ ] **Step 5: Run the FULL suite (cross-task integration check)**
 
