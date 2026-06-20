@@ -189,6 +189,14 @@ locked system roles exist, then checks the break-glass predicate: **if NO active
 is never touched — existing passwords/roles are never reset. This makes `.env` a genuine recovery
 path if the admin is deleted/disabled.
 
+**Startup integrity guard (defense against DB-surgery / bad-migration bypass):** the API-layer
+`assert_pair_integrity` only governs requests, not direct SQL or a flawed Alembic migration. So on
+every boot, AFTER migrations + seeding, `seed.py` runs `assert_global_pair_integrity()`: it scans
+every role's permission set and every active user's effective union; if any holds exactly one of
+`{users.manage, roles.manage}`, it re-asserts the locked system roles and **fails startup** (loud,
+naming the offending role/user) rather than serving a half-admin state. This closes the only
+remaining path to a half-admin (a write that bypasses the API).
+
 **Settings storage (single source of truth = DB after first boot):** the `app_settings` row is
 **seeded from `REGISTRATION_ENABLED` / `ALLOWED_EMAIL_DOMAINS` env vars ONLY on first boot (when the
 row does not yet exist)**. Thereafter the DB row is authoritative and the env vars are ignored — so
@@ -304,16 +312,20 @@ authed req: cookie → sha256 → sessions lookup → now < idle_expires_at AND 
            → resolve effective_permissions FRESH from user_roles/role_permissions (never cached)
            → require_permission(name) checks membership → 200 or 403
 
-approve:   admin POST /users/{id}/approve {role_ids}
+approve:   admin POST /users/{id}/approve {role_ids}   (one transaction)
            → status pending→active, approved_at/by set, user_roles replaced with role_ids
+           → assert_pair_integrity(effective_perms_after)  (422 admin_pair if exactly one of the pair)
+           → commit
 
 disable:   admin POST /users/{id}/disable   (all in ONE transaction)
            → set status active→disabled → assert_admin_invariant(post-state) → revoke_user_sessions(id)
            → commit; on invariant violation ROLL BACK and return 409 last_admin (status unchanged)
 
-set-roles: admin PUT /users/{id}/roles {role_ids}
-           → in one tx: replace user_roles ; assert_admin_invariant(after) (rollback+409 if violated)
+set-roles: admin PUT /users/{id}/roles {role_ids}   (one transaction)
+           → replace user_roles
+           → assert_pair_integrity(effective_perms_after) (422)  THEN  assert_admin_invariant(after) (409)
            → revoke_user_sessions(id) so the next request resolves the new permission set cleanly
+           → commit; rollback on either violation
 ```
 
 ---
@@ -382,7 +394,7 @@ network; argon2 with reduced rounds in tests for speed.
 | auth endpoints | register ALWAYS returns identical `202 {status:'accepted'}` for success/disabled/bad-domain/email-taken (no enumeration); login fixed-order (verify before status), identical 401 for unknown/wrong-pw/inactive; logout deletes session; me reflects live roles/permissions; change-password verifies current + revokes other sessions. |
 | admin endpoints | approve pending→active + assigns roles; reject pending→deleted; disable revokes sessions; set-roles replaces + revokes target sessions; reset-password sets + revokes; role-in-use delete → 409; is_system role edit/delete → 409; settings toggle persists; all admin endpoints 403 without the permission. |
 | last-admin invariant | EACH path that could break it is rejected with 409 and rolled back: disable the last admin; delete the last admin; set-roles removing admin-equiv from the last admin; delete/edit a custom role that holds the last admin-equiv perms. The invariant is satisfied again after adding a second admin. |
-| admin-pair integrity | creating/updating a custom role with ONLY `users.manage` → 422; with ONLY `roles.manage` → 422; with BOTH or NEITHER → ok. Assigning a user a role-set whose union is exactly one of the pair → 422. The seeded `admin` (both) and `member` (neither) pass. |
+| admin-pair integrity | creating/updating a custom role with ONLY `users.manage` → 422; with ONLY `roles.manage` → 422; with BOTH or NEITHER → ok. Assigning a user (approve/set-roles) a role-set whose union is exactly one of the pair → 422. The seeded `admin` (both) and `member` (neither) pass. **Startup guard:** a half-admin row injected directly via SQL makes `assert_global_pair_integrity()` fail boot (loud) rather than serve it. |
 | escalation (accepted model) | a full admin (both perms) CAN mint another admin — assert the model holds; a user with ONLY `prd.read` cannot reach any admin endpoint; a user cannot call admin endpoints to act before approval; there is NO reachable state where a user holds exactly one of the admin pair (pair-integrity). |
 | settings authority | env seeds the row on first boot; a second boot with a DIFFERENT env value does NOT overwrite the existing DB row (single source of truth after first boot). |
 | domain matching | `evilringkas.co.id` is rejected when only `ringkas.co.id` is allowed (exact match, no suffix); case/whitespace/IDNA normalized. |
