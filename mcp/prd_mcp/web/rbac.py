@@ -10,9 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import Depends, Request
-from sqlalchemy import func, select
-
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
 from prd_mcp.web.db import get_db
 from prd_mcp.web.errors import forbidden, last_admin_error, pair_error, unauthorized
@@ -28,7 +26,7 @@ from prd_mcp.web.settings import WebSettings
 
 # Arbitrary fixed key for the transaction-scoped advisory lock that serializes
 # the last-admin check-then-mutate across concurrent requests.
-_ADMIN_INVARIANT_LOCK_KEY = 4827310199
+_ADMIN_INVARIANT_LOCK_KEY = 4827310199  # 64-bit bigint key for pg_advisory_xact_lock (intentionally > int4 max)
 
 PERMISSIONS: dict[str, str] = {
     "prd.read": "Read PRDs (Library + Search).",
@@ -71,7 +69,6 @@ async def assert_admin_invariant(db) -> None:
     Callers MUST run this AFTER their flush and BEFORE their commit.
     """
     await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=_ADMIN_INVARIANT_LOCK_KEY))
-    pair = list(ADMIN_PAIR)
     stmt = (
         select(func.count())
         .select_from(
@@ -79,9 +76,9 @@ async def assert_admin_invariant(db) -> None:
             .join(user_roles, user_roles.c.user_id == User.id)
             .join(role_permissions, role_permissions.c.role_id == user_roles.c.role_id)
             .join(Permission, Permission.id == role_permissions.c.permission_id)
-            .where(User.status == "active", Permission.name.in_(pair))
+            .where(User.status == "active", Permission.name.in_(ADMIN_PAIR))
             .group_by(User.id)
-            .having(func.count(func.distinct(Permission.name)) == len(pair))
+            .having(func.count(func.distinct(Permission.name)) == len(ADMIN_PAIR))
             .subquery()
         )
     )
@@ -122,15 +119,15 @@ async def current_user(
     if loaded is None:
         raise unauthorized()
     user, token_hash = loaded
+    request.state.session_token_hash = token_hash
+    request.state.current_user = user
     # resolve_session slid idle_expires_at (and maybe last_seen_at) but only
     # flushed. get_db does NOT commit on success, and read-only handlers (e.g.
     # /me) never commit, so without this the slide rolls back and the idle window
     # never actually moves in production (spec §4 requires it to slide on
     # activity). Commit the slide here; mutating handlers commit again later,
     # which is a harmless no-op on an already-committed slide.
-    await db.commit()
-    request.state.session_token_hash = token_hash
-    request.state.current_user = user
+    await db.commit()  # commit the idle slide (after state is set)
     return user
 
 
