@@ -70,3 +70,67 @@ async def test_delete_role_in_use_is_409(client, settings, sessionmaker_):
         await s.commit()
     r = await client.delete(f"/api/admin/roles/{rid}")
     assert r.status_code == 409 and r.json()["error"]["code"] == "role_in_use"
+
+
+async def _make_custom_admin_role_on_admin(client, settings, sessionmaker_):
+    """Give the admin user a CUSTOM role with both admin-pair perms, then remove
+    the seeded system admin role, so the custom role is the sole admin source."""
+    both = await _perm_ids(sessionmaker_, ["users.manage", "roles.manage"])
+    created = await client.post("/api/admin/roles", json={"name": "custom_admin", "permission_ids": both})
+    assert created.status_code == 201
+    custom_id = created.json()["id"]
+    async with sessionmaker_() as s:
+        admin = (await s.execute(select(User).where(User.email == settings.admin_email))).scalar_one()
+        custom = (await s.execute(select(Role).where(Role.name == "custom_admin"))).scalar_one()
+        admin.roles[:] = [custom]   # sole admin source is now the custom role
+        await s.commit()
+    return custom_id
+
+
+async def test_update_custom_admin_role_removing_pair_is_409(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    custom_id = await _make_custom_admin_role_on_admin(client, settings, sessionmaker_)
+    read_only = await _perm_ids(sessionmaker_, ["prd.read"])
+    r = await client.put(f"/api/admin/roles/{custom_id}", json={"permission_ids": read_only})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "last_admin"
+
+
+async def test_delete_custom_admin_role_is_409_last_admin(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    custom_id = await _make_custom_admin_role_on_admin(client, settings, sessionmaker_)
+    # deleting the sole admin-source role would drop the last admin (it's assigned,
+    # so role_in_use OR last_admin may fire — both are correct 409s; assert 409)
+    r = await client.delete(f"/api/admin/roles/{custom_id}")
+    assert r.status_code == 409 and r.json()["error"]["code"] in ("last_admin", "role_in_use")
+
+
+async def _make_custom_admin_role_on_admin(client, settings, sessionmaker_):
+    """Give the admin user a CUSTOM role with both admin-pair perms, then make it
+    the sole admin source (replace the seeded system admin role on that user)."""
+    both = await _perm_ids(sessionmaker_, ["users.manage", "roles.manage"])
+    created = await client.post("/api/admin/roles", json={"name": "custom_admin", "permission_ids": both})
+    assert created.status_code == 201
+    custom_id = created.json()["id"]
+    async with sessionmaker_() as s:
+        admin = (await s.execute(select(User).where(User.email == settings.admin_email))).scalar_one()
+        custom = (await s.execute(select(Role).where(Role.name == "custom_admin"))).scalar_one()
+        admin.roles[:] = [custom]
+        await s.commit()
+    return custom_id
+
+
+async def test_update_custom_admin_role_removing_pair_is_409(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    custom_id = await _make_custom_admin_role_on_admin(client, settings, sessionmaker_)
+    read_only = await _perm_ids(sessionmaker_, ["prd.read"])
+    r = await client.put(f"/api/admin/roles/{custom_id}", json={"permission_ids": read_only})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "last_admin"
+
+
+async def test_delete_custom_admin_role_is_409(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    custom_id = await _make_custom_admin_role_on_admin(client, settings, sessionmaker_)
+    # role is assigned to the sole admin: deleting it would drop the last admin.
+    # role_in_use (FK RESTRICT) or last_admin may fire first — both are correct 409s.
+    r = await client.delete(f"/api/admin/roles/{custom_id}")
+    assert r.status_code == 409 and r.json()["error"]["code"] in ("last_admin", "role_in_use")
