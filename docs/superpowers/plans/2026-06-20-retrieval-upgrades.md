@@ -538,6 +538,15 @@ def test_keyword_retrieve_snippet_falls_back_to_summary_when_body_missing():
     assert out[0].text == "The Summary Text"  # fell back to summary
 
 
+def test_keyword_retrieve_snippet_falls_back_when_term_absent_from_body():
+    # body EXISTS but does not contain the matched term (it matched via title/id/tags)
+    # -> must fall back to summary, NOT return an arbitrary body[:200] (Codex F3)
+    store = FakeStore(kw_rows=[kwrow("EP-1-a", "The Summary Text")])
+    out = keyword_retrieve("sp3k", store, 10, "/v",
+                           read_body_fn=lambda stem, prds, **kw: "body without the term at all")
+    assert out[0].text == "The Summary Text"  # summary, not "body without..."
+
+
 def test_keyword_retrieve_all_short_tokens_returns_empty():
     store = FakeStore(kw_rows=[kwrow("EP-1-a")])
     out = keyword_retrieve("a", store, 10, "/v", read_body_fn=lambda *a, **k: "")
@@ -610,20 +619,31 @@ def retrieve(query: str, store, embed_fn, k: int, threshold: float):
 
 
 def _snippet(body: str, first_term: str, summary: str, title: str) -> str:
+    # Prefer a body window around the first matched term. If the term is NOT in
+    # the body (it matched via title/id/tags in the keyword chunk), fall back to
+    # the summary, then the title — never an arbitrary body[:200] that doesn't
+    # contain the match (Codex F3).
     if body and first_term:
         idx = body.lower().find(first_term)
         if idx >= 0:
             start = max(0, idx - 100)
             return body[start:idx + 120]
-        return body[:200]
     if summary:
         return summary
-    return title
+    if title:
+        return title
+    return body[:200] if body else ""
+
+
+def tokenize(query: str) -> list:
+    # Lowercase, split, drop tokens shorter than 2 chars (1-char tokens like "a"
+    # match almost everything). Shared by the server's pre-store guard (Codex N2).
+    return [t for t in (query or "").lower().split() if len(t) >= 2]
 
 
 def keyword_retrieve(query: str, store, k: int, prds_dir: str,
                      read_body_fn=read_body_by_stem) -> list:
-    terms = [t for t in (query or "").lower().split() if len(t) >= 2]
+    terms = tokenize(query)
     if not terms:
         return []
     rows = store.keyword_query(terms, k)
@@ -643,7 +663,7 @@ def keyword_retrieve(query: str, store, k: int, prds_dir: str,
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/test_retrieve.py -v`
-Expected: PASS (7 tests).
+Expected: PASS (8 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -776,16 +796,22 @@ class FakeLlm:
     def chat(self, msgs): return "answer prose"
 
 
+def _doc_id(stem):
+    # "EP-1-a" -> "EP-1" (the real id is the first two dash-segments, not stem[:5]
+    # which would wrongly yield "EP-1-" with a trailing hyphen)
+    return "-".join(stem.split("-")[:2])
+
+
 def srow(stem, dist):
     return {"text": "body", "distance": dist, "metadata": {
-        "doc_stem": stem, "doc_id": stem[:5], "title": f"T {stem}",
+        "doc_stem": stem, "doc_id": _doc_id(stem), "title": f"T {stem}",
         "source_url": f"https://n/{stem}", "status": "x", "tags": "a,b",
         "summary": "sum", "chunk_type": "body"}}
 
 
 def krow(stem):
     return {"text": "kw text lowercased", "metadata": {
-        "doc_stem": stem, "doc_id": stem[:5], "title": f"T {stem}",
+        "doc_stem": stem, "doc_id": _doc_id(stem), "title": f"T {stem}",
         "source_url": f"https://n/{stem}", "status": "x", "tags": "a,b",
         "summary": "Original Summary", "chunk_type": "keyword"}}
 
@@ -831,8 +857,11 @@ def test_ask_prds_match_returns_answer():
 
 
 def test_keyword_search_returns_distinct_with_snippet(monkeypatch):
-    import prd_mcp.server as srv
-    monkeypatch.setattr(srv, "read_body_by_stem", _no_body)
+    # Patch the binding keyword_retrieve actually uses (retrieve module), so the
+    # body read returns "" and the snippet falls back to the summary — by the
+    # patch, not by accident (Codex/Claude minor).
+    import prd_mcp.retrieve as ret
+    monkeypatch.setattr(ret, "read_body_by_stem", _no_body)
     store = FakeStore(kw=[krow("EP-1-a"), krow("EP-2-b")])
     out = keyword_search_impl(Cfg(), store, FakeLlm(), "bank dashboard", 10)
     assert out["count"] == 2
@@ -843,6 +872,13 @@ def test_keyword_search_returns_distinct_with_snippet(monkeypatch):
 
 def test_keyword_search_empty_query_does_not_touch_store():
     out = keyword_search_impl(Cfg(), BoomStore(), FakeLlm(), "  ", 10)
+    assert out["count"] == 0 and out["results"] == []
+
+
+def test_keyword_search_all_short_tokens_does_not_touch_store():
+    # "a b" is non-blank but every token is <2 chars -> zero usable tokens.
+    # Must return empty WITHOUT touching the store (Codex N2).
+    out = keyword_search_impl(Cfg(), BoomStore(), FakeLlm(), "a b", 10)
     assert out["count"] == 0 and out["results"] == []
 
 
@@ -876,9 +912,9 @@ Replace the whole file with:
 
 ```python
 from mcp.server.fastmcp import FastMCP
-from prd_mcp.retrieve import retrieve, keyword_retrieve
+from prd_mcp.retrieve import retrieve, keyword_retrieve, tokenize
 from prd_mcp.answer import answer as build_answer
-from prd_mcp.read import read_prd as _read_prd, read_body_by_stem
+from prd_mcp.read import read_prd as _read_prd
 from prd_mcp.vault import read_doc, list_docs
 
 
@@ -915,7 +951,9 @@ def ask_prds_impl(cfg, store, llm, question: str) -> dict:
 
 
 def keyword_search_impl(cfg, store, llm, query: str, k: int) -> dict:
-    if _blank(query):
+    # Guard BEFORE _ensure_index: blank OR all-short-token queries (e.g. "a b" ->
+    # zero usable tokens) must return empty without touching the store (Codex N2).
+    if _blank(query) or not tokenize(query):
         return {"count": 0, "results": []}
     _ensure_index(store)
     k = min(max(1, int(k)), 20)
@@ -963,7 +1001,7 @@ def build_server(cfg, store, llm) -> FastMCP:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/test_server.py -v`
-Expected: PASS (11 tests).
+Expected: PASS (13 tests).
 
 - [ ] **Step 5: Run the FULL suite (cross-task integration check)**
 
@@ -1077,11 +1115,15 @@ EMBED_DIM = 1536  # text-embedding-3-small
 def _embed_with_keyword_placeholder(chunks, embed_fn):
     # Embed only non-keyword chunks (keyword chunk text can exceed the embed token
     # limit). Keyword chunks get a zero placeholder vector spliced back in order.
+    # The placeholder dim MUST match the real embeddings' dim (a Chroma collection
+    # is single-dimension) — derive it from the returned vectors, not a constant,
+    # so tests with small fake embedders and the live 1536-dim embedder both work.
     to_embed = [c.text for c in chunks if c.chunk_type != "keyword"]
     vecs = list(embed_fn(to_embed)) if to_embed else []
+    dim = len(vecs[0]) if vecs else EMBED_DIM
     out, it = [], iter(vecs)
     for c in chunks:
-        out.append([0.0] * EMBED_DIM if c.chunk_type == "keyword" else next(it))
+        out.append([0.0] * dim if c.chunk_type == "keyword" else next(it))
     return out
 
 
