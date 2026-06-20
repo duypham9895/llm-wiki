@@ -33,6 +33,8 @@ def read_prd(prd_id: str, prds_dir: str, read_doc_fn=read_doc, list_docs_fn=list
 
 
 def read_body_by_stem(stem: str, prds_dir: str, read_doc_fn=read_doc, list_docs_fn=list_docs) -> str:
+    if not stem:
+        return ""
     for path in list_docs_fn(prds_dir):
         try:
             doc = read_doc_fn(path)

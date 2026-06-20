@@ -60,6 +60,7 @@ def test_read_prd_exact_id_no_prefix_collision():
     list_fn, read_fn = make_docs()
     out = read_prd("EP-43", "/v", read_doc_fn=read_fn, list_docs_fn=list_fn)
     assert out["found"] is True and out["title"] == "Short"
+    assert out["id"] == "EP-43" and out["title"] != "Long"
 
 
 def test_read_prd_unknown_id_found_false():
@@ -81,3 +82,10 @@ def test_read_body_by_stem():
         == "full long body text"
     )
     assert read_body_by_stem("nope", "/v", read_doc_fn=read_fn, list_docs_fn=list_fn) == ""
+
+
+def test_read_body_by_stem_blank_stem_returns_empty_without_listing():
+    def list_fn(_prds_dir):
+        raise AssertionError("blank stem should not list docs")
+
+    assert read_body_by_stem("", "/v", list_docs_fn=list_fn) == ""
