@@ -192,14 +192,3 @@ async def test_set_roles_removing_last_admin_is_409(client, settings, sessionmak
     # try to replace the admin's roles with member-only (drops the last admin)
     r = await client.put(f"/api/admin/users/{admin_id}/roles", json={"role_ids": [member_id]})
     assert r.status_code == 409 and r.json()["error"]["code"] == "last_admin"
-
-
-async def test_set_roles_removing_last_admin_is_409(client, settings, sessionmaker_):
-    """Demoting the only admin via set-roles is rejected 409 last_admin."""
-    await _login_admin(client, settings)
-    member_id = await _role_id(sessionmaker_, "member")
-    async with sessionmaker_() as s:
-        admin = (await s.execute(select(User).where(User.email == settings.admin_email))).scalar_one()
-        admin_id = str(admin.id)
-    r = await client.put(f"/api/admin/users/{admin_id}/roles", json={"role_ids": [member_id]})
-    assert r.status_code == 409 and r.json()["error"]["code"] == "last_admin"
