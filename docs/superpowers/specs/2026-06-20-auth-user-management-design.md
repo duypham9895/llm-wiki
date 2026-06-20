@@ -171,9 +171,10 @@ app_settings
 - `roles.manage` — create/edit/delete roles, set role permissions, change settings (allowlist, register toggle).
 
 > **Admin-equivalence (locked, see §2 + §6):** `users.manage` + `roles.manage` held together = full
-> admin. We do NOT attempt to make them independently safe (a `roles.manage` holder can always edit a
-> role they belong to; a `users.manage` holder can always mint another admin). The invariant we DO
-> enforce is the last-admin guard. The UI presents the two as a single "Admin" capability.
+> admin. We do NOT try to make them independently *safe* — instead we make them genuinely
+> *inseparable*: **`assert_pair_integrity` (§6) makes a "half-admin" un-representable** — no role or
+> user may ever hold exactly one of the pair (422). On top of that, the **last-admin invariant** (§6)
+> keeps ≥1 active full-admin. The UI presents the two as a single "Admin" capability.
 
 **Seeded system roles:**
 - `admin` (is_system) → all permissions. **`is_system` roles are fully locked: name, `is_system`
@@ -270,7 +271,7 @@ always matches what the guards enforce.
 | Session expiry/revoke | Valid iff `now < idle_expires_at AND now < absolute_expires_at` (§4). Idle window slides on activity; absolute cap never moves. Expired/disabled-user → 401 + cookie cleared. Disable/logout/role-change deletes rows = instant revoke. `purge_expired` runs on a schedule (a background asyncio task started at app boot, hourly) AND opportunistically on resolve of an already-expired row. |
 | Authorization (per-request) | Every protected endpoint declares `require_permission(name)`. The dependency loads the session user's effective permissions **freshly from `user_roles`/`role_permissions` on every request** (NEVER cached in the session) and 403s otherwise. No endpoint is guarded by role NAME — always by permission. So revoking a role takes effect on the user's next request. |
 | Last-admin invariant | The system must always retain ≥1 `active` user whose effective permissions include BOTH `users.manage` AND `roles.manage`. A central `assert_admin_invariant()` is called inside the transaction of EVERY mutating path that could reduce privilege — `disable`, `delete user`, `set-roles`, `role.update` (custom-role perm removal), `role.delete` — and rolls back with `409 last_admin` if the post-mutation state would violate it. (`reject` only acts on a `pending` user, who can never be an admin-equivalent, so the check there always passes — harmless to include. `reset-password` doesn't change roles/status, so it is NOT in the guarded set. `is_system` admin role is immutable, so `role.update` can't strip it; this guard catches the custom-role and user-role paths.) |
-| Admin-pair integrity (ENFORCED) | `assert_pair_integrity(perm_set)` rejects (`422 admin_pair`) any operation whose result would leave a role's permission set — or a user's effective permission set — holding EXACTLY ONE of `{users.manage, roles.manage}`. Called on: role create, role update, user approve, user set-roles. This is what makes "admin-equivalent" a real data-model invariant rather than a prose hope: you can never carve off `roles.manage` alone (which would reopen the self-escalation path) or `users.manage` alone. The seeded `member` role has neither; `admin` has both. |
+| Admin-pair integrity (ENFORCED) | `assert_pair_integrity(perm_set)` rejects (`422 admin_pair`) any operation whose result would leave a role's permission set — or a user's effective permission set — holding EXACTLY ONE of `{users.manage, roles.manage}`. Called on: role create, role update, user approve, user set-roles. This is what makes "admin-equivalent" a real data-model invariant rather than a prose hope: you can never carve off `roles.manage` alone (which would reopen the self-escalation path) or `users.manage` alone. The seeded `member` role has neither; `admin` has both. **Evaluation order:** pair-integrity (`422`, input shape) is checked BEFORE the last-admin invariant (`409`, system state) so a single failing op returns a deterministic code. |
 | Privilege escalation (accepted model) | Given pair-integrity above, `users.manage`+`roles.manage` only ever travel together = admin-equivalent (§2); an admin minting another admin is by-design. The escalation guards are: (a) pair-integrity (no half-admin role can exist), (b) the last-admin invariant (can't drop below one admin). Self-demotion is allowed (footgun) except where it breaks the last-admin invariant. |
 | User enumeration (register) | ALL register outcomes — success(pending), registration-disabled, domain-not-allowed, email-taken — return the SAME status (`202`) and the SAME body `{status:'accepted'}`. The server performs equivalent work in every branch (incl. a dummy argon2 hash on the email-taken path) so neither status code, body, nor timing distinguishes them. A real account is created only when all checks pass. |
 | User enumeration (login) | Fixed order: (1) load user by email, (2) ALWAYS run argon2-verify — against the real hash if found, else a precomputed dummy hash with IDENTICAL argon2 parameters, (3) THEN check `status == active`, (4) any failure → identical generic `401`. Status is never checked before the verify. |
@@ -357,7 +358,7 @@ set-roles: admin PUT /users/{id}/roles {role_ids}
 | Login bad credentials / inactive / unknown user | `401 {error:{code:'invalid_credentials'}}` — identical for all; argon2 verify always runs before any status check. |
 | Expired/invalid/revoked session | `401`, clears the cookie. |
 | Missing permission | `403 {error:{code:'forbidden'}}`. |
-| Any mutation that would break the last-admin invariant | `409 {code:'last_admin'}` — transaction rolled back. Covers disable/delete/reject/set-roles/role.update/role.delete. |
+| Any mutation that would break the last-admin invariant | `409 {code:'last_admin'}` — transaction rolled back. Covers disable/delete/set-roles/role.update/role.delete. (`reject` acts only on a `pending` user, never an admin-equivalent, so it can't trip this.) |
 | Role/user op that would create a half-admin (exactly one of users.manage/roles.manage) | `422 {code:'admin_pair'}` — rejected. |
 | Edit or delete an `is_system` role | `409 {code:'system_role_immutable'}`. |
 | Delete a role still assigned to a user | `409 {code:'role_in_use'}` (FK RESTRICT). |
