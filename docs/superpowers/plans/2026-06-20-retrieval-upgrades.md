@@ -458,7 +458,7 @@ git commit -m "feat(mcp): read_prd (full body by exact id) + read_body_by_stem"
 - Consumes: `Store.query(...)`, `Store.keyword_query(terms, k)`, `embed_fn`, `Config.score_threshold`, `read.read_body_by_stem(stem, prds_dir, ...)`.
 - Produces:
   - `retrieve(query, store, embed_fn, k, threshold) -> tuple[list[Retrieved], str]`, verdict ∈ `{"match","no_match"}`. Empty/whitespace query → `([], "no_match")` WITHOUT calling `embed_fn`.
-  - `keyword_retrieve(query, store, k, prds_dir, read_body_fn=read_body_by_stem) -> list[Retrieved]` — lowercases + splits the query, drops tokens shorter than 2 chars, returns `[]` if none remain (never calls `keyword_query`); dedupes to distinct PRDs; `Retrieved.text` is an **original-case snippet**: a ±120-char window around the first matched word in the original body (via `read_body_fn`), falling back to the metadata `summary`, then the title.
+  - `keyword_retrieve(query, store, k, prds_dir, read_body_fn=read_body_by_stem) -> list[Retrieved]` — lowercases + splits the query, drops tokens shorter than 2 chars, returns `[]` if none remain (never calls `keyword_query`); dedupes to distinct PRDs; `Retrieved.text` is an **original-case snippet** built per spec §3 order: the metadata `summary` when it contains the first matched word, else a ±120-char window around the first match in the original body (via `read_body_fn`), else the `summary`, else the title.
   - `Retrieved` dataclass UNCHANGED.
 
 NOTE: `retrieve`'s signature changes (adds `threshold`, returns a tuple). Both call sites (`search_prds_impl`, `ask_prds_impl`, Task 7) are updated in this phase.
@@ -1036,7 +1036,7 @@ git commit -m "feat(mcp): verdict + empty-query guard; keyword_search + read_prd
 
 **Interfaces:**
 - Consumes: existing `run_index(cfg, store, embed_fn, read_doc_fn, list_docs_fn)`, `Chunk.chunk_type`.
-- Produces: `run_index(..., force: bool = False)` that (a) embeds ONLY `chunk_type != "keyword"` chunks, (b) assigns the keyword chunk a zero vector `[0.0] * EMBED_DIM` with `EMBED_DIM = 1536`, (c) when `force=True`, ignores the `body_hash` skip-guard. `cli` `index` gains `--force`.
+- Produces: `run_index(..., force: bool = False)` that (a) embeds ONLY `chunk_type != "keyword"` chunks, (b) assigns the keyword chunk a zero vector whose dimension is derived from the real embeddings (`len(vecs[0])`, falling back to `EMBED_DIM = 1536` only when there are no non-keyword chunks to embed) — so the placeholder always matches the collection's dimension, (c) when `force=True`, ignores the `body_hash` skip-guard. `cli` `index` gains `--force`.
 
 **Critical (Codex fix):** the keyword chunk text (up to ~106k tokens) must NEVER be passed to `embed_fn` — it exceeds OpenAI's 8191-token limit and would crash. Embed the non-keyword chunks, then splice a zero vector in the keyword chunk's position.
 
