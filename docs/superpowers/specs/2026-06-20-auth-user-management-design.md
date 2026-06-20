@@ -29,7 +29,7 @@ and login rate-limiting are all non-negotiable.
   The shared PRD core (`retrieve/answer/store/read/index/vault`) is **untouched** by this phase.
 - Secrets: a root/app-user-only `.env` (chmod 600, gitignored) injected via docker-compose
   `env_file` — matches the existing foray/goclaw deployment pattern on the box.
-- Session model: server sessions (Postgres) + signed httpOnly Secure SameSite cookie.
+- Session model: server sessions (Postgres) + httpOnly Secure SameSite OPAQUE-random cookie (not signed).
 - Permission model: full RBAC (named permissions grouped into editable roles).
 - Account lifecycle: register (allowed domain) → pending → admin approves + assigns role(s) →
   active → admin can disable.
@@ -41,12 +41,15 @@ and login rate-limiting are all non-negotiable.
 | Decision | Choice | Rationale |
 |---|---|---|
 | Permission model | **Full RBAC** — code-defined permissions, admin-editable roles | Flexible where it matters (roles); permission vocabulary is fixed in code because a permission with no endpoint guard behind it is meaningless. |
-| Account lifecycle | **register → pending → (admin approves+assigns role) → active → disabled** | Admin is the gatekeeper for every account; domain allowlist is a pre-filter, not the gate. |
-| Sessions | **Server-side session rows + httpOnly Secure SameSite=Lax cookie**; store only the token HASH | XSS-resistant (JS can't read the cookie); instant revoke = delete the row; the raw token never persists server-side. |
+| Admin-equivalence | **`users.manage` + `roles.manage` together = admin-equivalent.** They are NOT treated as separable privileges. | Both reviewers showed a `roles.manage` holder can edit a role they belong to and grant themselves any permission, and a `users.manage` holder can mint an admin via a second account. Rather than pretend these are isolatable on a single-PM-team tool, we declare the two management permissions jointly = full admin. The UI surfaces them as one "Admin" capability. This closes the self-escalation theater honestly (see §6). |
+| Account lifecycle | **register → pending → (admin approves+assigns role) → active → disabled**; admin may also **reject** a pending user (→ deleted). | Admin is the gatekeeper for every account; domain allowlist is a pre-filter, not the gate. |
+| Sessions | **Server-side session rows + httpOnly Secure SameSite=Lax OPAQUE-random cookie** (NOT signed); store only the token HASH. **Absolute + idle expiry.** | XSS-resistant; instant revoke = delete the row; raw token never persists. A 256-bit random token looked up server-side needs no signing, so there is NO `COOKIE_SECRET` (dropped — an unused secret is a false-confidence liability). |
+| Permission resolution | **Per-request, from live `user_roles`/`role_permissions`** — NEVER cached in the session row | A role change (grant OR revoke) takes effect on the user's very next request. Caching effective perms in the session would let a revoked role persist until expiry — a real escalation-persistence bug. |
+| Last-admin invariant | **The system must always retain ≥1 `active` user whose effective permissions include BOTH `users.manage` AND `roles.manage`** | Defined in permission terms (matching the permission-first guard model), not by the role name `admin`. Enforced on EVERY mutating path that can reduce privilege (see §6). |
 | Password hashing | **argon2id** (via `argon2-cffi`) | Modern memory-hard KDF; the current OWASP default. |
 | Secrets | **`.env`, chmod 600, gitignored, docker-compose `env_file`** | Single-owner VPS; matches existing apps; Docker-secrets gain doesn't apply to a root-controlled box. |
 | DB | **Postgres** (own database `prd_auth` on the existing instance, dedicated app user) | Relational fit for RBAC; reuses the box's Postgres; isolated database keeps it separate from goclaw's data. |
-| Bootstrap admin | **First admin seeded from `.env` on first boot** (status active, role admin) | Solves the chicken-and-egg: someone must approve the first users; the first admin can't itself need approval. |
+| Bootstrap admin | **Seed/re-assert the `.env` admin whenever NO active admin-equivalent user exists** (not merely "if no user exists") — status active, role admin | Solves the chicken-and-egg AND acts as break-glass: if the admin is later deleted/disabled while other users exist, the next boot re-creates/re-activates the `.env` admin. The predicate is "no active user with `users.manage`+`roles.manage`", so a healthy instance is never touched. Idempotent: never duplicates, never resets an existing healthy admin's password. |
 | Email uniqueness | **`citext`** | Case-insensitive uniqueness so `Duy@` and `duy@` can't both register. |
 | Migrations | **Alembic** | Versioned schema; standard with SQLAlchemy; matches Atlas's pattern. |
 
@@ -60,10 +63,12 @@ A new `web/` subpackage inside `prd_mcp`. The shared PRD core is not modified.
 mcp/prd_mcp/
   web/
     __init__.py
-    settings.py     WebSettings from env: DATABASE_URL, COOKIE_SECRET, COOKIE_NAME,
-                    ALLOWED_EMAIL_DOMAINS (csv), REGISTRATION_ENABLED (bool),
-                    ADMIN_EMAIL, ADMIN_PASSWORD, SESSION_TTL_HOURS, ENV (dev|prod).
-                    Validates on startup; fails fast on missing required vars.
+    settings.py     WebSettings from env: DATABASE_URL, COOKIE_NAME, CORS_ORIGIN,
+                    ALLOWED_EMAIL_DOMAINS (csv, first-boot seed only), REGISTRATION_ENABLED
+                    (first-boot seed only), ADMIN_EMAIL, ADMIN_PASSWORD, SESSION_IDLE_HOURS,
+                    SESSION_ABSOLUTE_DAYS, LAST_SEEN_THROTTLE_MIN, RATE_LIMIT_PER_MIN,
+                    PASSWORD_MIN_LENGTH, ENV (dev|prod). No COOKIE_SECRET (opaque tokens).
+                    Validates on startup; fails fast on missing required vars (no silent "" defaults).
     db.py           async SQLAlchemy engine + async_sessionmaker; get_db() dependency.
     models.py       ORM: User, Role, Permission, role_permissions, user_roles, Session.
     schemas.py      Pydantic request/response models (RegisterIn, LoginIn, UserOut, RoleOut, ...).
@@ -107,7 +112,7 @@ users
   status        text       NOT NULL DEFAULT 'pending'     -- 'pending'|'active'|'disabled'
   created_at    timestamptz NOT NULL DEFAULT now()
   approved_at   timestamptz NULL
-  approved_by   uuid       NULL  REFERENCES users(id)     -- which admin approved
+  approved_by   uuid       NULL  REFERENCES users(id) ON DELETE SET NULL  -- approver; survives approver deletion
   CHECK (status IN ('pending','active','disabled'))
 
 roles
@@ -136,10 +141,26 @@ sessions
   id            uuid       PK
   user_id       uuid       NOT NULL REFERENCES users(id) ON DELETE CASCADE
   token_hash    text       NOT NULL UNIQUE                -- sha256(raw cookie token); raw never stored
-  created_at    timestamptz NOT NULL DEFAULT now()
-  expires_at    timestamptz NOT NULL
-  last_seen_at  timestamptz NOT NULL DEFAULT now()
-  INDEX (token_hash), INDEX (user_id), INDEX (expires_at)
+  created_at    timestamptz NOT NULL DEFAULT now()        -- absolute-lifetime anchor
+  idle_expires_at timestamptz NOT NULL                    -- now + SESSION_IDLE_HOURS; slides on activity
+  absolute_expires_at timestamptz NOT NULL                -- created_at + SESSION_ABSOLUTE_DAYS; never slides
+  last_seen_at  timestamptz NOT NULL DEFAULT now()        -- updated only when stale by > LAST_SEEN_THROTTLE_MIN
+  INDEX (token_hash), INDEX (user_id), INDEX (idle_expires_at)
+```
+
+**Session expiry semantics (resolve on every request):** a session is valid iff
+`now < idle_expires_at AND now < absolute_expires_at`. On a valid resolve, slide
+`idle_expires_at = now + SESSION_IDLE_HOURS` and (throttled) bump `last_seen_at` only if it is
+older than `LAST_SEEN_THROTTLE_MIN` (avoids a write on every request). `absolute_expires_at` never
+moves — a session dies at that cap regardless of activity. Defaults: idle 24h, absolute 30d,
+throttle 5 min (all env-tunable).
+
+app_settings
+  id                   integer    PK DEFAULT 1  CHECK (id = 1)   -- enforced singleton
+  registration_enabled boolean    NOT NULL
+  allowed_domains      text[]     NOT NULL DEFAULT '{}'
+  updated_at           timestamptz NOT NULL DEFAULT now()
+  updated_by           uuid       NULL REFERENCES users(id) ON DELETE SET NULL
 ```
 
 **The permission vocabulary (code-defined, seeded):**
@@ -149,19 +170,33 @@ sessions
 - `users.manage` — view/approve/disable/delete users, assign their roles.
 - `roles.manage` — create/edit/delete roles, set role permissions, change settings (allowlist, register toggle).
 
+> **Admin-equivalence (locked, see §2 + §6):** `users.manage` + `roles.manage` held together = full
+> admin. We do NOT attempt to make them independently safe (a `roles.manage` holder can always edit a
+> role they belong to; a `users.manage` holder can always mint another admin). The invariant we DO
+> enforce is the last-admin guard. The UI presents the two as a single "Admin" capability.
+
 **Seeded system roles:**
-- `admin` (is_system) → all permissions.
+- `admin` (is_system) → all permissions. **`is_system` roles are fully locked: name, `is_system`
+  flag, AND permission set are immutable via the API** (closes the "strip `users.manage` from the
+  admin role" lockout path). Only undeletable AND uneditable.
 - `member` (is_system) → `prd.read`, `prd.ask`.
 
-**Bootstrap admin:** on first boot, `seed.py` (idempotent) creates the permission rows, the two
-system roles, and — if no user exists — one admin user from `ADMIN_EMAIL`/`ADMIN_PASSWORD` (status
-`active`, role `admin`). Re-running seed never duplicates and never resets an existing admin's
-password.
+**Bootstrap admin:** on every boot, `seed.py` (idempotent) ensures the permission rows + the two
+locked system roles exist, then checks the break-glass predicate: **if NO active user has both
+`users.manage` and `roles.manage`**, it creates-or-reactivates the `ADMIN_EMAIL` user (status
+`active`, role `admin`, password = argon2(`ADMIN_PASSWORD`)). A healthy instance (≥1 active admin)
+is never touched — existing passwords/roles are never reset. This makes `.env` a genuine recovery
+path if the admin is deleted/disabled.
 
-**Settings storage:** `REGISTRATION_ENABLED` and `ALLOWED_EMAIL_DOMAINS` start from env defaults but
-are **runtime-editable by `roles.manage`** and persisted in a single-row `app_settings` table (so
-the admin can toggle registration without a redeploy). (7th table — small: `app_settings(id=1,
-registration_enabled bool, allowed_domains text[])`, seeded from env on first boot.)
+**Settings storage (single source of truth = DB after first boot):** the `app_settings` row is
+**seeded from `REGISTRATION_ENABLED` / `ALLOWED_EMAIL_DOMAINS` env vars ONLY on first boot (when the
+row does not yet exist)**. Thereafter the DB row is authoritative and the env vars are ignored — so
+an admin toggling registration off is NOT silently reverted by the next redeploy. Runtime edits
+require `roles.manage`. (A test asserts a redeploy with a different env value does not overwrite an
+existing row.) **Domain matching:** an email is allowed iff its domain (the part after the last `@`,
+lowercased + trimmed, IDNA/punycode-normalized) is an EXACT member of `allowed_domains` (no suffix
+matching — `evilringkas.co.id` must not match `ringkas.co.id`). An empty `allowed_domains` means no
+self-registration is possible.
 
 ---
 
@@ -186,8 +221,15 @@ All JSON. Auth via the session cookie. `4xx/5xx` share one error envelope
 | POST | `/api/admin/users/{id}/approve` | pending→active, set `approved_at/by`, assign role(s) in the same call `{role_ids:[...]}`. |
 | POST | `/api/admin/users/{id}/disable` | active→disabled AND revoke all their sessions (instant logout). |
 | POST | `/api/admin/users/{id}/enable` | disabled→active. |
-| PUT | `/api/admin/users/{id}/roles` | Replace a user's role set `{role_ids:[...]}`. |
-| DELETE | `/api/admin/users/{id}` | Delete a user (cascades sessions/user_roles). |
+| POST | `/api/admin/users/{id}/reject` | pending→deleted (deny a registration). |
+| POST | `/api/admin/users/{id}/reset-password` | Admin sets a new password for a user `{password}` (the operational recovery path, since there is no self-service reset this phase); revokes that user's sessions. |
+| PUT | `/api/admin/users/{id}/roles` | Replace a user's role set `{role_ids:[...]}`. Subject to the last-admin invariant; revokes the target's sessions on any change so new perms resolve cleanly. |
+| DELETE | `/api/admin/users/{id}` | Delete a user (cascades sessions/user_roles). Subject to the last-admin invariant. |
+
+### Auth — self-service (`auth.py`, requires own session)
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/auth/change-password` | `{current_password,new_password}` — the logged-in user changes their own password; verifies current, revokes all OTHER sessions of theirs. |
 
 ### Admin — roles & settings (`admin.py`, requires `roles.manage`)
 | Method | Path | Purpose |
@@ -195,16 +237,24 @@ All JSON. Auth via the session cookie. `4xx/5xx` share one error envelope
 | GET | `/api/admin/roles` | List roles + their permissions. |
 | GET | `/api/admin/permissions` | List the fixed permission vocabulary. |
 | POST | `/api/admin/roles` | Create a custom role `{name,description,permission_ids}`. |
-| PUT | `/api/admin/roles/{id}` | Update name/description/permissions. Rejects edits that would remove `is_system` protection. |
-| DELETE | `/api/admin/roles/{id}` | Delete a custom role. `is_system` roles cannot be deleted; a role still assigned to a user cannot be deleted (FK RESTRICT → 409). |
+| PUT | `/api/admin/roles/{id}` | Update a CUSTOM role's name/description/permissions. **`is_system` roles are fully immutable → 409.** Subject to the last-admin invariant (a permission removal that would drop the last admin-equivalent below the threshold is rejected). |
+| DELETE | `/api/admin/roles/{id}` | Delete a custom role. `is_system` roles cannot be deleted (409); a role still assigned to any user cannot be deleted (FK RESTRICT → 409). |
 | GET | `/api/admin/settings` | `{registration_enabled, allowed_domains}`. |
-| PUT | `/api/admin/settings` | Update the registration toggle and/or allowlist. |
+| PUT | `/api/admin/settings` | Update the registration toggle and/or allowlist; sets `updated_at/by`. |
+
+### Health (`app.py`, no auth)
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/healthz` | Liveness + DB reachability check; `200 {db:'ok'}` or `503`. No auth, no data. |
 
 ### Pydantic shapes (`schemas.py`)
 `UserOut{id,email,status,roles:[RoleBrief],permissions:[str],created_at}`,
 `RoleOut{id,name,description,is_system,permissions:[str]}`, `RegisterIn{email,password}`,
-`LoginIn{email,password}`, `SettingsOut/In{registration_enabled,allowed_domains:[str]}`.
-Password input validated: min length 12 (configurable), max 128.
+`LoginIn{email,password}`, `SettingsOut/In{registration_enabled,allowed_domains:[str]}`,
+`ChangePasswordIn{current_password,new_password}`, `SetPasswordIn{password}`.
+Password input validated: min length 12 (configurable), max 128. `permissions:[str]` in `UserOut`
+is computed per-request from live role membership (never read from a cached session value), so it
+always matches what the guards enforce.
 
 ---
 
@@ -213,41 +263,54 @@ Password input validated: min length 12 (configurable), max 128.
 | Concern | Mitigation |
 |---|---|
 | Password storage | argon2id (`argon2-cffi`), per-password salt; never logged. |
-| Session token | `secrets.token_urlsafe(32)` raw token in the cookie; server stores only `sha256(token)`. Lookups hash the incoming token and match. A DB leak does not expose usable tokens. |
-| Cookie flags | `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, expiry = session TTL. (Lax allows top-level navigation; the API is same-origin behind Caddy.) |
-| Transport | HTTPS only (Caddy auto-cert); app also sets HSTS in prod. The app refuses to set a Secure cookie over plain HTTP except in `ENV=dev`. |
-| Session expiry/revoke | `expires_at` enforced on every resolve; expired/disabled → 401 + cookie cleared. Disable/logout deletes rows = instant revoke. A periodic `purge_expired` removes stale rows. |
-| User enumeration | `register` and `login` return generic messages; identical timing where feasible (always run an argon2 verify even on unknown email — dummy-hash compare). |
-| Brute force | Rate-limit `/login` and `/register` (per-IP token bucket, e.g. 5/min then backoff). Lockout escalation optional. |
-| CSRF | SameSite=Lax + same-origin + a custom header check on state-changing requests (the SPA sends `X-Requested-With`); no cross-site form posts can carry the cookie meaningfully. |
-| Authorization | Every protected endpoint declares `require_permission(...)`; the dependency loads the session user's effective permissions (union of role permissions) and 403s otherwise. No endpoint is protected by role NAME — always by permission. |
-| Privilege escalation | A user cannot grant themselves roles (only `users.manage` holders can, and the UI/endpoint never lets a user edit their own roles to add permissions they lack — server-side check). The last remaining `admin` cannot be disabled/deleted (guard against locking everyone out). |
-| Secrets | `.env` chmod 600, gitignored; never in logs, responses, or exceptions. `COOKIE_SECRET` and DB creds live only there. |
-| Input | Pydantic validation on every body; email format checked; password length bounds; SQLAlchemy parameterized queries (no string SQL). |
+| Session token | `secrets.token_urlsafe(32)` (256-bit) OPAQUE random token in the cookie; server stores only `sha256(token)`. Lookups hash the incoming token and match. A DB leak exposes no usable tokens. The token is NOT signed — a random server-side-looked-up value needs no signature, so there is **no `COOKIE_SECRET`**. |
+| Session fixation | On EVERY successful login the server mints a BRAND-NEW token and session row and ignores/overwrites any cookie the client already presents. No pre-auth session is ever "upgraded". |
+| Cookie flags | `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, `Max-Age` = idle TTL. |
+| Transport | HTTPS only (Caddy auto-cert); app sets HSTS in prod. Refuses to set a `Secure` cookie over plain HTTP except `ENV=dev`. |
+| Session expiry/revoke | Valid iff `now < idle_expires_at AND now < absolute_expires_at` (§4). Idle window slides on activity; absolute cap never moves. Expired/disabled-user → 401 + cookie cleared. Disable/logout/role-change deletes rows = instant revoke. `purge_expired` runs on a schedule (a background asyncio task started at app boot, hourly) AND opportunistically on resolve of an already-expired row. |
+| Authorization (per-request) | Every protected endpoint declares `require_permission(name)`. The dependency loads the session user's effective permissions **freshly from `user_roles`/`role_permissions` on every request** (NEVER cached in the session) and 403s otherwise. No endpoint is guarded by role NAME — always by permission. So revoking a role takes effect on the user's next request. |
+| Last-admin invariant | The system must always retain ≥1 `active` user whose effective permissions include BOTH `users.manage` AND `roles.manage`. A central `assert_admin_invariant()` is called inside the transaction of EVERY mutating path that could reduce privilege — `disable`, `delete user`, `reject`, `set-roles`, `reset-password`(no, doesn't reduce), `role.update`(custom-role perm removal), `role.delete` — and rolls back with `409 last_admin` if the post-mutation state would violate it. (`is_system` admin role is immutable, so role.update can't strip it; this guard catches the custom-role and user-role paths.) |
+| Privilege escalation (accepted model) | `users.manage` + `roles.manage` = admin-equivalent (§2); we do NOT attempt to make them independently non-escalating. The only escalation guard is: a `users.manage` holder cannot reduce the system below the last-admin invariant. Self-demotion is allowed (footgun, not a hole) except where it breaks the invariant. |
+| User enumeration (register) | ALL register outcomes — success(pending), registration-disabled, domain-not-allowed, email-taken — return the SAME status (`202`) and the SAME body `{status:'accepted'}`. The server performs equivalent work in every branch (incl. a dummy argon2 hash on the email-taken path) so neither status code, body, nor timing distinguishes them. A real account is created only when all checks pass. |
+| User enumeration (login) | Fixed order: (1) load user by email, (2) ALWAYS run argon2-verify — against the real hash if found, else a precomputed dummy hash with IDENTICAL argon2 parameters, (3) THEN check `status == active`, (4) any failure → identical generic `401`. Status is never checked before the verify. |
+| Brute force | Rate-limit `/login`, `/register`, `/change-password` per CLIENT IP. The app runs a SINGLE uvicorn worker; the limiter is an in-process token bucket (5/min then backoff) — acceptable because single-worker, and a restart resetting the bucket is an accepted minor weakness. Client IP is taken from `X-Forwarded-For` via Starlette `ProxyHeadersMiddleware` trusting ONLY `127.0.0.1` (Caddy); the app binds to loopback so XFF cannot be spoofed by external clients. Additionally a per-email failure counter (in the same store) imposes an increasing delay after N consecutive failures (defense against single-account targeting across IPs). Account lockout is intentionally NOT used (avoids a trivial DoS-by-lockout); the chain is argon2-cost + 12-char-min + IP-limit + per-email-delay + monitoring. |
+| CSRF | Enforced as a rule, not assumed: (1) NO state-changing GET — every mutation is POST/PUT/DELETE; (2) every state-changing request MUST carry the custom header `X-Requested-With: prd-app` or it is rejected `403` regardless of SameSite; (3) CORS is locked to the exact same origin in prod (the `Origin` is never reflected/wildcarded); (4) SameSite=Lax is defense-in-depth on top, not the sole control. |
+| Secrets | `.env` chmod 600, gitignored; never in logs, responses, or exceptions. DB creds + `ADMIN_PASSWORD` live only there. LLM/embed keys are NOT in this phase's `.env` (no LLM calls in Phase 2 — added in Phase 3 to keep the auth container's blast radius small). `ADMIN_PASSWORD` is read only by the bootstrap predicate; document that it may be rotated out after first successful admin login. |
+| Input | Pydantic validation on every body; email format + IDNA-normalized domain check; password length bounds (12–128); SQLAlchemy parameterized queries only (no string SQL). |
 
 ---
 
 ## 7. Account & Request Flows
 
 ```
-register:  POST /register {email,pw}
-           → registration_enabled? domain in allowlist? email free?  (generic reject otherwise)
-           → create user(status=pending, hash=argon2(pw))  → 202 {status:pending}
+register:  POST /register {email,pw}   — EVERY branch does equivalent work + returns 202 {status:'accepted'}
+           → always: validate body; compute argon2(pw) (or a dummy argon2 on reject paths)
+           → if registration_enabled AND domain∈allowlist AND email free: create user(pending, hash)
+           → else: discard (no user created)
+           → ALWAYS respond 202 {status:'accepted'}  (no status/body/timing difference → no enumeration)
 
-login:     POST /login {email,pw}
-           → load user by email; ALWAYS argon2-verify (dummy hash if unknown) → constant-ish time
-           → user exists AND active AND verify ok?  → create session + Set-Cookie → {user}
-           → else generic 401
+login:     POST /login {email,pw}   — fixed order, no early exits
+           → (1) load user by email
+           → (2) ALWAYS argon2-verify: real hash if found, else precomputed dummy hash (identical params)
+           → (3) THEN check status == active
+           → (4) all of {found, verify ok, active}? → mint a FRESH session token (ignore any
+                 presented cookie) + Set-Cookie → {user}.  Any failure → identical generic 401.
 
-authed req: cookie → sha256 → sessions lookup → not expired? → load user → active?
-           → attach (user, effective_permissions) to request
+authed req: cookie → sha256 → sessions lookup → now < idle_expires_at AND now < absolute_expires_at?
+           → load user → status==active?  (else 401 + clear cookie)
+           → slide idle_expires_at; throttled-bump last_seen_at
+           → resolve effective_permissions FRESH from user_roles/role_permissions (never cached)
            → require_permission(name) checks membership → 200 or 403
 
 approve:   admin POST /users/{id}/approve {role_ids}
-           → user.status pending→active, approved_at/by set, user_roles replaced with role_ids
+           → status pending→active, approved_at/by set, user_roles replaced with role_ids
 
 disable:   admin POST /users/{id}/disable
-           → status active→disabled  AND  revoke_user_sessions(id)  (instant logout)
+           → assert_admin_invariant(after) ; status active→disabled ; revoke_user_sessions(id)
+
+set-roles: admin PUT /users/{id}/roles {role_ids}
+           → in one tx: replace user_roles ; assert_admin_invariant(after) (rollback+409 if violated)
+           → revoke_user_sessions(id) so the next request resolves the new permission set cleanly
 ```
 
 ---
@@ -255,19 +318,28 @@ disable:   admin POST /users/{id}/disable
 ## 8. Deployment (openclaw)
 
 - **Container:** a `prd-app` docker-compose project on the VPS: one service running
-  `uvicorn prd_mcp.web.app:app`, `env_file: .env`, on a loopback port (e.g. 127.0.0.1:8300).
-- **Caddy:** add a block `prd.duyopenclaw.tech { reverse_proxy 127.0.0.1:8300 }` → automatic HTTPS.
+  `uvicorn prd_mcp.web.app:app` with a **single worker** (`--workers 1`, required — the in-process
+  rate-limit bucket is not shared across workers), `env_file: .env`, bound to loopback `127.0.0.1:8300`.
+- **Proxy / client IP:** the app uses Starlette `ProxyHeadersMiddleware` (or uvicorn
+  `--forwarded-allow-ips=127.0.0.1`) trusting `X-Forwarded-For` ONLY from `127.0.0.1` (Caddy). Because
+  the app binds to loopback, no external client can reach it directly to spoof XFF. This is what makes
+  per-IP rate limiting see the real client, not Caddy.
+- **Caddy:** add a block `prd.duyopenclaw.tech { reverse_proxy 127.0.0.1:8300 }` → automatic HTTPS
+  (Caddy sets `X-Forwarded-For`/`X-Forwarded-Proto` by default).
 - **Postgres:** create database `prd_auth` + app user on the existing `goclaw-postgres` instance
   (or a dedicated `prd-postgres` container — chosen at build time; isolated DB either way).
-  `DATABASE_URL` in `.env`.
+  `DATABASE_URL` in `.env`. Enable the `citext` extension.
 - **Migrations:** `alembic upgrade head` runs on deploy (entrypoint or a one-shot). Seeding runs on
-  app startup (idempotent).
-- **Secrets in `.env`:** `DATABASE_URL`, `COOKIE_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`,
-  `ALLOWED_EMAIL_DOMAINS`, `REGISTRATION_ENABLED`, `OPENAI`/`MINIMAX` keys (for Phase 3's API),
-  `ENV=prod`. chmod 600, gitignored.
-- **keychain.py adaptation:** the existing `read_secret(service, account)` becomes injectable — on
-  the VPS it reads from `os.environ`; on the Mac it keeps the `security` CLI. `Config`/`WebSettings`
-  already take the reader as a parameter, so this is a one-line entrypoint swap, not a rewrite.
+  app startup (idempotent, break-glass predicate per §4).
+- **Secrets in `.env`** (chmod 600, gitignored; NO `COOKIE_SECRET` — opaque tokens aren't signed; NO
+  LLM keys this phase): `DATABASE_URL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ALLOWED_EMAIL_DOMAINS`,
+  `REGISTRATION_ENABLED`, `SESSION_IDLE_HOURS`, `SESSION_ABSOLUTE_DAYS`, `LAST_SEEN_THROTTLE_MIN`,
+  `RATE_LIMIT_PER_MIN`, `PASSWORD_MIN_LENGTH`, `ENV=prod`, `CORS_ORIGIN=https://prd.duyopenclaw.tech`.
+- **Secrets reading:** the web app's `settings.py` reads its config straight from `os.environ` (the
+  `.env` injected by docker-compose) — no macOS `security` CLI on Linux. The shared PRD core's
+  existing `read_secret(service, account)` (already injectable — `load_config` takes it as a param,
+  verified in `config.py`) is given a `os.environ`-backed implementation on the VPS; the Mac keeps
+  the `security` CLI version. One entrypoint swap, not a rewrite.
 - **Pipeline migration (A/B/C/index → VPS):** tracked as a deployment sub-task. The Node A/B jobs +
   Python index job move to cron/systemd on the box; the vault + `.chroma-mcp` live on the box; this
   is what makes Phase 3's Status tab read local run-manifests. (Full migration detail belongs to
@@ -279,14 +351,16 @@ disable:   admin POST /users/{id}/disable
 
 | Situation | Behavior |
 |---|---|
-| Registration disabled / domain not allowed / email taken | `403`/`409` with a GENERIC "cannot register" — no enumeration. |
-| Login bad credentials / inactive user | `401` generic; argon2 verify always runs (timing). |
+| Registration: disabled / domain not allowed / email taken / success | **All identical: `202 {status:'accepted'}`**, same timing (dummy argon2 on reject paths) — no enumeration via code, body, or timing. |
+| Login bad credentials / inactive / unknown user | `401 {error:{code:'invalid_credentials'}}` — identical for all; argon2 verify always runs before any status check. |
 | Expired/invalid/revoked session | `401`, clears the cookie. |
 | Missing permission | `403 {error:{code:'forbidden'}}`. |
-| Disable/delete the last admin | `409 {code:'last_admin'}` — refused. |
-| Delete a role still assigned | `409 {code:'role_in_use'}` (FK RESTRICT). |
-| Missing required env on boot | App fails fast naming the missing var. |
-| DB unreachable | `503`; health endpoint reports it. |
+| Any mutation that would break the last-admin invariant | `409 {code:'last_admin'}` — transaction rolled back. Covers disable/delete/reject/set-roles/role.update/role.delete. |
+| Edit or delete an `is_system` role | `409 {code:'system_role_immutable'}`. |
+| Delete a role still assigned to a user | `409 {code:'role_in_use'}` (FK RESTRICT). |
+| Missing custom CSRF header on a state-changing request | `403 {code:'csrf'}`. |
+| Missing required env on boot | App fails fast naming the missing var (no silent empty-string defaults for required secrets). |
+| DB unreachable | `503`; `/healthz` reports it. |
 | Rate limit exceeded | `429` with `Retry-After`. |
 
 ---
@@ -298,17 +372,22 @@ network; argon2 with reduced rounds in tests for speed.
 
 | Layer | Tests |
 |---|---|
-| security | argon2 hash/verify round-trip; wrong password fails; token hash is sha256 and stable; cookie flags set correctly (HttpOnly/Secure/SameSite). |
-| sessions | create→resolve→revoke; expired session resolves to None; revoke_user_sessions clears all of a user's rows. |
-| rbac | effective permissions = union of role perms; require_permission allows/forbids correctly; a user with no roles has no permissions. |
-| auth endpoints | register creates pending; disabled/pending can't log in; login sets cookie + returns user; logout deletes session; me reflects roles/permissions; user-enumeration resistance (same response for unknown vs wrong-pw). |
-| admin endpoints | approve pending→active + assigns roles; disable revokes sessions; set-roles replaces; last-admin guard; role-in-use delete → 409; settings toggle persists; all admin endpoints 403 without the permission. |
-| lifecycle (integration) | full flow: register → admin approve → login → access a prd.read-guarded route → disable → next request 401. |
-| seed | idempotent: re-running doesn't duplicate or reset admin; first-boot creates admin + system roles + permissions. |
-| security regressions | a non-admin cannot call admin endpoints; a user cannot escalate their own roles; Secure cookie not set over plain HTTP in prod. |
+| security | argon2 hash/verify round-trip; wrong password fails; token hash is sha256 and stable; cookie flags HttpOnly/Secure/SameSite; Secure cookie NOT set over plain HTTP when ENV=prod. |
+| sessions | create→resolve→revoke; idle expiry (past `idle_expires_at`→invalid) AND absolute expiry (past `absolute_expires_at`→invalid even if recently active); idle window slides on resolve but absolute does not; `last_seen_at` write is throttled; revoke_user_sessions clears all of a user's rows; **login mints a fresh token and ignores a presented cookie (fixation)**. |
+| rbac | effective permissions = union of role perms (live, not cached); require_permission allows/forbids; no-roles → no permissions; **changing a user's roles changes the next request's effective perms WITHOUT re-login (per-request resolution)**. |
+| auth endpoints | register ALWAYS returns identical `202 {status:'accepted'}` for success/disabled/bad-domain/email-taken (no enumeration); login fixed-order (verify before status), identical 401 for unknown/wrong-pw/inactive; logout deletes session; me reflects live roles/permissions; change-password verifies current + revokes other sessions. |
+| admin endpoints | approve pending→active + assigns roles; reject pending→deleted; disable revokes sessions; set-roles replaces + revokes target sessions; reset-password sets + revokes; role-in-use delete → 409; is_system role edit/delete → 409; settings toggle persists; all admin endpoints 403 without the permission. |
+| last-admin invariant | EACH path that could break it is rejected with 409 and rolled back: disable the last admin; delete the last admin; set-roles removing admin-equiv from the last admin; delete/edit a custom role that holds the last admin-equiv perms. The invariant is satisfied again after adding a second admin. |
+| escalation (accepted model) | a `users.manage`+`roles.manage` holder CAN escalate (documented as admin-equivalent) — assert the model holds; a user with ONLY `prd.read` cannot reach any admin endpoint; a user cannot call admin endpoints to act before approval. |
+| settings authority | env seeds the row on first boot; a second boot with a DIFFERENT env value does NOT overwrite the existing DB row (single source of truth after first boot). |
+| domain matching | `evilringkas.co.id` is rejected when only `ringkas.co.id` is allowed (exact match, no suffix); case/whitespace/IDNA normalized. |
+| rate limit / proxy | client IP is taken from X-Forwarded-For (trusted from loopback only), so two different XFF IPs get independent buckets while same IP is throttled; per-email delay after N failures; 429 + Retry-After. |
+| lifecycle (integration) | register → admin approve → login → access a prd.read-guarded route → admin disables → next request 401 + cookie cleared. |
+| seed / break-glass | idempotent (re-run doesn't duplicate or reset a healthy admin); first boot creates admin+system roles+permissions; **if the only admin is deleted, next boot re-asserts the .env admin (break-glass); a healthy instance is untouched.** |
 
-No real LLM/embed calls (this phase has none). Postgres is real (the RBAC/session logic is the
-point — fakes would hide the bugs).
+No real LLM/embed calls (this phase has none). Postgres is real (the RBAC/session/invariant logic is
+the point — fakes would hide the bugs); argon2 uses reduced rounds in tests for speed but the dummy
+hash uses the SAME params as real hashes (timing test).
 
 ---
 
@@ -316,8 +395,10 @@ point — fakes would hide the bugs).
 
 - The React UI for any of this (Admin/Users tab + login screen) — Phase 3.
 - The PRD-serving web-API (Library/Search/Ask/Status endpoints over the shared core) — Phase 3.
-- Password reset / email verification flows — deferred (admin-approval gate + small known team make
-  it low-priority; can add later with an email provider).
+- SELF-SERVICE password reset via email + email verification — deferred (no email provider yet). The
+  operational recovery path IS covered this phase: a logged-in user can `change-password`, and a
+  `users.manage` admin can `reset-password` for any user; only the "forgot password while logged out"
+  email-link flow is deferred.
 - OAuth / SSO / 2FA — deferred (email+password is the agreed mechanism).
 - Multi-tenancy — explicitly out of scope for all of v2.
 - Audit log of admin actions — nice-to-have, deferred (not required for the gate).
