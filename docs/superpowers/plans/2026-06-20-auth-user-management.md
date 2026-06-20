@@ -1479,7 +1479,26 @@ async def test_invariant_counts_only_effective_pair_holders(db):
     await db.flush()
     with pytest.raises(AppError):
         await rbac.assert_admin_invariant(db)
+
+
+async def test_admin_invariant_takes_advisory_lock(db):
+    """The check must acquire the xact advisory lock so concurrent disables of
+    two different admins can't both pass (TOCTOU). We assert the lock is held by
+    this transaction after the call (pg_advisory_xact_lock is recorded in
+    pg_locks for the session's backend)."""
+    from sqlalchemy import text
+
+    await _active_admin(db, "a1@ringkas.co.id")
+    await _active_admin(db, "a2@ringkas.co.id")
+    await rbac.assert_admin_invariant(db)  # passes (2 admins) and takes the lock
+    held = (await db.execute(text(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+        "AND pid = pg_backend_pid()"
+    ))).scalar_one()
+    assert held >= 1
 ```
+
+NOTE for implementer: a true two-connection interleaving test (open two sessions, disable a different admin in each, prove the second blocks then fails) is the gold standard but flaky/slow under testcontainers. The lock-held assertion above plus the application-level guarded-path tests (disable/delete/set-roles last-admin → 409) are the required coverage; add the two-connection test only if time permits.
 
 - [ ] **Step 4: Run tests to verify they fail**
 
@@ -1505,6 +1524,8 @@ from datetime import datetime, timezone
 from fastapi import Depends, Request
 from sqlalchemy import func, select
 
+from sqlalchemy import text
+
 from prd_mcp.web.db import get_db
 from prd_mcp.web.errors import forbidden, last_admin_error, pair_error, unauthorized
 from prd_mcp.web.models import (
@@ -1516,6 +1537,10 @@ from prd_mcp.web.models import (
 )
 from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.settings import WebSettings
+
+# Arbitrary fixed key for the transaction-scoped advisory lock that serializes
+# the last-admin check-then-mutate across concurrent requests.
+_ADMIN_INVARIANT_LOCK_KEY = 4827310199
 
 PERMISSIONS: dict[str, str] = {
     "prd.read": "Read PRDs (Library + Search).",
@@ -1548,7 +1573,16 @@ async def assert_admin_invariant(db) -> None:
 
     SQL over the join tables so it sees flushed-but-uncommitted state in the
     current transaction. Counts users who, across all their roles, hold both.
+
+    Concurrency: without serialization this is a TOCTOU — two requests each
+    disabling a different admin can both observe the other still active and both
+    commit, leaving zero admins. A transaction-scoped Postgres advisory lock
+    serializes the check-then-mutate: the second request blocks until the first
+    commits, then re-evaluates against the post-commit state. The lock auto-
+    releases at txn end (commit OR rollback), so a rejected op holds nothing.
+    Callers MUST run this AFTER their flush and BEFORE their commit.
     """
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=_ADMIN_INVARIANT_LOCK_KEY))
     pair = list(ADMIN_PAIR)
     stmt = (
         select(func.count())
@@ -1595,6 +1629,13 @@ async def current_user(
     if loaded is None:
         raise unauthorized()
     user, token_hash = loaded
+    # resolve_session slid idle_expires_at (and maybe last_seen_at) but only
+    # flushed. get_db does NOT commit on success, and read-only handlers (e.g.
+    # /me) never commit, so without this the slide rolls back and the idle window
+    # never actually moves in production (spec §4 requires it to slide on
+    # activity). Commit the slide here; mutating handlers commit again later,
+    # which is a harmless no-op on an already-committed slide.
+    await db.commit()
     request.state.session_token_hash = token_hash
     request.state.current_user = user
     return user
@@ -1612,7 +1653,7 @@ def require_permission(name: str):
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cd mcp && poetry run pytest tests/web/test_rbac.py tests/web/test_invariants.py -v`
-Expected: rbac 5 + invariants 3 passed.
+Expected: rbac 5 + invariants 4 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -2278,6 +2319,44 @@ async def test_me_requires_session(client):
     assert r.status_code == 401
 
 
+async def test_me_persists_idle_slide(client, settings, sessionmaker_):
+    """The idle window must actually slide+COMMIT on a read request (regression
+    guard: current_user must commit the slide; get_db does not commit on success)."""
+    from sqlalchemy import select
+    from prd_mcp.web.models import Session as SessionRow
+
+    await client.post("/api/auth/login", json={"email": settings.admin_email, "password": settings.admin_password})
+    async with sessionmaker_() as s:
+        row = (await s.execute(select(SessionRow))).scalars().first()
+        before = row.idle_expires_at
+    # a read request resolves the session, sliding idle_expires_at to ~now+idle
+    assert (await client.get("/api/auth/me")).status_code == 200
+    async with sessionmaker_() as s:
+        row = (await s.execute(select(SessionRow))).scalars().first()
+        after = row.idle_expires_at
+    # the slide is persisted (committed), not rolled back at request end
+    assert after >= before
+
+
+async def test_register_is_rate_limited(client):
+    """register is brute-forceable -> per-IP throttled (default 5/min)."""
+    codes = []
+    for _ in range(7):
+        r = await client.post("/api/auth/register", json={"email": "rl@ringkas.co.id", "password": "x" * 12})
+        codes.append(r.status_code)
+    assert 429 in codes  # the bucket (5) is exhausted within the burst
+
+
+async def test_change_password_is_rate_limited(client, settings):
+    await client.post("/api/auth/login", json={"email": settings.admin_email, "password": settings.admin_password})
+    codes = []
+    for _ in range(7):
+        r = await client.post("/api/auth/change-password", json={
+            "current_password": "wrong-pw-xxxxx", "new_password": "new-" + "x" * 12})
+        codes.append(r.status_code)
+    assert 429 in codes
+
+
 async def test_login_then_me_then_logout(client, settings):
     await client.post("/api/auth/login", json={"email": settings.admin_email, "password": settings.admin_password})
     me = await client.get("/api/auth/me")
@@ -2384,6 +2463,7 @@ from datetime import datetime, timezone
 import idna
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.db import get_db
@@ -2449,11 +2529,26 @@ async def _load_settings_row(db) -> AppSettings | None:
     return (await db.execute(select(AppSettings))).scalar_one_or_none()
 
 
+def _enforce_ip_rate_limit(request: Request) -> None:
+    """Per-client-IP token bucket on every brute-forceable endpoint (login,
+    register, change-password). 429 + Retry-After when exhausted."""
+    from prd_mcp.web.errors import AppError
+
+    rl = request.app.state.ratelimiter
+    ip = request.client.host if request.client else "unknown"
+    if not rl.check_ip(ip, now=time.monotonic()):
+        raise AppError(429, "rate_limited", "too many attempts")
+
+
 @router.post("/register", status_code=202, response_model=AcceptedOut)
 async def register(payload: RegisterIn, request: Request, db=Depends(get_db)) -> AcceptedOut:
     settings = _settings(request)
     hasher = _hasher(request)
-    # Equivalent work on every branch: always compute an argon2 hash.
+    _enforce_ip_rate_limit(request)
+    # Equivalent work on every branch: always compute an argon2 hash AND always
+    # run the email-existence query, so neither timing nor body reveals which (or
+    # whether any) account was created — incl. the registration-disabled and
+    # bad-domain branches (otherwise those skip the query and respond faster).
     computed_hash = hasher.hash(payload.password)
     row = await _load_settings_row(db)
     enabled = bool(row and row.registration_enabled)
@@ -2463,11 +2558,14 @@ async def register(payload: RegisterIn, request: Request, db=Depends(get_db)) ->
         ok_pw = True
     except Exception:
         ok_pw = False
-    if enabled and ok_pw and domain_allowed(str(payload.email), allowed):
-        existing = (await db.execute(select(User).where(User.email == str(payload.email)))).scalar_one_or_none()
-        if existing is None:
-            db.add(User(email=str(payload.email), password_hash=computed_hash, status="pending"))
+    existing = (await db.execute(select(User).where(User.email == str(payload.email)))).scalar_one_or_none()
+    if enabled and ok_pw and existing is None and domain_allowed(str(payload.email), allowed):
+        db.add(User(email=str(payload.email), password_hash=computed_hash, status="pending"))
+        try:
             await db.commit()
+        except IntegrityError:
+            # lost a unique-email race; still indistinguishable to the caller
+            await db.rollback()
     # ALL paths return the identical response.
     return AcceptedOut()
 
@@ -2477,11 +2575,7 @@ async def login(payload: LoginIn, request: Request, response: Response, db=Depen
     settings = _settings(request)
     hasher = _hasher(request)
     rl = request.app.state.ratelimiter
-    ip = request.client.host if request.client else "unknown"
-    if not rl.check_ip(ip, now=time.monotonic()):
-        from prd_mcp.web.errors import AppError
-
-        raise AppError(429, "rate_limited", "too many attempts")
+    _enforce_ip_rate_limit(request)
     # per-email backoff delay (defense against single-account targeting).
     # MUST be asyncio.sleep, not time.sleep — a blocking sleep in an async handler
     # stalls the whole single-worker event loop (every other request, incl /healthz).
@@ -2530,6 +2624,7 @@ async def change_password(
 ):
     settings = _settings(request)
     hasher = _hasher(request)
+    _enforce_ip_rate_limit(request)  # brute-force guard on current_password
     if not hasher.verify(user.password_hash, payload.current_password):
         raise invalid_credentials()
     validate_password(payload.new_password, settings)
@@ -2546,7 +2641,7 @@ NOTE for implementer: `idna` and `pydantic[email]` are already declared in Task 
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `cd mcp && poetry run pytest tests/web/test_auth_endpoints.py -v`
-Expected: 10 passed.
+Expected: 13 passed.
 
 - [ ] **Step 7: Run the whole web suite (no regressions)**
 
@@ -2680,6 +2775,27 @@ async def test_reject_non_pending_user_is_409(client, settings, sessionmaker_):
     r = await client.post(f"/api/admin/users/{uid}/reject")
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "invalid_state"
+
+
+async def test_enable_pending_user_is_409(client, settings, sessionmaker_):
+    """enable is disabled->active ONLY; a pending user must go through approve."""
+    await _login_admin(client, settings)
+    uid = await _make_pending(sessionmaker_, "enpend@ringkas.co.id")
+    r = await client.post(f"/api/admin/users/{uid}/enable")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_state"
+
+
+async def test_disable_then_enable_round_trips(client, settings, sessionmaker_):
+    await _login_admin(client, settings)
+    # second admin so we can disable a non-last-admin member
+    member_id = await _role_id(sessionmaker_, "member")
+    uid = await _make_pending(sessionmaker_, "rt@ringkas.co.id")
+    await client.post(f"/api/admin/users/{uid}/approve", json={"role_ids": [member_id]})
+    dis = await client.post(f"/api/admin/users/{uid}/disable")
+    assert dis.status_code == 200 and dis.json()["status"] == "disabled"
+    en = await client.post(f"/api/admin/users/{uid}/enable")
+    assert en.status_code == 200 and en.json()["status"] == "active"
 
 
 async def test_disable_last_admin_is_409(client, settings, sessionmaker_):
@@ -3022,7 +3138,11 @@ async def disable_user(user_id: uuid.UUID, db=Depends(get_db)):
 @router.post("/users/{user_id}/enable", dependencies=[Depends(require_permission("users.manage"))])
 async def enable_user(user_id: uuid.UUID, db=Depends(get_db)):
     user = await _user_or_404(db, user_id)
-    # Re-activating must not produce a half-admin: if a disabled user's effective
+    # enable is disabled->active ONLY. A pending user must go through approve
+    # (which sets approved_at/by + assigns roles); enabling one would skip that.
+    if user.status != "disabled":
+        raise AppError(409, "invalid_state", "only disabled users can be enabled")
+    # Re-activating must not produce a half-admin: if the disabled user's effective
     # perms hold exactly one of the admin pair, reactivating them would violate
     # pair-integrity (which only the request layer enforces). Check before activating.
     assert_pair_integrity(effective_permissions(user))  # 422 if half-admin
