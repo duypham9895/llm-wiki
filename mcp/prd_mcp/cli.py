@@ -41,11 +41,23 @@ def main() -> int:
     store = Store.open(cfg.chroma_path)
 
     if args.cmd == "index":
+        from datetime import datetime, timezone
+        from prd_mcp.web.manifests import write_index_manifest
         llm = make_client(cfg)
+        started = datetime.now(timezone.utc).isoformat()
         res = run_index(cfg, store, llm.embed, force=args.force)
+        run_id = os.environ.get("RUN_ID", started)
+        # Codex #4 + new[major]: compute index_nonempty ONCE and make the process exit code
+        # AGREE with the manifest's exit_code (an empty index is a failure). Otherwise the
+        # orchestrator's exit-vs-manifest reconciliation (Task 8) would halt on a false
+        # "disagreement" instead of the intended empty-index gate.
+        index_nonempty = bool(store.stored_hashes())
+        write_index_manifest(cfg.vault_path, run_id, started,
+                             datetime.now(timezone.utc).isoformat(), res,
+                             index_nonempty=index_nonempty)
         print(f"indexed {res['indexed']} · skipped {res['skipped']} · "
               f"removed {res['removed']} · errors {res['errors']}")
-        return 1 if res["errors"] else 0
+        return 1 if (res["errors"] or not index_nonempty) else 0
 
     # serve
     llm = make_client(cfg)
