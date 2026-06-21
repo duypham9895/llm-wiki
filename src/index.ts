@@ -1,6 +1,6 @@
 import { Client } from '@notionhq/client';
 import { join } from 'node:path';
-import { loadConfig, readKeychainToken } from './config.js';
+import { loadConfig, readKeychainToken, readNotionTokenFromEnv } from './config.js';
 import { loadState, saveState, needsSync, findRemoved } from './state.js';
 import { enumerateDatabase, resolveUsers } from './notion.js';
 import { classify } from './classify.js';
@@ -32,7 +32,10 @@ export function buildSyncManifest(
 }
 
 async function main(): Promise<number> {
-  const cfg = loadConfig(process.env, readKeychainToken);
+  const reader = process.env.PRD_SECRETS === 'env'
+    ? () => readNotionTokenFromEnv(process.env)
+    : readKeychainToken;
+  const cfg = loadConfig(process.env, reader);
   const notion = new Client({ auth: cfg.token, timeoutMs: cfg.apiTimeoutMs });
   const n2m = makeConverter(notion);
   const prdsDir = join(cfg.vaultPath, 'PRDs');

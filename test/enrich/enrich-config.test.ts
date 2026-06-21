@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { loadEnrichConfig } from '../../src/enrich/enrich-config.js';
+import { loadEnrichConfig, readEnrichKeyFromEnv } from '../../src/enrich/enrich-config.js';
 
 const env = { VAULT_PATH: '/tmp/v', LLM_BASE_URL: 'https://api.x/v1', LLM_MODEL: 'MiniMax-M2' } as unknown as NodeJS.ProcessEnv;
 
@@ -27,4 +27,12 @@ test('env overrides for topK and threshold parse to numbers', () => {
   const c = loadEnrichConfig({ ...env, TOP_K: '8', DISTILL_THRESHOLD: '12000' } as unknown as NodeJS.ProcessEnv, () => 'k');
   expect(c.topK).toBe(8);
   expect(c.distillThreshold).toBe(12000);
+});
+
+test('readEnrichKeyFromEnv returns LLM_API_KEY from env', () => {
+  expect(readEnrichKeyFromEnv({ LLM_API_KEY: 'k-1' } as any)).toBe('k-1');
+});
+
+test('readEnrichKeyFromEnv throws when LLM_API_KEY is missing', () => {
+  expect(() => readEnrichKeyFromEnv({} as any)).toThrow(/LLM_API_KEY/);
 });

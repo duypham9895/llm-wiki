@@ -20,6 +20,12 @@ export function readKeychainToken(): string {
   ).trim();
 }
 
+export function readNotionTokenFromEnv(env: NodeJS.ProcessEnv): string {
+  const t = env.NOTION_TOKEN;
+  if (!t) throw new Error('NOTION_TOKEN env var is required (PRD_SECRETS=env mode)');
+  return t;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv, readToken: () => string): Config {
   const vaultPath = env.VAULT_PATH;
   if (!vaultPath) throw new Error('VAULT_PATH env var is required');

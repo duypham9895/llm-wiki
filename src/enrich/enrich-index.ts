@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { loadEnrichConfig, readEnrichKey } from './enrich-config.js';
+import { loadEnrichConfig, readEnrichKey, readEnrichKeyFromEnv } from './enrich-config.js';
 import { makeLlmClient } from './llm-client.js';
 import { distill } from './distill.js';
 import { summarizeDoc } from './summarize.js';
@@ -38,7 +38,10 @@ export function buildEnrichManifest(
 async function main(): Promise<number> {
   const startedAt = new Date().toISOString();
   const runId = process.env.RUN_ID ?? startedAt;
-  const cfg = loadEnrichConfig(process.env, readEnrichKey);
+  const reader = process.env.PRD_SECRETS === 'env'
+    ? () => readEnrichKeyFromEnv(process.env)
+    : readEnrichKey;
+  const cfg = loadEnrichConfig(process.env, reader);
   const llm = makeLlmClient(cfg);
   const prdsDir = join(cfg.vaultPath, 'PRDs');
 
