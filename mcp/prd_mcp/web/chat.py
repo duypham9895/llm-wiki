@@ -66,15 +66,6 @@ class MessageIn(BaseModel):
     content: str
 
 
-async def _next_seq(db, conv_id) -> int:
-    cur = (
-        await db.execute(
-            select(func.coalesce(func.max(Message.seq), 0)).where(
-                Message.conversation_id == conv_id
-            )
-        )
-    ).scalar_one()
-    return int(cur) + 1
 
 
 @router.post("/conversations/{cid}/messages")
@@ -131,6 +122,10 @@ async def post_message(
             # try so the finally's lock-release covers the entire post-claim
             # lifetime.  Use fresh sessions (request db may be closing).
             # ----------------------------------------------------------------
+            # Read history, compute the user seq, and insert the user row in ONE
+            # session/transaction. The generating lock already serializes writers
+            # per conversation, so MAX(seq)+1 is safe; doing it in a single session
+            # (no yield between read and write) closes any seq-collision window.
             async with db_mod._sessionmaker() as s:
                 history_rows = (
                     await s.execute(
@@ -140,16 +135,15 @@ async def post_message(
                     )
                 ).scalars().all()
                 history = [{"role": m.role, "content": m.content} for m in history_rows]
-                user_seq = (
-                    await s.execute(
-                        select(func.coalesce(func.max(Message.seq), 0)).where(
-                            Message.conversation_id == conv_id_val
+                user_seq = int(
+                    (
+                        await s.execute(
+                            select(func.coalesce(func.max(Message.seq), 0)).where(
+                                Message.conversation_id == conv_id_val
+                            )
                         )
-                    )
-                ).scalar_one()
-                user_seq = int(user_seq) + 1
-
-            async with db_mod._sessionmaker() as s:
+                    ).scalar_one()
+                ) + 1
                 s.add(Message(
                     conversation_id=conv_id_val,
                     seq=user_seq,
@@ -243,8 +237,13 @@ async def post_message(
                         conv_id_val,
                     )
 
-            # done event OUTSIDE the shield (it's a yield, not DB work)
-            if finish == "complete":
+            # done event OUTSIDE the shield (it's a yield, not DB work).
+            # Only emit `done` when the assistant row actually persisted (a_seq set);
+            # if the best-effort persist failed, a_seq stays None and emitting
+            # `done: "None"` would hand the client an unparseable seq. The lock is
+            # already released above, so suppressing `done` here is safe — the
+            # client sees the streamed tokens but no done marker on this rare path.
+            if finish == "complete" and a_seq is not None:
                 yield {"event": "done", "data": str(a_seq)}
 
     return EventSourceResponse(event_gen())
