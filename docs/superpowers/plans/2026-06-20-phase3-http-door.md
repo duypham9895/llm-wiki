@@ -1365,8 +1365,9 @@ async def test_healthz_responds_while_BLOCKING_sync_core_is_in_flight(client_prd
 
     def blocking_rewrite(history, latest, fn):
         entered.set()              # the blocking section is now executing
-        release.wait(5.0)          # hold here until the test releases us (block stays in flight)
-        return latest
+        release.wait()             # NO timeout (Codex iter-5): hold until the test releases us, so a
+        return latest              # non-offloaded loop stays frozen and fail_after(1.0) trips. The
+                                   # pytest/anyio test-level timeout + `finally: release.set()` prevent any hang.
     def blocking_retrieve(q, store, embed, k, th):
         return ([_FakeR()], "match")
     async def fast_stream(question, retrieved, verdict, fn):
@@ -1464,7 +1465,9 @@ git commit -m "test(web): /healthz stays responsive during a slow chat stream (s
 - #8 / new[blocker] (fixtures not real) — Task 0.5 rewritten against the REAL conftest (`settings`/`sessionmaker_`/`db`/`db_mod`/`seed_mod`); adds a real `make_user_with_perms` helper (no nonexistent `make_user`); `conv_id`/`busy_conv_id` depend on `ask_user`, not `app.state`; explicit land-order note (after Tasks 3/5/8).
 - #10 / new[major] (mid-stream retry + client leak) — Task 2 `chat_stream` split into PHASE 1 (connect, retry-only) and PHASE 2 (stream, no retry); client closed in `finally` on every path; test asserts a post-first-token error does NOT retry.
 
-**Codex review iterations 3–4 (B, C SHIP; A hardened to deterministic) — addressed:**
-- A (concurrency-test timing) — Task 9 final form uses TWO events: `entered` (blocking call has begun) + `release` (held open until the test lets go). `blocking_rewrite` sets `entered` then parks on `release.wait()`, so the block is PROVABLY in flight while `/healthz` is probed under `fail_after(1.0)`. A non-offloaded loop hangs → `fail_after` trips → test fails; an offloaded loop answers in ms. Fully deterministic — no fixed-sleep/timing-window assumption (Codex iter-3 then iter-4 "stronger" fix).
+**Codex review iterations 3–5 (B, C SHIP; A hardened to deterministic) — addressed:**
+- A (concurrency-test timing) — Task 9 final form uses TWO events: `entered` (blocking call has begun) + `release` (held open until the test lets go). `blocking_rewrite` sets `entered` then parks on `release.wait()` with **no timeout** (iter-5: a finite timeout could expire and let a broken non-offloaded route false-pass), so the block is PROVABLY in flight while `/healthz` is probed under `fail_after(1.0)`. A non-offloaded loop stays frozen → `fail_after` trips → test fails; an offloaded loop answers in ms. `finally: release.set()` + the pytest/anyio test-level timeout prevent any hang. Fully deterministic — no timing-window assumption.
+
+**Plan capped after iter 5 (design verified throughout):** the design + all logic findings were resolved by iter 2; iters 3–5 hardened a single concurrency *test* to be race-free. The remaining adjustments were Codex-prescribed one-line changes to that test's synchronization (now applied). The test's millisecond threshold (`h_elapsed < 0.3`) is tunable at implementation time against the real event loop. Treating Plan A as ready.
 
 **Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan. **Within this plan, run order:** 1, 2, 3, 5, 8, 0.5, 4, 6, 7, 9 (fixtures in 0.5 need coredeps/chatmodels/create_app(core=) from 3/5/8).
