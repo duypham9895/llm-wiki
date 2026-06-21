@@ -49,7 +49,8 @@
 - Consumes: nothing (leaf module).
 - Produces:
   - `interface StageCounts { processed: number; succeeded: number; failed: number; skipped: number }`
-  - `interface StageManifest { stage: 'sync'|'enrich'|'index'; run_id: string; started_at: string; finished_at: string; ok: boolean; exit_code: number; counts: StageCounts; errors: string[]; health_gate?: { passed: boolean; reason: string }; extra?: Record<string, unknown> }` (the spec §6 manifest contract includes the gate verdict; stages write the manifest with `health_gate` absent, and the orchestrator records each stage's gate verdict in the summary — Codex #6)
+  - `interface GateVerdict { passed: boolean; reason: string }`
+  - `interface StageManifest { stage: 'sync'|'enrich'|'index'|'summary'; run_id: string; started_at: string; finished_at: string; ok: boolean; exit_code: number; counts: StageCounts; errors: string[]; health_gate?: GateVerdict; extra?: Record<string, unknown> }` (`'summary'` is the orchestrator's roll-up manifest. The spec §6 manifest contract includes the gate verdict; stages write the manifest with `health_gate` absent, and the orchestrator records each stage's gate verdict in the summary's `extra.gates` — Codex #6)
   - `async function writeManifest(vaultPath: string, runId: string, m: StageManifest): Promise<string>` (returns the written path; creates `.runs/<run_id>/` recursively; writes `<stage>.json` pretty-printed)
   - `async function readManifest(vaultPath: string, runId: string, stage: string): Promise<StageManifest | null>` (null if absent/unparseable)
 
@@ -603,12 +604,17 @@ Then wire into `cli.py` `index` branch (after `run_index`, using env `RUN_ID` or
         started = datetime.now(timezone.utc).isoformat()
         res = run_index(cfg, store, llm.embed, force=args.force)
         run_id = os.environ.get("RUN_ID", started)
+        # Codex #4 + new[major]: compute index_nonempty ONCE and make the process exit code
+        # AGREE with the manifest's exit_code (an empty index is a failure). Otherwise the
+        # orchestrator's exit-vs-manifest reconciliation (Task 8) would halt on a false
+        # "disagreement" instead of the intended empty-index gate.
+        index_nonempty = bool(store.stored_hashes())
         write_index_manifest(cfg.vault_path, run_id, started,
                              datetime.now(timezone.utc).isoformat(), res,
-                             index_nonempty=bool(store.stored_hashes()))
+                             index_nonempty=index_nonempty)
         print(f"indexed {res['indexed']} · skipped {res['skipped']} · "
               f"removed {res['removed']} · errors {res['errors']}")
-        return 1 if res["errors"] else 0
+        return 1 if (res["errors"] or not index_nonempty) else 0
 ```
 
 (`cfg.vault_path` is verified to exist in `config.py:30`.)
@@ -1323,7 +1329,7 @@ Expected: PASS; typecheck clean.
 - [ ] **Step 5: Manual smoke (local, optional but recommended)**
 
 Run (Mac, keychain mode): `VAULT_PATH="/Users/edwardpham/Documents/Backup/Obsidian/ringkas" npm run orchestrate`
-Expected: runs sync → enrich → index in order; writes `<vault>/.runs/<run_id>/{sync,enrich,index,summary}.json`; prints `pipeline ok` (or `PIPELINE HALTED at <stage>` with a reason). Verify the manifest files exist.
+Expected: runs sync → enrich → index in order; writes `<vault>/.runs/<run_id>/{sync,enrich,index,summary}.json`; prints `pipeline ok` (or `PIPELINE HALTED at <stage>` with a reason). Verify the manifest files exist. **Sanity-check the exit/manifest agreement (Codex new[major]):** for the index stage, the subprocess exit code and `index.json`'s `exit_code` must match — on a healthy run both are 0; on an empty index both are 1 (so the orchestrator halts on the empty-index *gate*, not on a spurious exit-disagreement).
 
 - [ ] **Step 6: Commit**
 
