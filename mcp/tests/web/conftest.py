@@ -11,6 +11,7 @@ from testcontainers.postgres import PostgresContainer
 from prd_mcp.web.db import Base, make_engine, make_sessionmaker
 from prd_mcp.web.settings import load_settings
 import prd_mcp.web.models  # noqa: F401  (register tables on Base.metadata)
+import prd_mcp.web.chatmodels  # noqa: F401  (register chat tables for create_all)
 
 TEST_ARGON = {"ARGON2_TIME_COST": "1", "ARGON2_MEMORY_KIB": "8", "ARGON2_PARALLELISM": "1"}
 
