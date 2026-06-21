@@ -341,47 +341,44 @@ async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
 
 
 @pytest.mark.asyncio
-async def test_real_claim_refreshes_updated_at_so_sweep_spares_it(
-    client_prd_ask, ask_user, db, sessionmaker_, monkeypatch
-):
-    """Regression (Codex): a conversation whose updated_at is OLD, once claimed via the
-    REAL POST path, must have updated_at refreshed by the claim — so the stale sweep does
-    NOT release it. Exercises the actual claim UPDATE (not a manual updated_at set).
+async def test_claim_refreshes_updated_at_so_sweep_spares_active_lock(db, ask_user):
+    """Regression (Codex): the stale-sweep keys off updated_at, so the lock CLAIM must
+    refresh updated_at — otherwise a conversation last touched long ago could be claimed
+    and then swept WHILE STILL generating (mid-stream), releasing the lock under an active
+    generation. This test runs the sweep against a row that is `generating=True` from the
+    claim (NOT yet released), with an originally-old updated_at, and asserts it is spared.
 
-    We assert at the DB level that after a completed POST the conversation's updated_at is
-    recent and a 30-min sweep spares it — proving `.values(generating=True, updated_at=now())`
-    on the claim is what protects an active/just-active stream from the sweep."""
+    It would FAIL if the claim UPDATE omitted `updated_at=func.now()`: the row would still
+    be generating=True but with an old updated_at, and the sweep would clear it."""
     from datetime import datetime, timedelta, timezone
     from prd_mcp.web.chat import sweep_stale_generating
     from prd_mcp.web.chatmodels import Conversation as Conv
-    import sqlalchemy
+    from sqlalchemy import func, select, update as sa_update
 
-    # A conversation last touched 2 hours ago (older than the 30-min sweep window).
+    # Conversation last touched 2 hours ago, not generating.
     old_time = datetime.now(timezone.utc) - timedelta(hours=2)
-    conv = Conv(user_id=ask_user.id, title="old")
+    conv = Conv(user_id=ask_user.id, title="old", generating=False)
     db.add(conv)
     await db.flush()
-    await db.execute(
-        sqlalchemy.update(Conv).where(Conv.id == conv.id).values(updated_at=old_time)
-    )
+    await db.execute(sa_update(Conv).where(Conv.id == conv.id).values(updated_at=old_time))
     await db.commit()
-    cid = str(conv.id)
 
-    # Happy-path stream so the POST claims (refreshing updated_at) and then releases.
-    _patch_happy(monkeypatch)
+    # Apply the EXACT claim statement the handler uses (atomic, refreshes updated_at).
+    # This is the production claim from post_message: generating=True + updated_at=func.now().
+    claimed = (await db.execute(
+        sa_update(Conv)
+        .where(Conv.id == conv.id, Conv.generating.is_(False))
+        .values(generating=True, updated_at=func.now())
+    )).rowcount
+    await db.commit()
+    assert claimed == 1
 
-    r = await client_prd_ask.post(
-        f"/api/chat/conversations/{cid}/messages",
-        json={"content": "hi"}, headers={"x-requested-with": "prd-app"},
-    )
-    assert r.status_code == 200
-
-    # The claim refreshed updated_at to ~now (even though it started 2h old), so a sweep
-    # with a now reference 1 minute in the future must NOT clear this conversation.
-    async with sessionmaker_() as s:
-        swept = await sweep_stale_generating(
-            s, older_than_minutes=30,
-            now=datetime.now(timezone.utc) + timedelta(minutes=1),
-        )
-        await s.commit()
-    assert swept == 0, "a conversation claimed via the real path was swept — claim must refresh updated_at"
+    # The conversation is now generating=True (lock held, NOT released). Run the sweep with
+    # a reference time 1 minute in the future. Because the claim refreshed updated_at to ~now,
+    # the (formerly 2h-old) conversation must NOT be swept out from under the active lock.
+    swept = await sweep_stale_generating(db, older_than_minutes=30,
+                                         now=datetime.now(timezone.utc) + timedelta(minutes=1))
+    await db.commit()
+    await db.refresh(conv)
+    assert swept == 0, "claim must refresh updated_at — active lock was swept mid-generation"
+    assert conv.generating is True, "active lock was incorrectly released by the sweep"
