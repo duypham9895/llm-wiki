@@ -338,3 +338,50 @@ async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
     await db.refresh(conv)
     assert conv.generating is True, "in-flight lock was incorrectly cleared"
     assert swept == 0, f"expected rowcount 0, got {swept}"
+
+
+@pytest.mark.asyncio
+async def test_real_claim_refreshes_updated_at_so_sweep_spares_it(
+    client_prd_ask, ask_user, db, sessionmaker_, monkeypatch
+):
+    """Regression (Codex): a conversation whose updated_at is OLD, once claimed via the
+    REAL POST path, must have updated_at refreshed by the claim — so the stale sweep does
+    NOT release it. Exercises the actual claim UPDATE (not a manual updated_at set).
+
+    We assert at the DB level that after a completed POST the conversation's updated_at is
+    recent and a 30-min sweep spares it — proving `.values(generating=True, updated_at=now())`
+    on the claim is what protects an active/just-active stream from the sweep."""
+    from datetime import datetime, timedelta, timezone
+    from prd_mcp.web.chat import sweep_stale_generating
+    from prd_mcp.web.chatmodels import Conversation as Conv
+    import sqlalchemy
+
+    # A conversation last touched 2 hours ago (older than the 30-min sweep window).
+    old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    conv = Conv(user_id=ask_user.id, title="old")
+    db.add(conv)
+    await db.flush()
+    await db.execute(
+        sqlalchemy.update(Conv).where(Conv.id == conv.id).values(updated_at=old_time)
+    )
+    await db.commit()
+    cid = str(conv.id)
+
+    # Happy-path stream so the POST claims (refreshing updated_at) and then releases.
+    _patch_happy(monkeypatch)
+
+    r = await client_prd_ask.post(
+        f"/api/chat/conversations/{cid}/messages",
+        json={"content": "hi"}, headers={"x-requested-with": "prd-app"},
+    )
+    assert r.status_code == 200
+
+    # The claim refreshed updated_at to ~now (even though it started 2h old), so a sweep
+    # with a now reference 1 minute in the future must NOT clear this conversation.
+    async with sessionmaker_() as s:
+        swept = await sweep_stale_generating(
+            s, older_than_minutes=30,
+            now=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        await s.commit()
+    assert swept == 0, "a conversation claimed via the real path was swept — claim must refresh updated_at"

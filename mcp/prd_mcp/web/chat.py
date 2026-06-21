@@ -119,11 +119,15 @@ async def post_message(
 
     # Claim the one-at-a-time generation lock atomically.
     # WHERE generating IS FALSE ensures only one writer wins; rowcount==0 → already busy.
+    # Refresh updated_at on claim (Codex): the stale-lock sweep keys off updated_at, so
+    # a freshly-claimed conversation MUST look recent — otherwise a conversation whose
+    # updated_at predates the sweep window could be swept mid-stream, releasing the lock
+    # out from under an active generation.
     claimed = (
         await db.execute(
             update(Conversation)
             .where(Conversation.id == conv.id, Conversation.generating.is_(False))
-            .values(generating=True)
+            .values(generating=True, updated_at=func.now())
         )
     ).rowcount
     await db.commit()
