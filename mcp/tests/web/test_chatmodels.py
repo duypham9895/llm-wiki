@@ -5,14 +5,15 @@ User is created inline (no make_user fixture exists in this conftest — see tes
 for the same pattern).
 """
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from prd_mcp.web.chatmodels import Conversation, Message
 from prd_mcp.web.models import User
 
 
 @pytest.mark.asyncio
-async def test_conversation_message_persist_and_cascade(db):
+async def test_conversation_message_persist_and_ordering(db):
     # Create a user inline, matching the pattern used in test_invariants.py
     user = User(email="chat_test@ringkas.co.id", password_hash="x", status="active")
     db.add(user)
@@ -46,3 +47,44 @@ async def test_conversation_message_persist_and_cascade(db):
 
     assert [m.seq for m in rows] == [1, 2]
     assert rows[1].finish_reason == "complete"
+
+
+@pytest.mark.asyncio
+async def test_unique_conversation_seq_enforced(db):
+    """The (conversation_id, seq) UNIQUE constraint must reject a duplicate seq."""
+    user = User(email="uniq_test@ringkas.co.id", password_hash="x", status="active")
+    db.add(user)
+    await db.flush()
+    conv = Conversation(user_id=user.id, title="")
+    db.add(conv)
+    await db.flush()
+    db.add(Message(conversation_id=conv.id, seq=1, role="user", content="a"))
+    await db.flush()
+    db.add(Message(conversation_id=conv.id, seq=1, role="assistant", content="b"))
+    with pytest.raises(IntegrityError):
+        await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_deleting_conversation_cascades_to_messages(db):
+    """ON DELETE CASCADE: removing a conversation removes its messages."""
+    user = User(email="cascade_test@ringkas.co.id", password_hash="x", status="active")
+    db.add(user)
+    await db.flush()
+    conv = Conversation(user_id=user.id, title="")
+    db.add(conv)
+    await db.flush()
+    conv_id = conv.id
+    db.add_all([
+        Message(conversation_id=conv_id, seq=1, role="user", content="hi"),
+        Message(conversation_id=conv_id, seq=2, role="assistant", content="yo"),
+    ])
+    await db.commit()
+
+    await db.delete(conv)
+    await db.commit()
+
+    remaining = (await db.execute(
+        select(func.count()).select_from(Message).where(Message.conversation_id == conv_id)
+    )).scalar_one()
+    assert remaining == 0
