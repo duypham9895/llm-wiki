@@ -37,7 +37,12 @@ def main() -> int:
         return 0
 
     # index/serve only past this point — these require the keychain + Chroma:
-    cfg = load_config(os.environ, read_secret)
+    # index/serve require the LLM/embed secrets:
+    if os.environ.get("PRD_SECRETS") == "env":
+        from prd_mcp.env_secret import read_secret_from_env as secret_reader
+    else:
+        secret_reader = read_secret
+    cfg = load_config(os.environ, secret_reader)
     store = Store.open(cfg.chroma_path)
 
     if args.cmd == "index":
