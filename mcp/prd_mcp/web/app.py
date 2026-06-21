@@ -21,6 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from prd_mcp.web import db as db_mod
 from prd_mcp.web import sessions as sessions_mod
+from prd_mcp.web.coredeps import set_core
 from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
 from prd_mcp.web.security import make_password_hasher
@@ -49,7 +50,7 @@ class HSTSMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True) -> FastAPI:
+def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True, core=None) -> FastAPI:
     app = FastAPI(title="PRD Auth")
     app.state.settings = settings
     app.state.ratelimiter = RateLimiter(settings.rate_limit_per_min)
@@ -116,6 +117,10 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
 
     app.include_router(auth_router)
     app.include_router(admin_router)
+
+    if core is not None:
+        set_core(app, core)
+    # Phase 3 routers (prd/chat/status) are mounted in their own tasks.
 
     @app.get("/healthz")
     async def healthz():

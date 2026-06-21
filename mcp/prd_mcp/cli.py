@@ -25,11 +25,20 @@ def main() -> int:
         from prd_mcp.web.settings import load_settings
         from prd_mcp.web.db import make_engine, make_sessionmaker
         from prd_mcp.web.app import create_app
+        from prd_mcp.web.coredeps import Core
 
         web_settings = load_settings()  # reads os.environ; NO keychain, NO Chroma
         engine = make_engine(web_settings.database_url)
         sm = make_sessionmaker(engine)
-        application = create_app(web_settings, sm, run_startup=True)
+        # Build the PRD core (cfg/store/llm) the same way index/serve do.
+        if os.environ.get("PRD_SECRETS") == "env":
+            from prd_mcp.env_secret import read_secret_from_env as secret_reader
+        else:
+            secret_reader = read_secret
+        cfg = load_config(os.environ, secret_reader)
+        store = Store.open(cfg.chroma_path)
+        llm = make_client(cfg)
+        application = create_app(web_settings, sm, run_startup=True, core=Core(cfg=cfg, store=store, llm=llm))
         uvicorn.run(
             application, host=args.host, port=args.port,
             workers=1, forwarded_allow_ips="127.0.0.1",  # trust XFF only from Caddy on loopback
