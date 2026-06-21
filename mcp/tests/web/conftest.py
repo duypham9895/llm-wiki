@@ -96,6 +96,7 @@ async def client(app):
 # Phase 3 web fixtures — permission-scoped clients, fake core, chat fixtures
 # ---------------------------------------------------------------------------
 import sqlalchemy
+from sqlalchemy.orm import selectinload
 from prd_mcp.web.coredeps import Core
 from prd_mcp.web.rbac import current_user
 from prd_mcp.web.models import User, Role, Permission
@@ -182,15 +183,36 @@ async def app_with_core(settings, sessionmaker_, fake_core):
     return application
 
 
-def _perm_client(app, user: User) -> httpx.AsyncClient:
-    """Return an AsyncClient whose current_user is overridden to *user*.
+def _perm_client(settings, sessionmaker_, fake_core, user_id) -> httpx.AsyncClient:
+    """Return an AsyncClient whose current_user is overridden to the user with *user_id*.
+
+    Each client builds its OWN app instance (Codex review): overriding
+    current_user on a SHARED app would let a second scoped client clobber the
+    first's override when a single test uses two clients (e.g. owner +
+    non-owner). A per-client app makes scope isolation order-independent.
 
     Overrides current_user (not require_permission) so the REAL
-    require_permission guard runs — a client_no_perms user genuinely receives 403.
+    require_permission guard still runs — a no-perms user genuinely receives 403.
+
+    The override RE-FETCHES the user with roles+permissions eager-loaded inside a
+    fresh request-scoped session, because require_permission -> effective_permissions
+    walks user.roles/role.permissions (lazy="selectin"); a detached user from the
+    fixture's (closed) session would trip MissingGreenlet on that lazy load.
     """
+    db_mod.set_sessionmaker(sessionmaker_)
+    app = create_app(settings, sessionmaker_, run_startup=False, core=fake_core)
 
     async def _cu():
-        return user
+        async with sessionmaker_() as s:
+            return (
+                await s.execute(
+                    sqlalchemy.select(User)
+                    .where(User.id == user_id)
+                    .options(
+                        selectinload(User.roles).selectinload(Role.permissions)
+                    )
+                )
+            ).scalar_one()
 
     app.dependency_overrides[current_user] = _cu
     transport = httpx.ASGITransport(app=app)
@@ -202,10 +224,10 @@ def _perm_client(app, user: User) -> httpx.AsyncClient:
 
 
 @pytest_asyncio.fixture
-async def client_prd_read(app_with_core, db):
+async def client_prd_read(settings, sessionmaker_, fake_core, db):
     user = await make_user_with_perms(db, "reader@ringkas.co.id", {"prd.read"})
     await db.commit()
-    async with _perm_client(app_with_core, user) as c:
+    async with _perm_client(settings, sessionmaker_, fake_core, user.id) as c:
         yield c
 
 
@@ -217,24 +239,24 @@ async def ask_user(db) -> User:
 
 
 @pytest_asyncio.fixture
-async def client_prd_ask(app_with_core, ask_user):
-    async with _perm_client(app_with_core, ask_user) as c:
+async def client_prd_ask(settings, sessionmaker_, fake_core, ask_user):
+    async with _perm_client(settings, sessionmaker_, fake_core, ask_user.id) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def client_status_view(app_with_core, db):
+async def client_status_view(settings, sessionmaker_, fake_core, db):
     user = await make_user_with_perms(db, "ops@ringkas.co.id", {"status.view"})
     await db.commit()
-    async with _perm_client(app_with_core, user) as c:
+    async with _perm_client(settings, sessionmaker_, fake_core, user.id) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def client_no_perms(app_with_core, db):
+async def client_no_perms(settings, sessionmaker_, fake_core, db):
     user = await make_user_with_perms(db, "noperm@ringkas.co.id", set())
     await db.commit()
-    async with _perm_client(app_with_core, user) as c:
+    async with _perm_client(settings, sessionmaker_, fake_core, user.id) as c:
         yield c
 
 
