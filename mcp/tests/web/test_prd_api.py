@@ -8,6 +8,18 @@ async def test_search_requires_prd_read(client_no_perms):
 
 
 @pytest.mark.asyncio
+async def test_library_requires_prd_read(client_no_perms):
+    r = await client_no_perms.get("/api/prd/library")
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_read_prd_requires_prd_read(client_no_perms):
+    r = await client_no_perms.get("/api/prd/EP-1")
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_search_returns_verdict_shape(client_prd_read, monkeypatch):
     import prd_mcp.web.prd as prdmod
     monkeypatch.setattr(prdmod, "search_prds_impl",

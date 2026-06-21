@@ -58,14 +58,23 @@ class Store:
         by_stem = {}
         for md in got.get("metadatas", []) or []:
             stem = md["doc_stem"]
-            if stem in by_stem:
+            # Prefer the summary chunk for card fields; Chroma .get() order isn't
+            # guaranteed, so don't just keep the first chunk seen. Once we've taken a
+            # summary chunk for a stem, never overwrite it.
+            if stem in by_stem and by_stem[stem].get("_from_summary"):
+                continue
+            is_summary = md.get("chunk_type") == "summary"
+            if stem in by_stem and not is_summary:
                 continue
             tags = [t for t in (md.get("tags") or "").split(",") if t]
             by_stem[stem] = {"id": md.get("doc_id", stem), "stem": stem, "title": md.get("title", ""),
                              "status": md.get("status", ""), "tags": tags,
-                             "summary": md.get("summary", "") or "", "source_url": md.get("source_url", "")}
+                             "summary": md.get("summary", "") or "", "source_url": md.get("source_url", ""),
+                             "_from_summary": is_summary}
         cards = [c for c in by_stem.values()
                  if (status is None or c["status"] == status) and (tag is None or tag in c["tags"])]
+        for c in cards:
+            c.pop("_from_summary", None)
         cards.sort(key=lambda c: c["id"])
         start = next((i + 1 for i, c in enumerate(cards) if c["id"] == cursor), 0)
         limit = max(1, min(limit, 100))

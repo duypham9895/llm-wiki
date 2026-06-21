@@ -28,6 +28,27 @@ def test_list_cards_paginates_by_cursor():
     rows = [_md(f"EP-{i}") for i in range(5)]
     store = Store(_FakeCollection(rows))
     page1 = store.list_cards(limit=2)
-    assert len(page1["results"]) == 2 and page1["next_cursor"] is not None
+    assert page1["results"][0]["id"] == "EP-0" and page1["results"][1]["id"] == "EP-1"
+    assert page1["next_cursor"] == "EP-1"
     page2 = store.list_cards(limit=2, cursor=page1["next_cursor"])
-    assert page1["results"][0]["id"] != page2["results"][0]["id"]
+    assert page2["results"][0]["id"] == "EP-2" and page2["results"][1]["id"] == "EP-3"
+    assert page2["next_cursor"] == "EP-3"
+    page3 = store.list_cards(limit=2, cursor=page2["next_cursor"])
+    assert page3["results"][0]["id"] == "EP-4"
+    assert page3["next_cursor"] is None
+
+
+def test_list_cards_prefers_summary_chunk():
+    # Body chunk first (title "BODY"), then summary chunk (title "SUMMARY")
+    body_chunk = {"doc_stem": "EP-1", "doc_id": "EP-1", "title": "BODY", "status": "active",
+                  "tags": "", "summary": "sum", "source_url": "u", "chunk_type": "body", "body_hash": "h"}
+    summary_chunk = {"doc_stem": "EP-1", "doc_id": "EP-1", "title": "SUMMARY", "status": "active",
+                     "tags": "", "summary": "sum", "source_url": "u", "chunk_type": "summary", "body_hash": "h"}
+    store = Store(_FakeCollection([body_chunk, summary_chunk]))
+    cards = store.list_cards()
+    assert cards["results"][0]["title"] == "SUMMARY"
+
+    # Reverse order: summary first, then body
+    store2 = Store(_FakeCollection([summary_chunk, body_chunk]))
+    cards2 = store2.list_cards()
+    assert cards2["results"][0]["title"] == "SUMMARY"
