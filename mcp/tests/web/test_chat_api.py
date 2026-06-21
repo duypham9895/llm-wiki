@@ -11,10 +11,30 @@ async def test_create_list_get_delete_owned(client_prd_ask):
     r = await client_prd_ask.get(f"/api/chat/conversations/{cid}")
     assert r.status_code == 200 and r.json()["messages"] == []
     r = await client_prd_ask.delete(f"/api/chat/conversations/{cid}", headers={"x-requested-with": "prd-app"})
-    assert r.status_code in (200, 204)
+    assert r.status_code == 204
+    r = await client_prd_ask.get(f"/api/chat/conversations/{cid}")
+    assert r.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_other_users_conversation_is_404(client_prd_ask, other_users_conversation_id):
     r = await client_prd_ask.get(f"/api/chat/conversations/{other_users_conversation_id}")
     assert r.status_code == 404  # not 403 — never leak existence
+
+
+@pytest.mark.asyncio
+async def test_delete_other_users_conversation_is_404(client_prd_ask, other_users_conversation_id):
+    r = await client_prd_ask.delete(f"/api/chat/conversations/{other_users_conversation_id}", headers={"x-requested-with": "prd-app"})
+    assert r.status_code == 404  # ownership-locked delete
+
+
+@pytest.mark.asyncio
+async def test_malformed_cid_get_is_404(client_prd_ask):
+    r = await client_prd_ask.get("/api/chat/conversations/not-a-uuid")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_malformed_cid_delete_is_404(client_prd_ask):
+    r = await client_prd_ask.delete("/api/chat/conversations/not-a-uuid", headers={"x-requested-with": "prd-app"})
+    assert r.status_code == 404

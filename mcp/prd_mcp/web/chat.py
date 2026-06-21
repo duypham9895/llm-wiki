@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import delete, select
 
@@ -56,6 +56,10 @@ async def delete_conversation(cid: str, user: User = Depends(require_permission(
     conv = await _owned_or_none(db, user, cid)
     if conv is None:
         return JSONResponse(status_code=404, content={"error": {"code": "not_found", "message": "conversation not found"}})
-    await db.execute(delete(Conversation).where(Conversation.id == conv.id))
+    await db.execute(
+        delete(Conversation).where(
+            Conversation.id == conv.id, Conversation.user_id == user.id
+        )
+    )
     await db.commit()
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
