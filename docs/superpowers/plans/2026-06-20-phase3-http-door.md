@@ -1344,6 +1344,7 @@ git commit -m "feat(web): status router + mount prd/chat/status into create_app;
 
 ```python
 # mcp/tests/web/test_chat_concurrency.py
+import threading
 import time
 import anyio
 import pytest
@@ -1356,11 +1357,14 @@ async def test_healthz_responds_while_BLOCKING_sync_core_is_in_flight(client_prd
     # offload them via anyio.to_thread.run_sync for /healthz to stay responsive.
     import prd_mcp.web.chat as chatmod
 
+    started = threading.Event()  # set the instant the blocking section is entered
+
     def blocking_rewrite(history, latest, fn):
-        time.sleep(0.4)   # blocks the CALLING thread; only a threadpool offload keeps the loop free
+        started.set()      # signal: the blocking core call has BEGUN
+        time.sleep(0.5)    # blocks the CALLING thread; only a threadpool offload frees the loop
         return latest
     def blocking_retrieve(q, store, embed, k, th):
-        time.sleep(0.4)
+        time.sleep(0.5)
         return ([_FakeR()], "match")
     async def fast_stream(question, retrieved, verdict, fn):
         yield "ok"
@@ -1368,30 +1372,30 @@ async def test_healthz_responds_while_BLOCKING_sync_core_is_in_flight(client_prd
     monkeypatch.setattr(chatmod, "retrieve", blocking_retrieve)
     monkeypatch.setattr(chatmod, "answer_stream", fast_stream)
 
-    import time as _time
     async with anyio.create_task_group() as tg:
         async def start_stream():
             await client_prd_ask.post(f"/api/chat/conversations/{conv_id}/messages",
                                       json={"content": "hi"}, headers={"x-requested-with": "prd-app"})
-        # Measure WALL-CLOCK from before the stream starts (Codex new[major]): if the loop
-        # were blocked, even reaching the healthz call would be delayed, so elapsed would
-        # exceed the blocking duration. We assert healthz completes well under 0.8s total.
-        t0 = _time.monotonic()
         tg.start_soon(start_stream)
-        await anyio.sleep(0.05)  # let the stream task start its (offloaded) blocking work
+        # SYNCHRONIZE (Codex new[major]): wait until the stream has actually ENTERED the
+        # blocking rewrite before probing — `started.wait` runs in a worker thread so it
+        # resolves the moment the flag is set, regardless of setup time. No fixed sleep.
+        entered = await anyio.to_thread.run_sync(started.wait, 2.0)
+        assert entered, "stream never reached rewrite_query within 2s"
+        # A 0.5s blocking call is now in flight (with a 0.5s retrieve queued behind it). If the
+        # route ran them ON the loop, /healthz cannot COMPLETE until ~1.0s of blocking clears.
+        h0 = time.monotonic()
         r = await client_prd_ask.get("/healthz")
-        elapsed = _time.monotonic() - t0
+        h_elapsed = time.monotonic() - h0
         assert r.status_code in (200, 503)
-        # 0.8s = the two 0.4s blocking calls. If healthz only returns AFTER they finish, the
-        # loop was blocked. A generous 0.5s ceiling proves healthz did NOT wait them out.
-        assert elapsed < 0.5, f"/healthz waited {elapsed:.2f}s — event loop was blocked (no offload)"
+        assert h_elapsed < 0.3, f"/healthz blocked {h_elapsed:.2f}s — event loop was blocked (no offload)"
 
 
 class _FakeR:
     doc_stem = "EP-1"; doc_id = "EP-1"; title = "T"; source_url = ""; summary = "s"; tags = []; status = ""; text = "ctx"; score = 0.5
 ```
 
-**Why this is the real proof (Codex #7 + new[major]):** the blocking fakes hold the calling thread for ~0.8s total. If the route ran them on the event loop, the loop would be frozen — and the `/healthz` request (issued on that same loop) could not COMPLETE until the block cleared, so `elapsed` would be ≥0.8s. Measuring wall-clock from BEFORE `start_stream` (not a `fail_after` that itself starts late) closes the window Codex flagged: a blocked loop delays even reaching/finishing the healthz call, tripping `elapsed < 0.5`. The proof only passes if `rewrite_query`/`retrieve` were offloaded via `anyio.to_thread.run_sync`. (The conftest's async httpx-over-ASGI client drives the app on the event loop, which is what makes this meaningful.)
+**Why this is the real proof (Codex #7 + the two follow-ups):** two things make it sound. (1) The fakes are *synchronously* blocking (`time.sleep`), so they freeze whatever thread runs them. (2) The `started` event removes the timing race: instead of a fixed `sleep(0.05)` and hoping the blocking call began, the test BLOCKS (in a worker thread, so the loop stays free) until `blocking_rewrite` signals it has started — then probes `/healthz` and measures only the health call's latency. In the correct (offloaded) design, `rewrite`/`retrieve` run in worker threads, the loop is free, and `/healthz` returns in milliseconds (`h_elapsed < 0.3`). In a blocking design, the ~1.0s of `time.sleep` runs on the loop and `/healthz` cannot complete until it clears, so `h_elapsed` ≥ ~0.5s and the assert trips. (The conftest's async httpx-over-ASGI client drives the app on the loop, which is what makes the latency meaningful.)
 
 - [ ] **Step 2: Run test to verify it fails (or reveals blocking)**
 
@@ -1453,5 +1457,8 @@ git commit -m "test(web): /healthz stays responsive during a slow chat stream (s
 - #7 / new[major] (concurrency test timing window) — Task 9 now measures wall-clock from before the stream starts and asserts `/healthz` completes in <0.5s (a blocked loop would delay even reaching/finishing the call); no late-starting `fail_after`.
 - #8 / new[blocker] (fixtures not real) — Task 0.5 rewritten against the REAL conftest (`settings`/`sessionmaker_`/`db`/`db_mod`/`seed_mod`); adds a real `make_user_with_perms` helper (no nonexistent `make_user`); `conv_id`/`busy_conv_id` depend on `ask_user`, not `app.state`; explicit land-order note (after Tasks 3/5/8).
 - #10 / new[major] (mid-stream retry + client leak) — Task 2 `chat_stream` split into PHASE 1 (connect, retry-only) and PHASE 2 (stream, no retry); client closed in `finally` on every path; test asserts a post-first-token error does NOT retry.
+
+**Codex review iteration 3 (B, C fixed; A partial) — addressed:**
+- A / new[major] (concurrency-test timing race) — Task 9 now uses a `threading.Event` set at the start of `blocking_rewrite`; the test waits (in a worker thread) until the blocking section is genuinely entered, THEN probes `/healthz` and measures only the health-call latency (`< 0.3s`). No fixed `sleep` assumption — closes the race where a slow setup let `/healthz` run before the block.
 
 **Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan. **Within this plan, run order:** 1, 2, 3, 5, 8, 0.5, 4, 6, 7, 9 (fixtures in 0.5 need coredeps/chatmodels/create_app(core=) from 3/5/8).
