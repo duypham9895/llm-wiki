@@ -120,7 +120,9 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True,
 
     if core is not None:
         set_core(app, core)
-    # Phase 3 routers (prd/chat/status) are mounted in their own tasks.
+        from prd_mcp.web.prd import router as prd_router
+        app.include_router(prd_router)
+    # Phase 3 routers (chat/status) are mounted in their own tasks.
 
     @app.get("/healthz")
     async def healthz():

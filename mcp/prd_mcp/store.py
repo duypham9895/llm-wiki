@@ -50,6 +50,29 @@ class Store:
         dists = (res.get("distances") or [[]])[0]
         return [{"text": t, "metadata": m, "distance": d} for t, m, d in zip(docs, metas, dists)]
 
+    def list_cards(self, status: str | None = None, tag: str | None = None,
+                   cursor: str | None = None, limit: int = 50) -> dict:
+        """One Library card per PRD, built from stored chunk metadata. Dedupes by
+        doc_stem (a PRD has many chunks), filters by status/tag, paginates by stem cursor."""
+        got = self.collection.get(include=["metadatas"])
+        by_stem = {}
+        for md in got.get("metadatas", []) or []:
+            stem = md["doc_stem"]
+            if stem in by_stem:
+                continue
+            tags = [t for t in (md.get("tags") or "").split(",") if t]
+            by_stem[stem] = {"id": md.get("doc_id", stem), "stem": stem, "title": md.get("title", ""),
+                             "status": md.get("status", ""), "tags": tags,
+                             "summary": md.get("summary", "") or "", "source_url": md.get("source_url", "")}
+        cards = [c for c in by_stem.values()
+                 if (status is None or c["status"] == status) and (tag is None or tag in c["tags"])]
+        cards.sort(key=lambda c: c["id"])
+        start = next((i + 1 for i, c in enumerate(cards) if c["id"] == cursor), 0)
+        limit = max(1, min(limit, 100))
+        page = cards[start:start + limit]
+        next_cursor = page[-1]["id"] if (start + limit) < len(cards) and page else None
+        return {"results": page, "next_cursor": next_cursor}
+
     def keyword_query(self, terms: list, k: int) -> list:
         if not terms:
             return []
