@@ -28,13 +28,13 @@ def test_list_cards_paginates_by_cursor():
     rows = [_md(f"EP-{i}") for i in range(5)]
     store = Store(_FakeCollection(rows))
     page1 = store.list_cards(limit=2)
-    assert page1["results"][0]["id"] == "EP-0" and page1["results"][1]["id"] == "EP-1"
+    assert [c["id"] for c in page1["results"]] == ["EP-0", "EP-1"]
     assert page1["next_cursor"] == "EP-1"
     page2 = store.list_cards(limit=2, cursor=page1["next_cursor"])
-    assert page2["results"][0]["id"] == "EP-2" and page2["results"][1]["id"] == "EP-3"
+    assert [c["id"] for c in page2["results"]] == ["EP-2", "EP-3"]
     assert page2["next_cursor"] == "EP-3"
     page3 = store.list_cards(limit=2, cursor=page2["next_cursor"])
-    assert page3["results"][0]["id"] == "EP-4"
+    assert [c["id"] for c in page3["results"]] == ["EP-4"]  # exact: no stray/repeated item
     assert page3["next_cursor"] is None
 
 
