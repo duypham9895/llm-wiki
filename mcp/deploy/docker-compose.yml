@@ -1,0 +1,28 @@
+services:
+  prd-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: prd_auth
+      POSTGRES_USER: prd_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - prd_pgdata:/var/lib/postgresql/data
+    networks: [prd_net]
+
+  prd-app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [prd-postgres]
+    ports:
+      - "127.0.0.1:8300:8300"   # host loopback only; Caddy reverse-proxies here
+    networks: [prd_net]
+
+volumes:
+  prd_pgdata:
+
+networks:
+  prd_net:
