@@ -9,6 +9,12 @@ export function readEnrichKey(): string {
   ).trim();
 }
 
+export function readEnrichKeyFromEnv(env: NodeJS.ProcessEnv): string {
+  const k = env.LLM_API_KEY;
+  if (!k) throw new Error('LLM_API_KEY env var is required (PRD_SECRETS=env mode)');
+  return k;
+}
+
 export function loadEnrichConfig(env: NodeJS.ProcessEnv, readKey: () => string): EnrichConfig {
   const vaultPath = env.VAULT_PATH;
   if (!vaultPath) throw new Error('VAULT_PATH env var is required');

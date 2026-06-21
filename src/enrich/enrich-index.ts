@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { loadEnrichConfig, readEnrichKey } from './enrich-config.js';
+import { loadEnrichConfig, readEnrichKey, readEnrichKeyFromEnv } from './enrich-config.js';
 import { makeLlmClient } from './llm-client.js';
 import { distill } from './distill.js';
 import { summarizeDoc } from './summarize.js';
@@ -8,6 +8,7 @@ import { listPrdFiles, splitFrontmatter, hashBody, writeLlmBlock } from './doc-i
 import type { DocRecord } from './enrich-types.js';
 import { readFile } from 'node:fs/promises';
 import { relatedEqual } from './enrich-helpers.js';
+import { writeManifest, type StageManifest } from '../manifest.js';
 
 function liftFields(sync: any): { title: string; shortSummary: string | null; status: string | null; platform: string[]; strategicGoal: string[] } {
   return {
@@ -19,9 +20,28 @@ function liftFields(sync: any): { title: string; shortSummary: string | null; st
   };
 }
 
+export function buildEnrichManifest(
+  runId: string, startedAt: string, finishedAt: string,
+  r: { enriched: number; skipped: number; failed: number; errors: string[]; relatedPairs: number; written: number },
+): StageManifest {
+  const processed = r.enriched + r.failed;
+  const bad = r.failed > 0 || r.errors.length > 0;   // summarize failures OR load/write errors
+  return {
+    stage: 'enrich', run_id: runId, started_at: startedAt, finished_at: finishedAt,
+    ok: !bad, exit_code: bad ? 1 : 0,
+    counts: { processed, succeeded: r.enriched, failed: r.failed, skipped: r.skipped },
+    errors: r.errors.slice(0, 20), extra: { relatedPairs: r.relatedPairs, written: r.written },
+  };
+}
+
 
 async function main(): Promise<number> {
-  const cfg = loadEnrichConfig(process.env, readEnrichKey);
+  const startedAt = new Date().toISOString();
+  const runId = process.env.RUN_ID ?? startedAt;
+  const reader = process.env.PRD_SECRETS === 'env'
+    ? () => readEnrichKeyFromEnv(process.env)
+    : readEnrichKey;
+  const cfg = loadEnrichConfig(process.env, reader);
   const llm = makeLlmClient(cfg);
   const prdsDir = join(cfg.vaultPath, 'PRDs');
 
@@ -46,7 +66,7 @@ async function main(): Promise<number> {
 
   // Phase 1: summarize docs that are new or whose body changed.
   // Fix 2: write each enriched doc immediately for crash-durability.
-  let enriched = 0, skipped = 0;
+  let enriched = 0, skipped = 0, failed = 0;
 
   for (const doc of docs) {
     const needs = doc.llm.summary === null || doc.llm.body_hash !== doc.bodyHash;
@@ -66,6 +86,7 @@ async function main(): Promise<number> {
       }
     } catch (err) {
       errors.push(`summarize ${doc.stem}: ${(err as Error).message}`);
+      failed++;
     }
   }
 
@@ -100,8 +121,13 @@ async function main(): Promise<number> {
   }
 
   console.log(`enriched ${enriched} · skipped ${skipped} · related-links ${relatedPairs} · errors ${errors.length} · written ${written}`);
-  if (errors.length) { console.error('Errors:\n' + errors.map((e) => '  - ' + e).join('\n')); return 1; }
+  await writeManifest(cfg.vaultPath, runId,
+    buildEnrichManifest(runId, startedAt, new Date().toISOString(),
+      { enriched, skipped, failed, errors, relatedPairs, written }));
+  if (errors.length || failed) { console.error('Errors:\n' + errors.map((e) => '  - ' + e).join('\n')); return 1; }
   return 0;
 }
 
-main().then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(1); });
+if (process.argv[1] && process.argv[1].endsWith('enrich-index.ts')) {
+  main().then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(1); });
+}

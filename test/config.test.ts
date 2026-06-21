@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, readNotionTokenFromEnv } from '../src/config.js';
 
 const fakeEnv = { VAULT_PATH: '/tmp/vault' } as NodeJS.ProcessEnv;
 
@@ -40,4 +40,12 @@ test('loadConfig parses PAGE_CONVERT_TIMEOUT_MS from env', () => {
   const env = { ...fakeEnv, PAGE_CONVERT_TIMEOUT_MS: '120000' } as NodeJS.ProcessEnv;
   const cfg = loadConfig(env, () => 'secret-token');
   expect(cfg.pageConvertTimeoutMs).toBe(120000);
+});
+
+test('readNotionTokenFromEnv returns NOTION_TOKEN from env', () => {
+  expect(readNotionTokenFromEnv({ NOTION_TOKEN: 'secret-123' } as any)).toBe('secret-123');
+});
+
+test('readNotionTokenFromEnv throws when NOTION_TOKEN is missing', () => {
+  expect(() => readNotionTokenFromEnv({} as any)).toThrow(/NOTION_TOKEN/);
 });

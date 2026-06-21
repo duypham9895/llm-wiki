@@ -6,6 +6,7 @@
   "scripts": {
     "sync": "tsx src/index.ts",
     "enrich": "tsx src/enrich/enrich-index.ts",
+    "orchestrate": "tsx src/orchestrate-main.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
