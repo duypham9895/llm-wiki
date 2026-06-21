@@ -75,20 +75,41 @@ Expected: `preflight OK`. If any import fails, STOP — merge Phase 2 and/or Pla
 
 **Why:** the existing `conftest.py` provides only `app`/`client` (+ Phase 2's `db_session`/`make_user`). Tasks 4/6/7/8/9 need permission-scoped clients, a fake core on the app, and chat fixtures. Define them ALL here, up front, so every later test task is runnable independently and in any order.
 
-**Interfaces produced (fixtures):** `fake_core`; `app_with_core`; `client_prd_read`, `client_prd_ask`, `client_status_view`, `client_no_perms` (each an async httpx client over the ASGI app whose `current_user` + permission resolution is overridden to a user holding exactly that permission, or none); `conv_id` (an owned empty conversation); `busy_conv_id` (an owned conversation with `generating=True`); `other_users_conversation_id` (a conversation owned by a DIFFERENT user).
+**GROUNDED in the REAL `conftest.py` (Codex #8 + new[blocker]).** The actual Phase 2 conftest provides: `settings`, `engine`, `sessionmaker_`, `db`, `app`, `client`, `base_env` — and **no `make_user`** (Phase 2 tests build `User(...)` inline and append `Role`/`Permission` objects to `u.roles`, per `tests/web/test_invariants.py`). So this task adds a real `make_user_with_perms` helper + the Phase-3 fixtures, using the real fixture names. **Ordering:** this task is authored here but its fixtures import `coredeps` (Task 3), `chatmodels` (Task 5), and `create_app(core=...)` (Task 8) — so it must LAND after Tasks 3, 5, 8. (It's numbered 0.5 for narrative grouping, but in execution order run it after Task 8. The early tests in Tasks 4/6 that need only `client_prd_read`/`client_prd_ask` can use a minimal inline fixture until 0.5 lands — or simply order 0.5 before 4/6 and accept that 3/5/8's modules must exist first. Recommended concrete order: 1, 2, 3, 5, 8, 0.5, 4, 6, 7, 9.)**
 
-- [ ] **Step 1: Implement the fixtures**
+**Interfaces produced (fixtures):** `make_user_with_perms` (helper), `app_with_core`, `fake_core`, `client_prd_read`, `client_prd_ask`, `client_status_view`, `client_no_perms`, `ask_user`, `conv_id`, `busy_conv_id`, `other_users_conversation_id`.
 
-Add to `mcp/tests/web/conftest.py` (uses Phase 2's existing `make_user`/`db_session`/sessionmaker fixtures and FastAPI dependency overrides):
+- [ ] **Step 1: Implement the fixtures (against the real conftest surface)**
+
+Add to `mcp/tests/web/conftest.py`:
 
 ```python
-import uuid
-import pytest_asyncio
+# --- Phase 3 web fixtures ---
 import httpx
+import pytest_asyncio
 from prd_mcp.web.app import create_app
-from prd_mcp.web.coredeps import Core
-from prd_mcp.web.rbac import require_permission, current_user
-from prd_mcp.web.chatmodels import Conversation
+from prd_mcp.web.coredeps import Core            # Task 3
+from prd_mcp.web.rbac import current_user
+from prd_mcp.web.models import User, Role, Permission
+from prd_mcp.web.chatmodels import Conversation  # Task 5
+
+
+async def make_user_with_perms(db, email: str, perms: set[str], status: str = "active") -> User:
+    """Create an active user holding exactly `perms` via a dedicated role + permission rows,
+    mirroring tests/web/test_invariants.py. effective_permissions(user) will return `perms`."""
+    user = User(email=email, password_hash="x", status=status)
+    if perms:
+        role = Role(name=f"role_{email.split('@')[0]}")
+        for name in sorted(perms):
+            # reuse an existing Permission row if present, else create it
+            existing = (await db.execute(
+                __import__("sqlalchemy").select(Permission).where(Permission.name == name))).scalar_one_or_none()
+            role.permissions.append(existing or Permission(name=name))
+        user.roles.append(role)
+        db.add(role)
+    db.add(user)
+    await db.flush()
+    return user
 
 
 def _fake_core():
@@ -99,7 +120,7 @@ def _fake_core():
     class FakeLlm:
         def embed(self, texts): return [[0.1, 0.2]]
         def chat(self, messages): return "rewritten"
-        async def chat_stream(self, messages):
+        async def chat_stream(self, messages, **kw):
             for t in ["a", "b"]:
                 yield t
     class FakeCfg:
@@ -108,89 +129,97 @@ def _fake_core():
 
 
 @pytest_asyncio.fixture
-async def app_with_core(sessionmaker_fixture):   # reuse Phase 2's sessionmaker fixture name
-    from prd_mcp.web.settings import load_settings
-    app = create_app(load_settings(), sessionmaker_fixture, run_startup=False, core=_fake_core())
-    return app
+def fake_core():
+    return _fake_core()
 
 
-def _client_with_perms(app, user):
-    # Override current_user so require_permission sees a user with the desired perms.
-    async def _fake_current_user():
+@pytest_asyncio.fixture
+async def app_with_core(settings, sessionmaker_, fake_core):
+    # mirrors the existing `app` fixture but with the PRD core mounted
+    db_mod.set_sessionmaker(sessionmaker_)
+    application = create_app(settings, sessionmaker_, run_startup=False, core=fake_core)
+    async with sessionmaker_() as s:
+        await seed_mod.run_seed(s, settings)
+    return application
+
+
+def _perm_client(app, user):
+    async def _cu():
         return user
-    app.dependency_overrides[current_user] = _fake_current_user
+    app.dependency_overrides[current_user] = _cu  # exercises the REAL require_permission guard
     transport = httpx.ASGITransport(app=app)
-    return httpx.AsyncClient(transport=transport, base_url="http://test")
+    return httpx.AsyncClient(transport=transport, base_url="http://test",
+                             headers={"X-Requested-With": "prd-app"})
 
 
 @pytest_asyncio.fixture
-async def client_prd_read(app_with_core, make_user):
-    user = await make_user(email="reader@ringkas.co.id", permissions={"prd.read"})
-    async with _client_with_perms(app_with_core, user) as c:
+async def client_prd_read(app_with_core, db):
+    user = await make_user_with_perms(db, "reader@ringkas.co.id", {"prd.read"}); await db.commit()
+    async with _perm_client(app_with_core, user) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def client_prd_ask(app_with_core, make_user):
-    user = await make_user(email="asker@ringkas.co.id", permissions={"prd.read", "prd.ask"})
-    app_with_core.state._test_user = user
-    async with _client_with_perms(app_with_core, user) as c:
+async def ask_user(db):
+    user = await make_user_with_perms(db, "asker@ringkas.co.id", {"prd.read", "prd.ask"}); await db.commit()
+    return user
+
+
+@pytest_asyncio.fixture
+async def client_prd_ask(app_with_core, ask_user):
+    async with _perm_client(app_with_core, ask_user) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def client_status_view(app_with_core, make_user):
-    user = await make_user(email="ops@ringkas.co.id", permissions={"status.view"})
-    async with _client_with_perms(app_with_core, user) as c:
+async def client_status_view(app_with_core, db):
+    user = await make_user_with_perms(db, "ops@ringkas.co.id", {"status.view"}); await db.commit()
+    async with _perm_client(app_with_core, user) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def client_no_perms(app_with_core, make_user):
-    user = await make_user(email="noperm@ringkas.co.id", permissions=set())
-    async with _client_with_perms(app_with_core, user) as c:
+async def client_no_perms(app_with_core, db):
+    user = await make_user_with_perms(db, "noperm@ringkas.co.id", set()); await db.commit()
+    async with _perm_client(app_with_core, user) as c:
         yield c
 
 
 @pytest_asyncio.fixture
-async def conv_id(db_session, app_with_core):
-    user = app_with_core.state._test_user
-    conv = Conversation(user_id=user.id, title="")
-    db_session.add(conv); await db_session.commit()
+async def conv_id(db, ask_user):
+    conv = Conversation(user_id=ask_user.id, title=""); db.add(conv); await db.commit()
     return str(conv.id)
 
 
 @pytest_asyncio.fixture
-async def busy_conv_id(db_session, app_with_core):
-    user = app_with_core.state._test_user
-    conv = Conversation(user_id=user.id, title="", generating=True)
-    db_session.add(conv); await db_session.commit()
+async def busy_conv_id(db, ask_user):
+    conv = Conversation(user_id=ask_user.id, title="", generating=True); db.add(conv); await db.commit()
     return str(conv.id)
 
 
 @pytest_asyncio.fixture
-async def other_users_conversation_id(db_session, make_user):
-    other = await make_user(email="other@ringkas.co.id", permissions={"prd.ask"})
-    conv = Conversation(user_id=other.id, title="")
-    db_session.add(conv); await db_session.commit()
+async def other_users_conversation_id(db):
+    other = await make_user_with_perms(db, "other@ringkas.co.id", {"prd.ask"}); await db.commit()
+    conv = Conversation(user_id=other.id, title=""); db.add(conv); await db.commit()
     return str(conv.id)
 ```
 
 **Implementer notes:**
-- `make_user(email, permissions={...})` — Phase 2's `make_user` may not take `permissions`; if not, extend it (or assign roles whose perms equal the set) so `effective_permissions(user)` returns the desired set. The permission-scoped clients rely on `require_permission` resolving from the real user, so the user must genuinely hold the perms (don't override `require_permission` itself — override `current_user` and give the user real roles, exercising the real guard).
-- `sessionmaker_fixture`/`db_session`/`make_user` are Phase 2 conftest fixtures — reuse their actual names (check `mcp/tests/web/conftest.py`); rename the references above to match.
-- These fixtures depend on `chatmodels` being importable (Task 5) and `create_app(core=...)` (Task 8). For tasks that run before Task 8 lands, the `core=` param already defaults safely; the chat fixtures need Task 5's models. Land Task 0.5's non-chat fixtures first if running tests strictly in order, or land Tasks 5 + 8 before executing the chat/status test steps.
+- Uses the REAL fixtures `settings`, `sessionmaker_`, `db`, and the module-level `db_mod`/`seed_mod` already imported in conftest. No `make_user`/`db_session`/`sessionmaker_fixture` (those don't exist).
+- `conv_id`/`busy_conv_id` depend on `ask_user` (the same user `client_prd_ask` authenticates as) so ownership lines up — no `app.state` coupling.
+- Overriding `current_user` (not `require_permission`) means the REAL guard runs: a `client_no_perms` user genuinely lacks the perm, so `require_permission` returns 403 for real.
+- `db` and `app_with_core` share `sessionmaker_`, so rows created via `db` are visible to the app's own sessions (same engine/transaction-visibility as the existing Phase 2 `app`+`client`+`db` combo).
 
 - [ ] **Step 2: Smoke the fixtures**
 
-Run: `cd mcp && .venv/bin/pytest tests/web -q -k "fixture or smoke" || true` then a real dependent test once Task 4 exists.
-Expected: no fixture-resolution errors (`fixture 'client_prd_ask' not found` must not appear in any later task).
+Run (after Tasks 3/5/8 land): `cd mcp && .venv/bin/pytest tests/web/test_prd_api.py -q`
+Expected: no `fixture '...' not found` errors; the prd-read tests resolve `client_prd_read`/`client_no_perms`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add mcp/tests/web/conftest.py
-git commit -m "test(web): concrete permission/core/chat fixtures for the Phase 3 web suite"
+git commit -m "test(web): concrete Phase 3 web fixtures (real conftest surface, real-guard perm clients)"
 ```
 
 ---
@@ -381,39 +410,49 @@ import httpx
         timeout = getattr(self.cfg, "request_timeout", 60)
         opener = stream_opener or self._default_stream_opener()
 
+        # PHASE 1 — connect with retry (NO tokens emitted yet). We open the stream and read the
+        # status line; retry ONLY here on 429/5xx or a pre-stream connect error (Codex #10). Once
+        # we begin iterating tokens, we never retry — a mid-stream drop propagates to the route as
+        # llm_error (the route records finish_reason='llm_error'). Each failed attempt closes its client.
         attempt = 0
-        while True:  # retry only the CONNECT/first-response, per spec §3 (mirrors sync _retry)
+        resp = client = ctx = None
+        while True:
+            client, ctx = opener(url, headers, body, timeout)
             try:
-                client, ctx = opener(url, headers, body, timeout)
-                async with ctx as resp:
-                    if resp.status_code >= 400:
-                        status = resp.status_code
-                        if (status == 429 or status >= 500) and attempt < self.max_retries:
-                            await async_sleep(min(2 ** attempt * 0.3, 5)); attempt += 1
-                            await client.aclose(); continue
-                        await client.aclose()
-                        raise Exception(f"http {status}")
-                    async for line in resp.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            delta = json.loads(data)["choices"][0]["delta"].get("content")
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
-                        if delta:
-                            yield delta
+                resp = await ctx.__aenter__()
+            except (httpx.ConnectError, httpx.ConnectTimeout) as err:
                 await client.aclose()
-                return
-            except (httpx.ConnectError, httpx.ReadTimeout) as err:  # pre-stream connection failures
                 if attempt < self.max_retries:
                     await async_sleep(min(2 ** attempt * 0.3, 5)); attempt += 1; continue
                 raise
+            if resp.status_code >= 400:
+                status = resp.status_code
+                await ctx.__aexit__(None, None, None); await client.aclose()
+                if (status == 429 or status >= 500) and attempt < self.max_retries:
+                    await async_sleep(min(2 ** attempt * 0.3, 5)); attempt += 1; continue
+                raise Exception(f"http {status}")
+            break  # connected with a 2xx — proceed to stream (no more retries)
+
+        # PHASE 2 — stream tokens. No retry here; close everything in finally.
+        try:
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0]["delta"].get("content")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if delta:
+                    yield delta
+        finally:
+            await ctx.__aexit__(None, None, None)
+            await client.aclose()
 ```
 
-Add a light unit test (fake `stream_opener` + fake `async_sleep`) asserting: (a) tokens are yielded from a fake stream; (b) a 503-then-200 opener retries once and then streams; (c) `async_sleep` is called on retry. Keep it fast — fakes only, no network.
+Add a light unit test (fake `stream_opener` + fake `async_sleep`) asserting: (a) tokens are yielded from a fake stream; (b) a 503-then-200 opener retries once BEFORE any token and then streams (assert `async_sleep` called once); (c) a fake whose `aiter_lines` raises AFTER yielding one token does NOT retry (the exception propagates, no duplicate tokens) — proving mid-stream errors aren't retried; (d) the client is closed on every path. Fakes only, no network. (The `opener` returns `(client, ctx)` where `ctx` is an async context manager whose `__aenter__` yields a response-like object with `.status_code` and `.aiter_lines()`.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1329,22 +1368,30 @@ async def test_healthz_responds_while_BLOCKING_sync_core_is_in_flight(client_prd
     monkeypatch.setattr(chatmod, "retrieve", blocking_retrieve)
     monkeypatch.setattr(chatmod, "answer_stream", fast_stream)
 
+    import time as _time
     async with anyio.create_task_group() as tg:
         async def start_stream():
             await client_prd_ask.post(f"/api/chat/conversations/{conv_id}/messages",
                                       json={"content": "hi"}, headers={"x-requested-with": "prd-app"})
+        # Measure WALL-CLOCK from before the stream starts (Codex new[major]): if the loop
+        # were blocked, even reaching the healthz call would be delayed, so elapsed would
+        # exceed the blocking duration. We assert healthz completes well under 0.8s total.
+        t0 = _time.monotonic()
         tg.start_soon(start_stream)
-        await anyio.sleep(0.1)  # the blocking rewrite/retrieve are now in flight (~0.8s total)
-        with anyio.fail_after(0.3):  # MUST answer well before the 0.8s of blocking work finishes
-            r = await client_prd_ask.get("/healthz")
-            assert r.status_code in (200, 503)
+        await anyio.sleep(0.05)  # let the stream task start its (offloaded) blocking work
+        r = await client_prd_ask.get("/healthz")
+        elapsed = _time.monotonic() - t0
+        assert r.status_code in (200, 503)
+        # 0.8s = the two 0.4s blocking calls. If healthz only returns AFTER they finish, the
+        # loop was blocked. A generous 0.5s ceiling proves healthz did NOT wait them out.
+        assert elapsed < 0.5, f"/healthz waited {elapsed:.2f}s — event loop was blocked (no offload)"
 
 
 class _FakeR:
     doc_stem = "EP-1"; doc_id = "EP-1"; title = "T"; source_url = ""; summary = "s"; tags = []; status = ""; text = "ctx"; score = 0.5
 ```
 
-**Why this is the real proof (Codex #7):** with `time.sleep` (a *synchronous* block) inside the monkeypatched `rewrite_query`/`retrieve`, the only way `/healthz` answers within 0.3s — while ~0.8s of blocking work runs — is if the route offloaded those calls to a worker thread via `anyio.to_thread.run_sync`. If the route called them directly, the single event-loop thread would be blocked and `fail_after(0.3)` would trip. (Note: the ASGI test client must drive the app on the event loop, not a sync transport — use the async httpx client over ASGI that the conftest provides.)
+**Why this is the real proof (Codex #7 + new[major]):** the blocking fakes hold the calling thread for ~0.8s total. If the route ran them on the event loop, the loop would be frozen — and the `/healthz` request (issued on that same loop) could not COMPLETE until the block cleared, so `elapsed` would be ≥0.8s. Measuring wall-clock from BEFORE `start_stream` (not a `fail_after` that itself starts late) closes the window Codex flagged: a blocked loop delays even reaching/finishing the healthz call, tripping `elapsed < 0.5`. The proof only passes if `rewrite_query`/`retrieve` were offloaded via `anyio.to_thread.run_sync`. (The conftest's async httpx-over-ASGI client drives the app on the event loop, which is what makes this meaningful.)
 
 - [ ] **Step 2: Run test to verify it fails (or reveals blocking)**
 
@@ -1402,4 +1449,9 @@ git commit -m "test(web): /healthz stays responsive during a slow chat stream (s
 - #9 (streaming DB lifecycle) — Task 7 opens a FRESH sessionmaker session for the final persist; `begin_nested`/`nullcontext` placeholder removed.
 - #10 (`chat_stream` retry/injectability) — Task 2 makes it injectable (`stream_opener`/`async_sleep`) with connect-time retry mirroring sync `_retry`, plus a fake-transport unit test.
 
-**Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan.
+**Codex review iteration 2 (7 fixed, 3 partial + 3 new) — all addressed:**
+- #7 / new[major] (concurrency test timing window) — Task 9 now measures wall-clock from before the stream starts and asserts `/healthz` completes in <0.5s (a blocked loop would delay even reaching/finishing the call); no late-starting `fail_after`.
+- #8 / new[blocker] (fixtures not real) — Task 0.5 rewritten against the REAL conftest (`settings`/`sessionmaker_`/`db`/`db_mod`/`seed_mod`); adds a real `make_user_with_perms` helper (no nonexistent `make_user`); `conv_id`/`busy_conv_id` depend on `ask_user`, not `app.state`; explicit land-order note (after Tasks 3/5/8).
+- #10 / new[major] (mid-stream retry + client leak) — Task 2 `chat_stream` split into PHASE 1 (connect, retry-only) and PHASE 2 (stream, no retry); client closed in `finally` on every path; test asserts a post-first-token error does NOT retry.
+
+**Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan. **Within this plan, run order:** 1, 2, 3, 5, 8, 0.5, 4, 6, 7, 9 (fixtures in 0.5 need coredeps/chatmodels/create_app(core=) from 3/5/8).
