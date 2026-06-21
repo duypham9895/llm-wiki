@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 import anyio
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -22,6 +23,32 @@ from prd_mcp.retrieve import retrieve
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat")
+
+
+async def sweep_stale_generating(session, *, older_than_minutes: int = 30, now=None) -> int:
+    """Clear generating=True on conversations whose updated_at is stale.
+
+    A healthy SSE stream bumps updated_at when it persists the user row and again
+    when it releases the lock in the finally block.  30 minutes (default) is far
+    longer than any real stream, so only genuinely-wedged locks — caused by a
+    rare client disconnect in the gap between the lock-claim commit and
+    sse-starlette first iterating the generator — are swept.  The threshold is
+    deliberately conservative to never interrupt a legitimately long in-flight
+    stream.
+
+    Does NOT commit; the caller is responsible for committing (mirrors the
+    contract used by sessions_mod.purge_expired in _purge_once).
+
+    Returns the number of rows updated (0 or more).
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=older_than_minutes)
+    result = await session.execute(
+        update(Conversation)
+        .where(Conversation.generating.is_(True), Conversation.updated_at < cutoff)
+        .values(generating=False)
+    )
+    return result.rowcount
 
 
 async def _owned_or_none(db, user: User, cid: str):
@@ -193,10 +220,13 @@ async def post_message(
             # unconditional and always commits last.
             # ----------------------------------------------------------------
             with anyio.CancelScope(shield=True):
-                # Step 1: best-effort persist assistant row (own transaction)
+                # Step 1: best-effort persist assistant row (own transaction).
+                # a_seq is assigned ONLY after a successful commit — so a failure
+                # anywhere (add/commit) leaves a_seq None and the `done` guard below
+                # correctly suppresses the done event for a row that didn't persist.
                 try:
                     async with db_mod._sessionmaker() as s:
-                        a_seq = (
+                        candidate_seq = (
                             await s.execute(
                                 select(func.coalesce(func.max(Message.seq), 0)).where(
                                     Message.conversation_id == conv_id_val
@@ -206,7 +236,7 @@ async def post_message(
                         s.add(
                             Message(
                                 conversation_id=conv_id_val,
-                                seq=a_seq,
+                                seq=candidate_seq,
                                 role="assistant",
                                 content="".join(acc) or "",
                                 sources=sources,
@@ -215,6 +245,7 @@ async def post_message(
                             )
                         )
                         await s.commit()
+                        a_seq = candidate_seq  # only set after the row is durably committed
                 except Exception:
                     log.exception(
                         "Failed to persist assistant message for conv %s; "

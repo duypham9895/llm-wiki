@@ -162,8 +162,10 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True,
 async def _purge_once(sessionmaker) -> None:
     """Run one purge cycle. Called by _purge_loop and directly in tests."""
     try:
+        from prd_mcp.web.chat import sweep_stale_generating
         async with sessionmaker() as s:
             await sessions_mod.purge_expired(s, now=datetime.now(timezone.utc))
+            await sweep_stale_generating(s, now=datetime.now(timezone.utc))
             await s.commit()
     except Exception:
         pass

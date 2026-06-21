@@ -264,6 +264,9 @@ async def test_assistant_row_finish_reason_on_happy_path(
     assert am.content, "Assistant message content is empty"
     # grounded should be True because verdict was "match" (not "no_match")
     assert am.grounded is True, f"Expected grounded=True, got {am.grounded!r}"
+    # sources persisted from format_sources([_FakeR]) — the cited PRD id round-trips
+    assert isinstance(am.sources, list) and len(am.sources) == 1, f"Expected 1 source, got {am.sources!r}"
+    assert am.sources[0]["id"] == "EP-1", f"Expected source id EP-1, got {am.sources[0]!r}"
 
     # NOTE: A real client-disconnect/CancelledError test (finish='client_disconnected') is
     # not feasible in this in-process harness because httpx ASGI transport always reads
@@ -271,3 +274,67 @@ async def test_assistant_row_finish_reason_on_happy_path(
     # generator from the client side. The disconnect path is covered structurally: the
     # shielded CancelScope in the finally block guarantees the lock-release commit runs
     # to completion even when anyio cancels the generator coroutine on disconnect.
+
+
+# ---------------------------------------------------------------------------
+# sweep_stale_generating — purge-loop self-heal for pre-iteration disconnects
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_sweep_clears_stale_generating_lock(db, ask_user):
+    """A generating=True conversation with updated_at > threshold minutes ago is
+    swept to generating=False.  Returns rowcount == 1."""
+    from datetime import datetime, timedelta, timezone
+    from prd_mcp.web.chat import sweep_stale_generating
+    from prd_mcp.web.chatmodels import Conversation as Conv
+    import sqlalchemy
+
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    conv = Conv(user_id=ask_user.id, title="stale", generating=True)
+    db.add(conv)
+    await db.flush()
+    # Force updated_at to 1 hour ago bypassing the server_default
+    await db.execute(
+        sqlalchemy.update(Conv)
+        .where(Conv.id == conv.id)
+        .values(updated_at=stale_time)
+    )
+    await db.commit()
+
+    now = datetime.now(timezone.utc)
+    swept = await sweep_stale_generating(db, older_than_minutes=30, now=now)
+    await db.commit()
+
+    await db.refresh(conv)
+    assert conv.generating is False, "stale lock was not cleared"
+    assert swept == 1, f"expected rowcount 1, got {swept}"
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
+    """A generating=True conversation with a recent updated_at (now) is NOT swept —
+    proves the sweep cannot interrupt a legitimately in-flight stream."""
+    from datetime import datetime, timezone
+    from prd_mcp.web.chat import sweep_stale_generating
+    from prd_mcp.web.chatmodels import Conversation as Conv
+    import sqlalchemy
+
+    conv = Conv(user_id=ask_user.id, title="inflight", generating=True)
+    db.add(conv)
+    await db.flush()
+    # Force updated_at to right now (recent)
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        sqlalchemy.update(Conv)
+        .where(Conv.id == conv.id)
+        .values(updated_at=now)
+    )
+    await db.commit()
+
+    swept = await sweep_stale_generating(db, older_than_minutes=30, now=now)
+    await db.commit()
+
+    await db.refresh(conv)
+    assert conv.generating is True, "in-flight lock was incorrectly cleared"
+    assert swept == 0, f"expected rowcount 0, got {swept}"
