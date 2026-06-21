@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 import anyio
 from fastapi import APIRouter, Depends, Response
@@ -17,6 +18,8 @@ from prd_mcp.web.models import User
 from prd_mcp.web.chatmodels import Conversation, Message
 from prd_mcp.answer import rewrite_query, answer_stream, format_sources
 from prd_mcp.retrieve import retrieve
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat")
 
@@ -82,12 +85,14 @@ async def post_message(
     db=Depends(get_db),
     core: Core = Depends(get_core),
 ):
+    # 404 — not owned
     conv = await _owned_or_none(db, user, cid)
     if conv is None:
         return JSONResponse(
             status_code=404,
             content={"error": {"code": "not_found", "message": "conversation not found"}},
         )
+    # 422 — empty content
     if not body.content or not body.content.strip():
         return JSONResponse(
             status_code=422,
@@ -110,30 +115,60 @@ async def post_message(
             content={"error": {"code": "conversation_busy", "message": "a response is already generating"}},
         )
 
-    # Load history BEFORE inserting the new row (so rewrite excludes the current turn),
-    # then persist the user message row — all committed before streaming starts.
-    history_rows = (
-        await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conv.id)
-            .order_by(Message.seq)
-        )
-    ).scalars().all()
-    history = [{"role": m.role, "content": m.content} for m in history_rows]
-    user_seq = await _next_seq(db, conv.id)
-    db.add(Message(conversation_id=conv.id, seq=user_seq, role="user", content=body.content))
-    if conv.title == "":
-        conv.title = body.content[:80]
-    await db.commit()
-
-    # Capture conv.id into a local before the generator closes the request session.
+    # Capture everything needed by the generator into locals.
+    # The request-scoped `db` may be closed once streaming starts, so the
+    # generator uses fresh sessions for ALL its DB work.
     conv_id_val = conv.id
+    content_val = body.content
+    title_was_empty = conv.title == ""
 
     async def event_gen():
         acc, sources, grounded, finish = [], [], None, "complete"
+        a_seq: int | None = None
         try:
+            # ----------------------------------------------------------------
+            # BLOCKER #2 fix: history load + user-row insert moved INSIDE the
+            # try so the finally's lock-release covers the entire post-claim
+            # lifetime.  Use fresh sessions (request db may be closing).
+            # ----------------------------------------------------------------
+            async with db_mod._sessionmaker() as s:
+                history_rows = (
+                    await s.execute(
+                        select(Message)
+                        .where(Message.conversation_id == conv_id_val)
+                        .order_by(Message.seq)
+                    )
+                ).scalars().all()
+                history = [{"role": m.role, "content": m.content} for m in history_rows]
+                user_seq = (
+                    await s.execute(
+                        select(func.coalesce(func.max(Message.seq), 0)).where(
+                            Message.conversation_id == conv_id_val
+                        )
+                    )
+                ).scalar_one()
+                user_seq = int(user_seq) + 1
+
+            async with db_mod._sessionmaker() as s:
+                s.add(Message(
+                    conversation_id=conv_id_val,
+                    seq=user_seq,
+                    role="user",
+                    content=content_val,
+                ))
+                if title_was_empty:
+                    await s.execute(
+                        update(Conversation)
+                        .where(Conversation.id == conv_id_val)
+                        .values(title=content_val[:80])
+                    )
+                await s.commit()
+
+            # ----------------------------------------------------------------
+            # LLM pipeline: rewrite → retrieve → stream
+            # ----------------------------------------------------------------
             standalone = await anyio.to_thread.run_sync(
-                rewrite_query, history, body.content, core.llm.chat
+                rewrite_query, history, content_val, core.llm.chat
             )
             yield {"event": "rewrite", "data": standalone}
 
@@ -144,7 +179,7 @@ async def post_message(
             grounded = verdict != "no_match"
             yield {"event": "sources", "data": json.dumps({"sources": sources, "verdict": verdict})}
 
-            async for tok in answer_stream(body.content, results, verdict, core.llm.chat_stream):
+            async for tok in answer_stream(content_val, results, verdict, core.llm.chat_stream):
                 acc.append(tok)
                 yield {"event": "token", "data": tok}
 
@@ -155,33 +190,60 @@ async def post_message(
             finish = "llm_error"
             yield {"event": "error", "data": "generation failed"}
         finally:
-            # Use a FRESH session (not the request-scoped `db`) because the request
-            # session may be closing while the SSE response is still streaming.
-            async with db_mod._sessionmaker() as s:
-                a_seq = (
-                    await s.execute(
-                        select(func.coalesce(func.max(Message.seq), 0)).where(
-                            Message.conversation_id == conv_id_val
+            # ----------------------------------------------------------------
+            # BLOCKER #1 fix: shield the entire cleanup with CancelScope so
+            # a client disconnect cannot interrupt the lock release mid-await.
+            #
+            # MAJOR #3 fix: two separate transactions — assistant-row insert
+            # is best-effort (failure is swallowed/logged), lock release is
+            # unconditional and always commits last.
+            # ----------------------------------------------------------------
+            with anyio.CancelScope(shield=True):
+                # Step 1: best-effort persist assistant row (own transaction)
+                try:
+                    async with db_mod._sessionmaker() as s:
+                        a_seq = (
+                            await s.execute(
+                                select(func.coalesce(func.max(Message.seq), 0)).where(
+                                    Message.conversation_id == conv_id_val
+                                )
+                            )
+                        ).scalar_one() + 1
+                        s.add(
+                            Message(
+                                conversation_id=conv_id_val,
+                                seq=a_seq,
+                                role="assistant",
+                                content="".join(acc) or "",
+                                sources=sources,
+                                grounded=grounded if finish == "complete" else None,
+                                finish_reason=finish,
+                            )
                         )
+                        await s.commit()
+                except Exception:
+                    log.exception(
+                        "Failed to persist assistant message for conv %s; "
+                        "lock will still be released.",
+                        conv_id_val,
                     )
-                ).scalar_one() + 1
-                s.add(
-                    Message(
-                        conversation_id=conv_id_val,
-                        seq=a_seq,
-                        role="assistant",
-                        content="".join(acc) or "",
-                        sources=sources,
-                        grounded=grounded if finish == "complete" else None,
-                        finish_reason=finish,
+
+                # Step 2: unconditional lock release (own transaction)
+                try:
+                    async with db_mod._sessionmaker() as s:
+                        await s.execute(
+                            update(Conversation)
+                            .where(Conversation.id == conv_id_val)
+                            .values(generating=False, updated_at=func.now())
+                        )
+                        await s.commit()
+                except Exception:
+                    log.exception(
+                        "CRITICAL: failed to release generating lock for conv %s",
+                        conv_id_val,
                     )
-                )
-                await s.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conv_id_val)
-                    .values(generating=False, updated_at=func.now())
-                )
-                await s.commit()
+
+            # done event OUTSIDE the shield (it's a yield, not DB work)
             if finish == "complete":
                 yield {"event": "done", "data": str(a_seq)}
 

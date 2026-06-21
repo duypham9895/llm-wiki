@@ -1,4 +1,5 @@
 import pytest
+import sqlalchemy
 
 
 class _FakeR:
@@ -140,3 +141,133 @@ async def test_malformed_cid_get_is_404(client_prd_ask):
 async def test_malformed_cid_delete_is_404(client_prd_ask):
     r = await client_prd_ask.delete("/api/chat/conversations/not-a-uuid", headers={"x-requested-with": "prd-app"})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Lock-release correctness tests (Codex findings #1/#2/#3/#4)
+# ---------------------------------------------------------------------------
+
+def _patch_happy(monkeypatch):
+    """Monkeypatch retrieve/answer_stream/rewrite_query for a happy-path stream."""
+    import prd_mcp.web.chat as chatmod
+    monkeypatch.setattr(chatmod, "retrieve", lambda q, store, embed, k, th: ([_FakeR()], "match"))
+    monkeypatch.setattr(chatmod, "rewrite_query", lambda h, l, fn: l)
+
+    async def _fake_stream(question, retrieved, verdict, fn):
+        for t in ["X", "Y"]:
+            yield t
+
+    monkeypatch.setattr(chatmod, "answer_stream", _fake_stream)
+
+
+@pytest.mark.asyncio
+async def test_lock_released_after_normal_stream(
+    client_prd_ask, conv_id, monkeypatch, sessionmaker_
+):
+    """After a successful stream, generating=False; a second POST on the same
+    conversation succeeds (200), proving the lock was released."""
+    _patch_happy(monkeypatch)
+
+    r1 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "first"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r1.status_code == 200, f"first POST failed: {r1.status_code}"
+    # Verify the response body contains done event
+    assert "event: done" in r1.text
+
+    # Second message on the same conversation must succeed (lock was released)
+    r2 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "second"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r2.status_code == 200, (
+        f"Second POST returned {r2.status_code} — lock was NOT released after first stream. "
+        f"Body: {r2.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_released_after_llm_error(
+    client_prd_ask, conv_id, monkeypatch, sessionmaker_
+):
+    """When the LLM pipeline raises an exception, generating must be set back to
+    False so subsequent messages are not permanently blocked."""
+    import prd_mcp.web.chat as chatmod
+
+    monkeypatch.setattr(chatmod, "rewrite_query", lambda h, l, fn: l)
+    monkeypatch.setattr(chatmod, "retrieve", lambda q, store, embed, k, th: (_ for _ in ()).throw(RuntimeError("retrieval exploded")))
+
+    r1 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "trigger error"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    # The SSE response itself starts (200), but contains an error event
+    assert r1.status_code == 200
+    assert "event: error" in r1.text
+
+    # Now check the DB directly — generating must be False
+    from prd_mcp.web.chatmodels import Conversation as Conv
+    import uuid as _uuid
+    async with sessionmaker_() as s:
+        row = (await s.execute(
+            sqlalchemy.select(Conv).where(Conv.id == _uuid.UUID(conv_id))
+        )).scalar_one()
+        assert row.generating is False, (
+            "generating stuck True after LLM error — lock was NOT released"
+        )
+
+    # A follow-up message must also succeed (not 409)
+    _patch_happy(monkeypatch)
+    r2 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "retry after error"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r2.status_code == 200, (
+        f"Retry after LLM error returned {r2.status_code} — lock stuck. Body: {r2.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assistant_row_finish_reason_on_happy_path(
+    client_prd_ask, conv_id, monkeypatch, sessionmaker_
+):
+    """After a successful stream the persisted assistant Message has
+    finish_reason='complete' and non-empty content."""
+    _patch_happy(monkeypatch)
+
+    r = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "check finish reason"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r.status_code == 200
+    assert "event: done" in r.text
+
+    from prd_mcp.web.chatmodels import Message as Msg
+    import uuid as _uuid
+    async with sessionmaker_() as s:
+        msgs = (await s.execute(
+            sqlalchemy.select(Msg)
+            .where(Msg.conversation_id == _uuid.UUID(conv_id))
+            .order_by(Msg.seq)
+        )).scalars().all()
+
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert len(assistant_msgs) == 1, f"Expected 1 assistant message, got {len(assistant_msgs)}"
+    am = assistant_msgs[0]
+    assert am.finish_reason == "complete", f"Expected finish_reason='complete', got {am.finish_reason!r}"
+    assert am.content, "Assistant message content is empty"
+    # grounded should be True because verdict was "match" (not "no_match")
+    assert am.grounded is True, f"Expected grounded=True, got {am.grounded!r}"
+
+    # NOTE: A real client-disconnect/CancelledError test (finish='client_disconnected') is
+    # not feasible in this in-process harness because httpx ASGI transport always reads
+    # the full response before returning; there is no mechanism to mid-stream cancel the
+    # generator from the client side. The disconnect path is covered structurally: the
+    # shielded CancelScope in the finally block guarantees the lock-release commit runs
+    # to completion even when anyio cancels the generator coroutine on disconnect.
