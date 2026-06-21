@@ -7,6 +7,7 @@ check and returns one generic 401.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -17,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 
 from prd_mcp.web import sessions as sessions_mod
 from prd_mcp.web.db import get_db
-from prd_mcp.web.errors import invalid_credentials, unauthorized
+from prd_mcp.web.errors import invalid_credentials
 from prd_mcp.web.models import AppSettings, User
 from prd_mcp.web.rbac import current_user, effective_permissions
 from prd_mcp.web.schemas import (
@@ -35,6 +36,8 @@ from prd_mcp.web.security import (
     set_session_cookie,
 )
 from prd_mcp.web.settings import WebSettings
+
+logger = logging.getLogger("prd_mcp.web.auth")
 
 router = APIRouter(prefix="/api/auth")
 
@@ -139,6 +142,7 @@ async def login(payload: LoginIn, request: Request, response: Response, db=Depen
     verified = hasher.verify(real_hash, payload.password)
     if not user or not verified or user.status != "active":
         rl.record_email_failure(str(payload.email), now=time.monotonic())
+        logger.warning("failed login for %s from %s", payload.email, request.client.host if request.client else "unknown")
         raise invalid_credentials()
     rl.reset_email(str(payload.email))
     now = datetime.now(timezone.utc)
@@ -176,6 +180,7 @@ async def change_password(
     hasher = _hasher(request)
     _enforce_ip_rate_limit(request)  # brute-force guard on current_password
     if not hasher.verify(user.password_hash, payload.current_password):
+        logger.warning("failed change-password (wrong current) for user %s", user.email)
         raise invalid_credentials()
     validate_password(payload.new_password, settings)
     user.password_hash = hasher.hash(payload.new_password)

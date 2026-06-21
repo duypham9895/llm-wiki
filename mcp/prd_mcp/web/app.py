@@ -150,12 +150,17 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
     return app
 
 
+async def _purge_once(sessionmaker) -> None:
+    """Run one purge cycle. Called by _purge_loop and directly in tests."""
+    try:
+        async with sessionmaker() as s:
+            await sessions_mod.purge_expired(s, now=datetime.now(timezone.utc))
+            await s.commit()
+    except Exception:
+        pass
+
+
 async def _purge_loop(sessionmaker):  # pragma: no cover - timing loop
     while True:
         await asyncio.sleep(3600)
-        try:
-            async with sessionmaker() as s:
-                await sessions_mod.purge_expired(s, now=datetime.now(timezone.utc))
-                await s.commit()
-        except Exception:
-            pass
+        await _purge_once(sessionmaker)
