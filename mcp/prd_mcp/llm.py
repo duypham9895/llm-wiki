@@ -73,17 +73,22 @@ class LlmClient:
             client, ctx = opener(url, headers, body, timeout)
             try:
                 resp = await ctx.__aenter__()
-            except (httpx.ConnectError, httpx.ConnectTimeout) as err:
+            except (httpx.ConnectError, httpx.ConnectTimeout):
                 await client.aclose()
                 if attempt < self.max_retries:
                     await async_sleep(min(2 ** attempt * 0.3, 5))
                     attempt += 1
                     continue
                 raise
+            except BaseException:
+                await client.aclose()  # any other open error: close, do not retry, propagate
+                raise
             if resp.status_code >= 400:
                 status = resp.status_code
-                await ctx.__aexit__(None, None, None)
-                await client.aclose()
+                try:
+                    await ctx.__aexit__(None, None, None)
+                finally:
+                    await client.aclose()
                 if (status == 429 or status >= 500) and attempt < self.max_retries:
                     await async_sleep(min(2 ** attempt * 0.3, 5))
                     attempt += 1
@@ -106,8 +111,10 @@ class LlmClient:
                 if delta:
                     yield delta
         finally:
-            await ctx.__aexit__(None, None, None)
-            await client.aclose()
+            try:
+                await ctx.__aexit__(None, None, None)
+            finally:
+                await client.aclose()
 
 
 def make_client(cfg, http_post=None, sleep_fn=time.sleep):

@@ -244,3 +244,69 @@ async def test_chat_stream_client_closed_on_connect_error_exhausted():
     # max_retries=2 → 3 total attempts (0,1,2), 2 sleeps
     assert len(closed) == 3
     assert len(sleep_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_client_closed_on_aenter_non_connect_error():
+    """Any non-Connect error during __aenter__ closes the client and propagates."""
+    import httpx
+    client = FakeClient()
+
+    class BoomCtx:
+        async def __aenter__(self):
+            raise RuntimeError("init failed")
+        async def __aexit__(self, *args):
+            pass
+
+    def opener(url, headers, body, timeout):
+        return client, BoomCtx()
+
+    c = make_client(Cfg())
+    with pytest.raises(RuntimeError, match="init failed"):
+        async for _ in c.chat_stream([],
+                                     stream_opener=opener,
+                                     async_sleep=lambda s: asyncio.sleep(0)):
+            pass
+
+    # Client must be closed even though the error is not a Connect/Timeout error
+    assert client.closed is True
+
+
+# ── answer_stream new tests (Finding #2 & #3) ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_answer_stream_match_empty_retrieved_yields_fixed_nonanswer():
+    """verdict='match' but retrieved=[] → yields fixed non-answer, does NOT call chat_stream_fn."""
+    called = False
+    async def chat_stream_fn(messages):
+        nonlocal called
+        called = True
+        yield "X"
+    toks = await _collect(answer_stream("q", [], "match", chat_stream_fn))
+    assert "".join(toks) == "No PRD covers this."
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_answer_stream_match_passes_build_messages_output_to_chat_stream():
+    """Matched stream passes build_messages output (system + PRD context) to chat_stream_fn."""
+    captured_messages = {}
+
+    async def chat_stream_fn(messages):
+        captured_messages["messages"] = messages
+        for t in ["He", "llo"]:
+            yield t
+
+    retrieved = [_mk("EP-1"), _mk("SP-2")]
+    toks = await _collect(answer_stream("what is EP-1?", retrieved, "match", chat_stream_fn))
+    assert "".join(toks) == "Hello"
+
+    # chat_stream_fn must have been called with messages from build_messages
+    assert "messages" in captured_messages
+    messages = captured_messages["messages"]
+    assert len(messages) > 0
+    # System prompt should be included
+    assert any("system" in str(msg).lower() for msg in messages)
+    # PRD context should be included (from the retrieved docs)
+    full_text = " ".join(m.get("content", "") for m in messages if isinstance(m, dict))
+    assert "EP-1" in full_text or "SP-2" in full_text or "ctx" in full_text
