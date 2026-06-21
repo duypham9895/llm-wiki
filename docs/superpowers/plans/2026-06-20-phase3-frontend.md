@@ -683,13 +683,24 @@ it('shows friendly copy when deleting the last admin (409 last_admin)', async ()
   expect(screen.queryByText('last_admin')).not.toBeInTheDocument();
 });
 
-it('shows reset-password action and surfaces success', async () => {
+it('resets a password: clicks the action, calls the endpoint, surfaces success (Codex #minor)', async () => {
+  let hit = false;
   server.use(
     http.get('/api/admin/users', () => HttpResponse.json([{ id: 'u2', email: 'm@ringkas.co.id', status: 'active', roles: [{ id: 'r2', name: 'member' }] }])),
-    http.post('/api/admin/users/u2/reset-password', () => HttpResponse.json({ status: 'ok' })),
+    http.post('/api/admin/users/u2/reset-password', async ({ request }) => {
+      hit = true;
+      const body = await request.json();
+      expect(body).toHaveProperty('password');   // the new password is sent
+      return HttpResponse.json({ status: 'ok' });
+    }),
   );
   renderWithProviders(<Directory />, { me: { permissions: ['users.manage'] } });
-  expect(within(await screen.findByTestId('user-u2')).getByRole('button', { name: /reset password/i })).toBeInTheDocument();
+  await userEvent.click(within(await screen.findByTestId('user-u2')).getByRole('button', { name: /reset password/i }));
+  // a dialog collects the new password, then confirms
+  await userEvent.type(screen.getByLabelText(/new password/i), 'a-fresh-password-123');
+  await userEvent.click(screen.getByRole('button', { name: /set password|confirm/i }));
+  expect(await screen.findByText(/password (reset|updated)/i)).toBeInTheDocument();  // success UI
+  expect(hit).toBe(true);   // the endpoint was actually called
 });
 ```
 
@@ -789,3 +800,6 @@ Expected: a static bundle in `dist/`. Confirm `apiFetch` uses RELATIVE `/api/...
 - #2 major (missing admin endpoints) — Global Constraints + Task 8 now include `GET /users/{id}`, `POST /users/{id}/reset-password`, `DELETE /users/{id}`, with Directory actions spelled out.
 - #3 major (only admin_pair tested) — added MSW tests for `last_admin` (Directory delete), `role_in_use` (Roles delete), `system_role_immutable` (Roles edit defense-in-depth), each asserting friendly `ERROR_COPY` and NO raw code; plus a reset-password action test.
 - #4 minor (Ask tests weak) — deferred-promise mock proves Send is disabled WHILE streaming and re-enabled after; a two-turn test proves `streamChat` is re-called per turn (re-retrieve) and each assistant turn retains its own sources.
+
+**Codex review iteration 2 (4 fixed; 1 new minor) — addressed:**
+- new minor (reset-password test was hollow) — the Directory reset-password test now CLICKS the action, fills the new-password dialog, confirms, asserts the `POST /reset-password` handler was actually hit (with a `password` body) and that success UI appears — so it can't pass against an unwired button.
