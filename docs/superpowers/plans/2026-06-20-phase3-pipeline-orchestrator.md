@@ -49,7 +49,7 @@
 - Consumes: nothing (leaf module).
 - Produces:
   - `interface StageCounts { processed: number; succeeded: number; failed: number; skipped: number }`
-  - `interface StageManifest { stage: 'sync'|'enrich'|'index'; run_id: string; started_at: string; finished_at: string; ok: boolean; exit_code: number; counts: StageCounts; errors: string[]; extra?: Record<string, unknown> }`
+  - `interface StageManifest { stage: 'sync'|'enrich'|'index'; run_id: string; started_at: string; finished_at: string; ok: boolean; exit_code: number; counts: StageCounts; errors: string[]; health_gate?: { passed: boolean; reason: string }; extra?: Record<string, unknown> }` (the spec §6 manifest contract includes the gate verdict; stages write the manifest with `health_gate` absent, and the orchestrator records each stage's gate verdict in the summary — Codex #6)
   - `async function writeManifest(vaultPath: string, runId: string, m: StageManifest): Promise<string>` (returns the written path; creates `.runs/<run_id>/` recursively; writes `<stage>.json` pretty-printed)
   - `async function readManifest(vaultPath: string, runId: string, stage: string): Promise<StageManifest | null>` (null if absent/unparseable)
 
@@ -113,8 +113,10 @@ import { join } from 'node:path';
 
 export interface StageCounts { processed: number; succeeded: number; failed: number; skipped: number }
 
+export interface GateVerdict { passed: boolean; reason: string }
+
 export interface StageManifest {
-  stage: 'sync' | 'enrich' | 'index';
+  stage: 'sync' | 'enrich' | 'index' | 'summary';
   run_id: string;
   started_at: string;
   finished_at: string;
@@ -122,6 +124,7 @@ export interface StageManifest {
   exit_code: number;
   counts: StageCounts;
   errors: string[];
+  health_gate?: GateVerdict;       // spec §6 manifest contract; set by the orchestrator
   extra?: Record<string, unknown>;
 }
 
@@ -277,9 +280,28 @@ git commit -m "feat(pipeline): health gates (exit-first; B no-op + div-zero safe
 - Consumes: `writeManifest`, `StageManifest` from `src/manifest.js`.
 - Produces: `function buildSyncManifest(runId, startedAt, finishedAt, counts, errors): StageManifest` exported from `src/index.ts` (pure; testable without running the whole sync).
 
-**Note:** `src/index.ts`'s `main()` does live Notion work, so we do NOT test `main()`. We extract a pure `buildSyncManifest` and unit-test that; wiring it into `main()` is a mechanical change verified by the typecheck + a manual run.
+**Note:** `src/index.ts`'s `main()` does live Notion work, so we do NOT test `main()`. We extract a pure `buildSyncManifest` and unit-test that; wiring it into `main()` is a mechanical change verified by the typecheck + a manual run. **Codex blocker #1:** `src/index.ts` currently calls `main()` unconditionally at module top-level (`src/index.ts:112`), so merely *importing* `buildSyncManifest` in a test would start a live Notion sync. Step 1 below adds an ESM entrypoint guard BEFORE we add the export, so the import is side-effect-free.
 
-- [ ] **Step 1: Write the failing test**
+**Counter semantics (Codex #7) — additive:** sync attempts both page writes AND archive deletions, and may error. Counts must satisfy `processed == succeeded + failed`: `processed = synced + archived + errors.length`, `succeeded = synced + archived`, `failed = errors.length`, `skipped = skipped`.
+
+- [ ] **Step 1: Guard the existing top-level `main()` call (so importing the module is side-effect-free)**
+
+In `src/index.ts`, replace the final line:
+
+```typescript
+main().then((code) => process.exit(code)).catch((err) => { console.error(err); process.exit(1); });
+```
+
+with an entrypoint-guarded version:
+
+```typescript
+// Only run the pipeline when executed directly, NOT when imported by a test.
+if (process.argv[1] && process.argv[1].endsWith('index.ts')) {
+  main().then((code) => process.exit(code)).catch((err) => { console.error(err); process.exit(1); });
+}
+```
+
+- [ ] **Step 2: Write the failing test**
 
 ```typescript
 // test/manifest-sync.test.ts
@@ -287,30 +309,30 @@ import { describe, it, expect } from 'vitest';
 import { buildSyncManifest } from '../src/index.js';
 
 describe('buildSyncManifest', () => {
-  it('maps sync counts to the manifest shape', () => {
+  it('maps a healthy run with additive counts', () => {
     const m = buildSyncManifest('r1', 'a', 'b', { synced: 3, skipped: 280, archived: 1, errors: [] });
     expect(m.stage).toBe('sync');
-    expect(m.counts).toEqual({ processed: 3, succeeded: 3, failed: 0, skipped: 280 });
+    expect(m.counts).toEqual({ processed: 4, succeeded: 4, failed: 0, skipped: 280 });
     expect(m.ok).toBe(true);
     expect(m.exit_code).toBe(0);
     expect(m.extra?.archived).toBe(1);
   });
 
-  it('flags failure when there are errors', () => {
-    const m = buildSyncManifest('r1', 'a', 'b', { synced: 2, skipped: 1, archived: 0, errors: ['boom'] });
-    expect(m.counts.failed).toBe(1);
+  it('flags failure and keeps counts additive when there are errors', () => {
+    const m = buildSyncManifest('r1', 'a', 'b', { synced: 2, skipped: 1, archived: 1, errors: ['boom'] });
+    expect(m.counts).toEqual({ processed: 4, succeeded: 3, failed: 1, skipped: 1 }); // 2 synced + 1 archived + 1 error
     expect(m.ok).toBe(false);
     expect(m.exit_code).toBe(1);
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `npm test -- manifest-sync`
-Expected: FAIL — `buildSyncManifest` is not exported.
+Expected: FAIL — `buildSyncManifest` is not exported. (It must NOT trigger a live sync — the guard from Step 1 ensures that.)
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 4: Write minimal implementation**
 
 Add to `src/index.ts` (above `main`), and add the import at the top:
 
@@ -321,16 +343,18 @@ export function buildSyncManifest(
   runId: string, startedAt: string, finishedAt: string,
   r: { synced: number; skipped: number; archived: number; errors: string[] },
 ): StageManifest {
+  const failed = r.errors.length;
+  const succeeded = r.synced + r.archived;
   return {
     stage: 'sync', run_id: runId, started_at: startedAt, finished_at: finishedAt,
-    ok: r.errors.length === 0, exit_code: r.errors.length ? 1 : 0,
-    counts: { processed: r.synced, succeeded: r.synced, failed: r.errors.length, skipped: r.skipped },
+    ok: failed === 0, exit_code: failed ? 1 : 0,
+    counts: { processed: succeeded + failed, succeeded, failed, skipped: r.skipped },
     errors: r.errors.slice(0, 20), extra: { archived: r.archived },
   };
 }
 ```
 
-Then wire it into `main()` just before the existing `console.log(...)`/returns at `src/index.ts:107`. `main()` must accept/derive a `runId` (read `process.env.RUN_ID` if set by the orchestrator, else generate one):
+Then wire it into `main()` just before the existing `console.log(...)`/returns at `src/index.ts:107`. `main()` must derive a `runId` (read `process.env.RUN_ID` if set by the orchestrator, else generate one):
 
 ```typescript
   // near the top of main(), alongside `const syncedAt = new Date().toISOString();`
@@ -340,16 +364,16 @@ Then wire it into `main()` just before the existing `console.log(...)`/returns a
     { synced, skipped, archived, errors }));
 ```
 
-- [ ] **Step 4: Run test + typecheck**
+- [ ] **Step 5: Run test + typecheck**
 
 Run: `npm test -- manifest-sync && npm run typecheck`
-Expected: tests PASS; typecheck clean.
+Expected: tests PASS (and the test run does NOT perform a live sync); typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/index.ts test/manifest-sync.test.ts
-git commit -m "feat(pipeline): sync (A) emits a run-manifest"
+git commit -m "feat(pipeline): sync (A) emits a run-manifest (entrypoint-guarded, additive counts)"
 ```
 
 ---
@@ -364,9 +388,27 @@ git commit -m "feat(pipeline): sync (A) emits a run-manifest"
 - Consumes: `writeManifest`, `StageManifest` from `src/manifest.js`.
 - Produces: `function buildEnrichManifest(runId, startedAt, finishedAt, counts): StageManifest` exported from `src/enrich/enrich-index.ts`.
 
-**Counting rule:** `processed` = docs that *needed* enrichment this run (`needs === true`); `succeeded` = `enriched`; `failed` = summarize errors among those; `skipped` = `skipped`. This makes the 287/287 case `processed=287, succeeded=0, failed=287`.
+**Counting rule:** `processed` = docs that *needed* enrichment this run = `enriched + failed` (summarize failures); `succeeded` = `enriched`; `failed` = summarize errors among those; `skipped` = `skipped`. This makes the 287/287 case `processed=287, succeeded=0, failed=287`.
 
-- [ ] **Step 1: Write the failing test**
+**Codex #1 + #3:** `enrich-index.ts` also calls `main()` at top-level (`src/enrich/enrich-index.ts:107`) → entrypoint guard first. AND the real loop pushes load/write errors into a separate `errors[]` (at lines 42-43, 64-65, 95-96) and exits 1 when `errors.length` (line 102-103). The manifest's `ok`/`exit_code` must reflect `errors.length || failed`, NOT just `failed` — otherwise a run that loaded 0 docs (all load-errors) would report `ok:true`. So `buildEnrichManifest` takes the `errors` array too.
+
+- [ ] **Step 1: Guard the top-level `main()` call**
+
+In `src/enrich/enrich-index.ts`, replace the final line:
+
+```typescript
+main().then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(1); });
+```
+
+with:
+
+```typescript
+if (process.argv[1] && process.argv[1].endsWith('enrich-index.ts')) {
+  main().then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(1); });
+}
+```
+
+- [ ] **Step 2: Write the failing test**
 
 ```typescript
 // test/enrich/manifest-enrich.test.ts
@@ -375,7 +417,7 @@ import { buildEnrichManifest } from '../../src/enrich/enrich-index.js';
 
 describe('buildEnrichManifest', () => {
   it('maps a healthy incremental run', () => {
-    const m = buildEnrichManifest('r1', 'a', 'b', { enriched: 5, skipped: 282, failed: 0, relatedPairs: 12, written: 5 });
+    const m = buildEnrichManifest('r1', 'a', 'b', { enriched: 5, skipped: 282, failed: 0, errors: [], relatedPairs: 12, written: 5 });
     expect(m.stage).toBe('enrich');
     expect(m.counts).toEqual({ processed: 5, succeeded: 5, failed: 0, skipped: 282 });
     expect(m.ok).toBe(true);
@@ -383,34 +425,42 @@ describe('buildEnrichManifest', () => {
   });
 
   it('maps the 287/287 total-failure (incident)', () => {
-    const m = buildEnrichManifest('r1', 'a', 'b', { enriched: 0, skipped: 0, failed: 287, relatedPairs: 0, written: 0 });
+    const m = buildEnrichManifest('r1', 'a', 'b', { enriched: 0, skipped: 0, failed: 287, errors: [], relatedPairs: 0, written: 0 });
     expect(m.counts).toEqual({ processed: 287, succeeded: 0, failed: 287, skipped: 0 });
     expect(m.ok).toBe(false);
     expect(m.exit_code).toBe(1);
   });
+
+  it('flags failure when load/write errors occurred even if no summarize failed', () => {
+    const m = buildEnrichManifest('r1', 'a', 'b', { enriched: 3, skipped: 1, failed: 0, errors: ['load x: boom'], relatedPairs: 2, written: 3 });
+    expect(m.ok).toBe(false);
+    expect(m.exit_code).toBe(1);
+    expect(m.errors).toContain('load x: boom');
+  });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `npm test -- manifest-enrich`
-Expected: FAIL — `buildEnrichManifest` not exported.
+Expected: FAIL — `buildEnrichManifest` not exported (and the import does NOT run a live enrich, thanks to Step 1).
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 4: Write minimal implementation**
 
-In `src/enrich/enrich-index.ts`: add `import { writeManifest, type StageManifest } from '../manifest.js';` at the top; add a `let failed = 0;` next to `let enriched = 0, skipped = 0;`; increment `failed++` in the Phase-1 `catch (err)` block that pushes the `summarize ...` error (line ~67-69). Add the builder and wire the write:
+In `src/enrich/enrich-index.ts`: add `import { writeManifest, type StageManifest } from '../manifest.js';` at the top; add a `let failed = 0;` next to `let enriched = 0, skipped = 0;`; increment `failed++` in the Phase-1 `catch (err)` block that pushes the `summarize ...` error (lines ~67-69). Add the builder:
 
 ```typescript
 export function buildEnrichManifest(
   runId: string, startedAt: string, finishedAt: string,
-  r: { enriched: number; skipped: number; failed: number; relatedPairs: number; written: number },
+  r: { enriched: number; skipped: number; failed: number; errors: string[]; relatedPairs: number; written: number },
 ): StageManifest {
   const processed = r.enriched + r.failed;
+  const bad = r.failed > 0 || r.errors.length > 0;   // summarize failures OR load/write errors
   return {
     stage: 'enrich', run_id: runId, started_at: startedAt, finished_at: finishedAt,
-    ok: r.failed === 0, exit_code: r.failed ? 1 : 0,
+    ok: !bad, exit_code: bad ? 1 : 0,
     counts: { processed, succeeded: r.enriched, failed: r.failed, skipped: r.skipped },
-    errors: [], extra: { relatedPairs: r.relatedPairs, written: r.written },
+    errors: r.errors.slice(0, 20), extra: { relatedPairs: r.relatedPairs, written: r.written },
   };
 }
 ```
@@ -424,22 +474,21 @@ Wire near the tail (around line 102), capturing timestamps at the top of `main()
   // just before the final console.log/return:
   await writeManifest(cfg.vaultPath, runId,
     buildEnrichManifest(runId, startedAt, new Date().toISOString(),
-      { enriched, skipped, failed, relatedPairs, written }));
-  // keep the existing errors.length -> return 1 behavior (exit_code in the manifest matches it)
+      { enriched, skipped, failed, errors, relatedPairs, written }));
 ```
 
-Note: the existing `errors[]` also collects load/write errors; keep returning 1 when `errors.length` OR `failed`. Update the final guard to: `if (errors.length || failed) { ...; return 1; }`.
+Update the final guard to return 1 when either errors or summarize-failures occurred: `if (errors.length || failed) { console.error(...); return 1; }`.
 
-- [ ] **Step 4: Run test + typecheck**
+- [ ] **Step 5: Run test + typecheck**
 
 Run: `npm test -- manifest-enrich && npm run typecheck`
-Expected: PASS; typecheck clean.
+Expected: PASS (3 tests); typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/enrich/enrich-index.ts test/enrich/manifest-enrich.test.ts
-git commit -m "feat(pipeline): enrich (B) tracks failures and emits a run-manifest"
+git commit -m "feat(pipeline): enrich (B) emits a run-manifest (entrypoint-guarded; ok reflects errors+failures)"
 ```
 
 ---
@@ -488,6 +537,18 @@ def test_write_index_manifest_with_errors():
         assert m["counts"]["failed"] == 2
         assert m["ok"] is False
         assert m["exit_code"] == 1
+
+
+def test_write_index_manifest_empty_index_is_failure():
+    # Codex #4: a clean run (0 errors) that leaves an EMPTY index must NOT be exit 0.
+    with tempfile.TemporaryDirectory() as vault:
+        path = write_index_manifest(
+            vault, "r1", "a", "b",
+            {"indexed": 0, "skipped": 0, "removed": 0, "errors": 0}, index_nonempty=False)
+        m = json.load(open(path))
+        assert m["ok"] is False
+        assert m["exit_code"] == 1
+        assert m["extra"]["index_nonempty"] is False
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -509,13 +570,14 @@ def write_index_manifest(vault_path: str, run_id: str, started_at: str, finished
     os.makedirs(run_dir, exist_ok=True)
     errors = int(res.get("errors", 0))
     indexed = int(res.get("indexed", 0))
+    bad = errors > 0 or not index_nonempty   # Codex #4: an empty index is a failure, not exit 0
     manifest = {
         "stage": "index",
         "run_id": run_id,
         "started_at": started_at,
         "finished_at": finished_at,
-        "ok": errors == 0 and index_nonempty,
-        "exit_code": 1 if errors else 0,
+        "ok": not bad,
+        "exit_code": 1 if bad else 0,
         "counts": {
             "processed": indexed,
             "succeeded": indexed,
@@ -565,6 +627,98 @@ git commit -m "feat(pipeline): index (C) emits a run-manifest matching the share
 
 ---
 
+### Task 5b: Python env-backed secret reader for C (Linux/VPS)
+
+**Files:**
+- Create: `mcp/prd_mcp/env_secret.py`
+- Modify: `mcp/prd_mcp/cli.py:40` (select the reader by `PRD_SECRETS`)
+- Test: `mcp/tests/test_env_secret.py`
+
+**Interfaces:**
+- Consumes: nothing (leaf). Mirrors `read_secret(service, account)` from `mcp/prd_mcp/keychain.py` (verified: it shells out to the macOS `security` CLI, so it fails on Linux).
+- Produces: `def read_secret_from_env(service: str, account: str) -> str` — maps the (service, account) pairs the core actually uses to env vars and returns the value, raising a clear error if missing.
+
+**Codex #2 + spec §8:** `load_config(os.environ, read_secret)` in `cli.py:40` uses the keychain reader. The core requests exactly two secrets (verified in `config.py:32,35`): `read_secret("ringkas-prd-embed", "openai-api-key")` and `read_secret("ringkas-prd-enrich", "llm-api-key")`. The env reader maps those to `OPENAI_API_KEY` and `LLM_API_KEY`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# mcp/tests/test_env_secret.py
+import pytest
+from prd_mcp.env_secret import read_secret_from_env
+
+
+def test_maps_known_service_account_pairs(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "embed-key")
+    monkeypatch.setenv("LLM_API_KEY", "chat-key")
+    assert read_secret_from_env("ringkas-prd-embed", "openai-api-key") == "embed-key"
+    assert read_secret_from_env("ringkas-prd-enrich", "llm-api-key") == "chat-key"
+
+
+def test_missing_env_raises_clearly(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        read_secret_from_env("ringkas-prd-embed", "openai-api-key")
+
+
+def test_unknown_pair_raises(monkeypatch):
+    with pytest.raises(KeyError):
+        read_secret_from_env("unknown-service", "unknown-account")
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cd mcp && .venv/bin/pytest tests/test_env_secret.py -v`
+Expected: FAIL — module `prd_mcp.env_secret` does not exist.
+
+- [ ] **Step 3: Write minimal implementation**
+
+```python
+# mcp/prd_mcp/env_secret.py
+import os
+
+# (service, account) -> env var name. These are the only secrets the core requests
+# (see config.py load_config: ringkas-prd-embed/openai-api-key, ringkas-prd-enrich/llm-api-key).
+_ENV_BY_PAIR = {
+    ("ringkas-prd-embed", "openai-api-key"): "OPENAI_API_KEY",
+    ("ringkas-prd-enrich", "llm-api-key"): "LLM_API_KEY",
+}
+
+
+def read_secret_from_env(service: str, account: str) -> str:
+    """Env-backed replacement for keychain.read_secret on Linux (PRD_SECRETS=env)."""
+    var = _ENV_BY_PAIR[(service, account)]  # KeyError on an unknown pair = programmer error
+    val = os.environ.get(var)
+    if not val:
+        raise ValueError(f"{var} env var is required (PRD_SECRETS=env mode)")
+    return val
+```
+
+Then select it in `cli.py` (replace the single `load_config(os.environ, read_secret)` at line 40):
+
+```python
+    # index/serve require the LLM/embed secrets:
+    if os.environ.get("PRD_SECRETS") == "env":
+        from prd_mcp.env_secret import read_secret_from_env as secret_reader
+    else:
+        secret_reader = read_secret
+    cfg = load_config(os.environ, secret_reader)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cd mcp && .venv/bin/pytest tests/test_env_secret.py -v`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add mcp/prd_mcp/env_secret.py mcp/prd_mcp/cli.py mcp/tests/test_env_secret.py
+git commit -m "feat(pipeline): env-backed secret reader for C (PRD_SECRETS=env) on Linux"
+```
+
+---
+
 ### Task 6: Manifest reader for the Status API (`manifests.py` read side)
 
 **Files:**
@@ -574,7 +728,7 @@ git commit -m "feat(pipeline): index (C) emits a run-manifest matching the share
 **Interfaces:**
 - Consumes: manifest JSON files written by Tasks 3–5.
 - Produces:
-  - `def read_latest_run(vault_path: str) -> dict | None` — newest `.runs/<run_id>/` by name (run_ids are ISO timestamps → lexically sortable); returns `{run_id, stages: {sync?, enrich?, index?}, halted: bool, halt_reason: str|None}` (reads an optional `summary.json` written by the orchestrator for halted/halt_reason; absent → infer halted from a missing downstream stage). Returns None if `.runs/` is absent/empty.
+  - `def read_latest_run(vault_path: str) -> dict | None` — newest `.runs/<run_id>/` by name (run_ids are ISO timestamps → lexically sortable); returns `{run_id, stages: {sync?, enrich?, index?}, halted: bool, halt_reason: str|None, halted_at: str|None}` (reads the orchestrator's `summary.json`; its halt fields live under `extra` because summary uses the shared manifest shape — Codex #5; absent → infer halted from a missing/failed downstream stage). Returns None if `.runs/` is absent/empty.
   - `def read_run_history(vault_path: str, limit: int = 10) -> list[dict]` — newest-first list of `{run_id, ok, stage_count}`.
 
 **Tolerance:** a missing `.runs/`, an empty dir, or a partial run must NOT raise — Status shows "no run data yet".
@@ -620,6 +774,23 @@ def test_history_newest_first_limited():
             _write(vault, f"2026-06-{day}T03:00:00Z", "sync")
         hist = read_run_history(vault, limit=2)
         assert [h["run_id"] for h in hist] == ["2026-06-20T03:00:00Z", "2026-06-19T03:00:00Z"]
+
+
+def test_summary_halt_reason_round_trips_from_extra():
+    # Codex #5: orchestrator writes halt fields under extra; reader must surface them.
+    with tempfile.TemporaryDirectory() as vault:
+        rid = "2026-06-20T03:00:00Z"
+        _write(vault, rid, "sync")
+        _write(vault, rid, "enrich", ok=False)
+        d = os.path.join(vault, ".runs", rid)
+        json.dump({"stage": "summary", "run_id": rid, "ok": False, "exit_code": 1,
+                   "counts": {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}, "errors": [],
+                   "extra": {"halted": True, "halt_reason": "enrich 0/287 (ratio 0.00 < 0.5)", "halted_at": "enrich"}},
+                  open(os.path.join(d, "summary.json"), "w"))
+        latest = read_latest_run(vault)
+        assert latest["halted"] is True
+        assert latest["halt_reason"] == "enrich 0/287 (ratio 0.00 < 0.5)"
+        assert latest["halted_at"] == "enrich"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -660,15 +831,20 @@ def read_latest_run(vault_path: str) -> dict | None:
     run_id = ids[0]
     stages = {s: m for s in STAGES if (m := _read_stage(vault_path, run_id, s)) is not None}
     summary = _read_stage(vault_path, run_id, "summary") or {}
-    halted = summary.get("halted")
-    halt_reason = summary.get("halt_reason")
+    # The orchestrator writes halt fields under `extra` (summary uses the shared manifest shape) — Codex #5.
+    sx = summary.get("extra") or {}
+    halted = sx.get("halted")
+    halt_reason = sx.get("halt_reason")
+    halted_at = sx.get("halted_at")
     if halted is None:
-        # infer: a run is halted if any stage is missing OR any present stage is not ok
+        # No summary yet: infer a halt if any stage is missing OR any present stage is not ok.
         halted = (len(stages) < len(STAGES)) or any(not m.get("ok", False) for m in stages.values())
         if halted and halt_reason is None:
             bad = next((s for s in STAGES if s not in stages or not stages[s].get("ok", False)), None)
             halt_reason = f"stage '{bad}' did not complete successfully" if bad else None
-    return {"run_id": run_id, "stages": stages, "halted": bool(halted), "halt_reason": halt_reason}
+            halted_at = bad
+    return {"run_id": run_id, "stages": stages, "halted": bool(halted),
+            "halt_reason": halt_reason, "halted_at": halted_at}
 
 
 def read_run_history(vault_path: str, limit: int = 10) -> list[dict]:
@@ -805,12 +981,16 @@ git commit -m "feat(pipeline): env-backed secret readers (PRD_SECRETS=env) for L
 - Test: `test/orchestrate.test.ts`
 
 **Interfaces:**
-- Consumes: `readManifest`, `writeManifest`, `StageManifest` (`src/manifest.js`); `syncGate`, `enrichGate`, `indexGate`, `GateResult` (`src/gate.js`).
+- Consumes: `readManifest`, `writeManifest`, `StageManifest`, `GateVerdict` (`src/manifest.js`); `syncGate`, `enrichGate`, `indexGate`, `GateResult` (`src/gate.js`).
 - Produces:
   - `interface StageRunner { (runId: string): Promise<{ exitCode: number }> }`
-  - `async function orchestrate(opts: { vaultPath: string; runId: string; runners: { sync: StageRunner; enrich: StageRunner; index: StageRunner }; indexNonEmpty: () => Promise<boolean>; onSuccessPing?: () => Promise<void> }): Promise<{ halted: boolean; haltedAt?: 'sync'|'enrich'|'index'; reason: string }>`
+  - `async function orchestrate(opts: { vaultPath: string; runId: string; runners: { sync: StageRunner; enrich: StageRunner; index: StageRunner }; onSuccessPing?: () => Promise<void>; maxSyncFailures?: number; minSuccessRatio?: number }): Promise<{ halted: boolean; haltedAt?: 'sync'|'enrich'|'index'; reason: string }>`
 
-**Design:** `orchestrate` is dependency-injected with stage *runners* (so tests pass fakes; production passes runners that `spawn` the real `npm run sync` / `npm run enrich` / `prd-mcp index` subprocesses with `RUN_ID` in env). After each runner it reads that stage's manifest, applies the gate, and HALTS (writing a `summary.json` and returning) on failure. Only on all-pass does it call `onSuccessPing` (the dead-man monitor) — Task 9 wires the real ping.
+**Design:** `orchestrate` is dependency-injected with stage *runners* (so tests pass fakes; production passes runners that `spawn` the real `npm run sync` / `npm run enrich` / `prd-mcp index` subprocesses with `RUN_ID` in env). After each runner it reads that stage's manifest, applies the gate, and HALTS (writing a `summary.json` and returning) on failure. Three correctness rules from Codex review:
+- **(#3) Exit-code reconciliation:** the runner returns `{exitCode}` AND the stage writes `exit_code` in its manifest. If they DISAGREE (e.g. the process crashed before writing, or wrote `ok:true` but exited nonzero), treat the stage as FAILED — never trust one over the other.
+- **(#4) `index_nonempty` comes from the index manifest's `extra.index_nonempty`** (written by Task 5 from the real `store.stored_hashes()`), NOT a caller-supplied boolean. This removes Task 9's hardcoded-`true` bypass.
+- **(#6) Gate verdicts are recorded** per stage in the summary manifest's `extra.gates` so the Status API (Plan A) can show why a run halted.
+Only on all-pass does it call `onSuccessPing` (the dead-man monitor) — Task 9 wires the real ping.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -826,12 +1006,18 @@ import { writeManifest, readManifest, type StageManifest } from '../src/manifest
 function counts(c: Partial<StageManifest['counts']>) {
   return { processed: 0, succeeded: 0, failed: 0, skipped: 0, ...c };
 }
-// a runner that writes a manifest for its stage then reports an exit code
-function runnerWriting(vault: string, stage: StageManifest['stage'], exit: number, c: Partial<StageManifest['counts']>): StageRunner {
+// a runner that writes a manifest for its stage then reports an exit code.
+// `extra` lets the index stage advertise index_nonempty; `manifestExit` lets a test
+// force a disagreement between the written manifest and the returned exitCode.
+function runnerWriting(
+  vault: string, stage: StageManifest['stage'], exit: number, c: Partial<StageManifest['counts']>,
+  extra?: Record<string, unknown>, manifestExit?: number,
+): StageRunner {
   return async (runId: string) => {
+    const ec = manifestExit ?? exit;
     await writeManifest(vault, runId, {
-      stage, run_id: runId, started_at: 'a', finished_at: 'b', ok: exit === 0, exit_code: exit,
-      counts: counts(c), errors: [],
+      stage, run_id: runId, started_at: 'a', finished_at: 'b', ok: ec === 0, exit_code: ec,
+      counts: counts(c), errors: [], extra,
     });
     return { exitCode: exit };
   };
@@ -846,27 +1032,28 @@ describe('orchestrate', () => {
       runners: {
         sync: runnerWriting(vault, 'sync', 0, { processed: 3, succeeded: 3 }),
         enrich: runnerWriting(vault, 'enrich', 0, { processed: 2, succeeded: 2 }),
-        index: runnerWriting(vault, 'index', 0, { processed: 2, succeeded: 2 }),
+        index: runnerWriting(vault, 'index', 0, { processed: 2, succeeded: 2 }, { index_nonempty: true }),
       },
-      indexNonEmpty: async () => true,
       onSuccessPing: ping,
     });
     expect(res.halted).toBe(false);
     expect(ping).toHaveBeenCalledOnce();
+    // gate verdicts recorded in the summary (Codex #6)
+    const summary = await readManifest(vault, 'r1', 'summary' as any);
+    expect((summary!.extra as any).gates.enrich.passed).toBe(true);
   });
 
   it('HALTS at enrich on the 287/287 case and never runs index', async () => {
     const vault = await mkdtemp(join(tmpdir(), 'v-'));
     const ping = vi.fn(async () => {});
-    const indexRunner = vi.fn(runnerWriting(vault, 'index', 0, { processed: 1, succeeded: 1 }));
+    const indexRunner = vi.fn(runnerWriting(vault, 'index', 0, { processed: 1, succeeded: 1 }, { index_nonempty: true }));
     const res = await orchestrate({
       vaultPath: vault, runId: 'r2',
       runners: {
         sync: runnerWriting(vault, 'sync', 0, { processed: 0, skipped: 287 }),
-        enrich: runnerWriting(vault, 'enrich', 0, { processed: 287, succeeded: 0, failed: 287 }),
+        enrich: runnerWriting(vault, 'enrich', 1, { processed: 287, succeeded: 0, failed: 287 }),
         index: indexRunner,
       },
-      indexNonEmpty: async () => true,
       onSuccessPing: ping,
     });
     expect(res.halted).toBe(true);
@@ -875,6 +1062,8 @@ describe('orchestrate', () => {
     expect(ping).not.toHaveBeenCalled();           // no success ping on a halt
     const summary = await readManifest(vault, 'r2', 'summary' as any);
     expect(summary).not.toBeNull();
+    expect((summary!.extra as any).halted).toBe(true);
+    expect((summary!.extra as any).halt_reason).toContain('enrich');
   });
 
   it('HALTS at sync when sync fails and never runs enrich/index', async () => {
@@ -885,9 +1074,39 @@ describe('orchestrate', () => {
       runners: {
         sync: runnerWriting(vault, 'sync', 1, { failed: 1 }),
         enrich: enrichRunner,
-        index: runnerWriting(vault, 'index', 0, {}),
+        index: runnerWriting(vault, 'index', 0, {}, { index_nonempty: true }),
       },
-      indexNonEmpty: async () => true,
+    });
+    expect(res.halted).toBe(true);
+    expect(res.haltedAt).toBe('sync');
+    expect(enrichRunner).not.toHaveBeenCalled();
+  });
+
+  it('HALTS at index when the index is empty (Codex #4 — no bypass)', async () => {
+    const vault = await mkdtemp(join(tmpdir(), 'v-'));
+    const res = await orchestrate({
+      vaultPath: vault, runId: 'r4',
+      runners: {
+        sync: runnerWriting(vault, 'sync', 0, { processed: 1, succeeded: 1 }),
+        enrich: runnerWriting(vault, 'enrich', 0, { processed: 1, succeeded: 1 }),
+        index: runnerWriting(vault, 'index', 0, { processed: 0 }, { index_nonempty: false }),
+      },
+    });
+    expect(res.halted).toBe(true);
+    expect(res.haltedAt).toBe('index');
+  });
+
+  it('HALTS when a runner exit code disagrees with its manifest (Codex #3)', async () => {
+    const vault = await mkdtemp(join(tmpdir(), 'v-'));
+    const enrichRunner = vi.fn(runnerWriting(vault, 'enrich', 0, { processed: 1, succeeded: 1 }));
+    // sync runner exits 1 but (bug-simulating) writes a manifest claiming exit_code 0
+    const res = await orchestrate({
+      vaultPath: vault, runId: 'r5',
+      runners: {
+        sync: runnerWriting(vault, 'sync', 1, { processed: 1, succeeded: 1 }, undefined, 0),
+        enrich: enrichRunner,
+        index: runnerWriting(vault, 'index', 0, {}, { index_nonempty: true }),
+      },
     });
     expect(res.halted).toBe(true);
     expect(res.haltedAt).toBe('sync');
@@ -905,8 +1124,8 @@ Expected: FAIL — cannot resolve `../src/orchestrate.js`.
 
 ```typescript
 // src/orchestrate.ts
-import { readManifest, writeManifest, type StageManifest } from './manifest.js';
-import { syncGate, enrichGate, indexGate, type GateResult } from './gate.js';
+import { readManifest, writeManifest, type StageManifest, type GateVerdict } from './manifest.js';
+import { syncGate, enrichGate, indexGate } from './gate.js';
 
 export interface StageRunner { (runId: string): Promise<{ exitCode: number }> }
 
@@ -914,7 +1133,6 @@ export interface OrchestrateOpts {
   vaultPath: string;
   runId: string;
   runners: { sync: StageRunner; enrich: StageRunner; index: StageRunner };
-  indexNonEmpty: () => Promise<boolean>;
   onSuccessPing?: () => Promise<void>;
   maxSyncFailures?: number;
   minSuccessRatio?: number;
@@ -922,38 +1140,57 @@ export interface OrchestrateOpts {
 
 export interface OrchestrateResult { halted: boolean; haltedAt?: 'sync' | 'enrich' | 'index'; reason: string }
 
-async function writeSummary(vaultPath: string, runId: string, result: OrchestrateResult): Promise<void> {
-  await writeManifest(vaultPath, runId, {
-    stage: 'summary' as StageManifest['stage'], run_id: runId,
-    started_at: '', finished_at: '', ok: !result.halted, exit_code: result.halted ? 1 : 0,
-    counts: { processed: 0, succeeded: 0, failed: 0, skipped: 0 }, errors: [],
-    extra: { halted: result.halted, halt_reason: result.halted ? result.reason : null, halted_at: result.haltedAt ?? null },
-  });
-}
-
 export async function orchestrate(opts: OrchestrateOpts): Promise<OrchestrateResult> {
   const { vaultPath, runId, runners } = opts;
+  const gates: Record<string, GateVerdict> = {};
 
-  async function stage(name: 'sync' | 'enrich' | 'index', gate: (m: StageManifest) => GateResult): Promise<GateResult | null> {
-    await runners[name](runId);
-    const m = await readManifest(vaultPath, runId, name);
-    if (!m) return { passed: false, reason: `${name} wrote no manifest` };
-    return gate(m);
+  async function writeSummary(result: OrchestrateResult): Promise<void> {
+    await writeManifest(vaultPath, runId, {
+      stage: 'summary', run_id: runId, started_at: '', finished_at: '',
+      ok: !result.halted, exit_code: result.halted ? 1 : 0,
+      counts: { processed: 0, succeeded: 0, failed: 0, skipped: 0 }, errors: [],
+      extra: {
+        halted: result.halted,
+        halt_reason: result.halted ? result.reason : null,
+        halted_at: result.haltedAt ?? null,
+        gates,   // Codex #6: per-stage gate verdicts for the Status API
+      },
+    });
   }
 
-  const sync = await stage('sync', (m) => syncGate(m, opts.maxSyncFailures));
-  if (!sync!.passed) { const r = { halted: true, haltedAt: 'sync' as const, reason: sync!.reason }; await writeSummary(vaultPath, runId, r); return r; }
+  // Run one stage: execute the runner, read its manifest, reconcile exit codes (Codex #3),
+  // then apply the gate. Returns the manifest (or null with a synthetic failing gate).
+  async function runStage(
+    name: 'sync' | 'enrich' | 'index',
+    gate: (m: StageManifest) => GateVerdict,
+  ): Promise<{ passed: boolean; reason: string }> {
+    const { exitCode } = await runners[name](runId);
+    const m = await readManifest(vaultPath, runId, name);
+    if (!m) { const g = { passed: false, reason: `${name} wrote no manifest` }; gates[name] = g; return g; }
+    // Codex #3: a disagreement between the runner's exit code and the manifest's recorded
+    // exit_code means something is wrong — fail closed rather than trust either alone.
+    if (exitCode !== m.exit_code) {
+      const g = { passed: false, reason: `${name} exit code ${exitCode} disagrees with manifest exit_code ${m.exit_code}` };
+      gates[name] = g; return g;
+    }
+    const g = gate(m);
+    gates[name] = g;
+    return g;
+  }
 
-  const enrich = await stage('enrich', (m) => enrichGate(m, opts.minSuccessRatio));
-  if (!enrich!.passed) { const r = { halted: true, haltedAt: 'enrich' as const, reason: enrich!.reason }; await writeSummary(vaultPath, runId, r); return r; }
+  const sync = await runStage('sync', (m) => syncGate(m, opts.maxSyncFailures));
+  if (!sync.passed) { const r = { halted: true, haltedAt: 'sync' as const, reason: sync.reason }; await writeSummary(r); return r; }
 
-  await runners.index(runId);
-  const im = await readManifest(vaultPath, runId, 'index');
-  const idx = im ? indexGate(im, await opts.indexNonEmpty()) : { passed: false, reason: 'index wrote no manifest' };
-  if (!idx.passed) { const r = { halted: true, haltedAt: 'index' as const, reason: idx.reason }; await writeSummary(vaultPath, runId, r); return r; }
+  const enrich = await runStage('enrich', (m) => enrichGate(m, opts.minSuccessRatio));
+  if (!enrich.passed) { const r = { halted: true, haltedAt: 'enrich' as const, reason: enrich.reason }; await writeSummary(r); return r; }
+
+  // Codex #4: index_nonempty comes from the index manifest's extra (written from the real
+  // store.stored_hashes() in Task 5), NOT a caller-supplied boolean — no bypass.
+  const idx = await runStage('index', (m) => indexGate(m, Boolean((m.extra ?? {}).index_nonempty)));
+  if (!idx.passed) { const r = { halted: true, haltedAt: 'index' as const, reason: idx.reason }; await writeSummary(r); return r; }
 
   const ok = { halted: false, reason: 'all stages passed' };
-  await writeSummary(vaultPath, runId, ok);
+  await writeSummary(ok);
   if (opts.onSuccessPing) await opts.onSuccessPing();
   return ok;
 }
@@ -1053,9 +1290,8 @@ async function main(): Promise<number> {
   const runId = buildRunId(new Date().toISOString());
   const ping = makeHealthcheckPing(process.env.HEALTHCHECK_URL);
 
-  // indexNonEmpty: ask the index CLI? Simplest: the index manifest's extra.index_nonempty (Task 5)
-  // is authoritative; orchestrate reads the manifest, so here we provide a trivial fallback true and
-  // rely on indexGate using the manifest's own exit. For a stricter check, query the store via a tiny script.
+  // index_nonempty is read by orchestrate() from the index manifest's extra (written by Task 5
+  // from the real store.stored_hashes()), so there is no hardcoded bypass here (Codex #4).
   const result = await orchestrate({
     vaultPath: process.env.VAULT_PATH!, runId,
     runners: {
@@ -1063,7 +1299,6 @@ async function main(): Promise<number> {
       enrich: spawnRunner('npm', ['run', 'enrich'], repoRoot),
       index: spawnRunner(join(mcpDir, '.venv', 'bin', 'prd-mcp'), ['index'], mcpDir),
     },
-    indexNonEmpty: async () => true,
     onSuccessPing: ping,
   });
 
@@ -1117,14 +1352,19 @@ This is operator documentation, not a code task. Captured here so the pipeline m
 **Spec coverage (against §6 + §8 of the design):**
 - Run-manifests per stage → Tasks 1, 3, 4, 5. ✓
 - Chain guard halts before C on a failed B → Task 8 (with the 287/287 regression test). ✓
-- Counter semantics + no div-zero + no-op-night pass → Task 2 (gate) + Tasks 3–5 (counts). ✓
+- Counter semantics + no div-zero + no-op-night pass → Task 2 (gate) + Tasks 3–5 (additive counts). ✓
 - A-gate single policy → Task 2 `syncGate`. ✓
+- Empty-index is a failure (no bypass) → Task 5 (exit_code) + Task 8 (derives index_nonempty from the manifest). ✓
+- Exit-code/manifest reconciliation (fail closed) → Task 8 `runStage`. ✓
+- `health_gate`/gate verdicts in the manifest contract → Task 1 (`GateVerdict`) + Task 8 (`extra.gates`). ✓
 - OnFailure/dead-man alert → Task 9 `makeHealthcheckPing` + the deploy runbook. ✓
-- Move pipeline to VPS / Linux secrets → Task 7 + deploy runbook. ✓
-- Manifest reader for Status API → Task 6 (consumed by Plan A's `status.py`). ✓
+- Move pipeline to VPS / Linux secrets for BOTH runtimes → Task 7 (Node A/B) + Task 5b (Python C) + deploy runbook. ✓
+- Manifest reader for Status API (halt fields under `extra`) → Task 6 (consumed by Plan A's `status.py`). ✓
 
 **Placeholder scan:** no TBD/TODO; every code step shows complete code. ✓
 
-**Type consistency:** `StageManifest`/`StageCounts` defined in Task 1 and reused verbatim in Tasks 2, 3, 4, 8; the Python manifest in Task 5 mirrors the same JSON field names; `read_latest_run`/`read_run_history` (Task 6) are the exact names Plan A's `status.py` will import. ✓
+**Type consistency:** `StageManifest`/`StageCounts`/`GateVerdict` defined in Task 1 and reused verbatim in Tasks 2, 3, 4, 8; the Python manifest in Task 5 mirrors the same JSON field names; `read_latest_run`/`read_run_history` (Task 6) are the exact names Plan A's `status.py` will import; summary halt fields live under `extra` in both the writer (Task 8) and reader (Task 6). ✓
+
+**Codex review iteration 1 (7 findings) — all addressed:** #1 entrypoint guards (Tasks 3, 4) so importing builders is side-effect-free; #2 Python env secret reader (Task 5b); #3 enrich `ok` reflects `errors[]` + exit-code reconciliation (Tasks 4, 8); #4 empty-index failure + manifest-derived `index_nonempty` (Tasks 5, 8, 9); #5 summary halt fields read from `extra` (Task 6); #6 gate verdicts recorded (Tasks 1, 8); #7 additive sync counts (Task 3). ✓
 
 **Cross-plan interface:** Plan A (Status API) imports `read_latest_run`, `read_run_history` from `prd_mcp.web.manifests`. Plan A's `/api/status/pipeline` shape is built from `read_latest_run`'s `{run_id, stages, halted, halt_reason}`.
