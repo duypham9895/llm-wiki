@@ -4,6 +4,12 @@ SYSTEM = (
     "say you don't have a PRD covering that — do not invent. Be concise and direct."
 )
 
+REWRITE_SYSTEM = (
+    "Rewrite the user's latest message into a single standalone search query for a PRD "
+    "knowledge base, using the conversation for context (resolve pronouns/references like "
+    "'that one'). Output ONLY the query text, no quotes, no explanation."
+)
+
 
 def build_messages(question: str, retrieved: list) -> list:
     ctx = "\n\n".join(f"[{r.doc_id} · {r.title}] {r.text}" for r in retrieved)
@@ -27,3 +33,15 @@ def answer(question: str, retrieved: list, verdict: str, chat_fn) -> dict:
         return {"answer": "No PRD covers this.", "sources": [], "grounded": False}
     prose = chat_fn(build_messages(question, retrieved))
     return {"answer": prose, "sources": format_sources(retrieved), "grounded": True}
+
+
+def rewrite_query(history: list, latest: str, chat_fn) -> str:
+    # No prior turns OR a blank message -> nothing to rewrite; skip the LLM entirely.
+    if not history or not latest or not latest.strip():
+        return latest
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+    messages = [
+        {"role": "system", "content": REWRITE_SYSTEM},
+        {"role": "user", "content": f"Conversation so far:\n{convo}\n\nLatest message: {latest}\n\nStandalone query:"},
+    ]
+    return chat_fn(messages).strip()
