@@ -35,6 +35,17 @@ def answer(question: str, retrieved: list, verdict: str, chat_fn) -> dict:
     return {"answer": prose, "sources": format_sources(retrieved), "grounded": True}
 
 
+NON_ANSWER = "No PRD covers this."
+
+
+async def answer_stream(question: str, retrieved: list, verdict: str, chat_stream_fn):
+    if verdict == "no_match" or not retrieved:
+        yield NON_ANSWER
+        return
+    async for tok in chat_stream_fn(build_messages(question, retrieved)):
+        yield tok
+
+
 def rewrite_query(history: list, latest: str, chat_fn) -> str:
     # No prior turns OR a blank message -> nothing to rewrite; skip the LLM entirely.
     if not history or not latest or not latest.strip():
