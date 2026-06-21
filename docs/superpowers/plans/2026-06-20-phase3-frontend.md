@@ -19,7 +19,9 @@
   - `GET /api/chat/conversations` → `[{id,title,updated_at}]`; `POST` → `{id}`; `GET /{id}` → `{id,title,messages:[{seq,role,content,sources,grounded,finish_reason}]}`; `DELETE /{id}` → 204; non-owned → 404.
   - `POST /api/chat/conversations/{id}/messages` `{content}` → **SSE** events `rewrite`/`sources`/`token`/`done`/`error`; `409 {error:{code:'conversation_busy'}}` if busy; `403 {error:{code:'csrf'}}` without the header.
   - `GET /api/status/pipeline` → `{run_id, stages, halted, halt_reason, halted_at}`; `GET /api/status/history?limit=` → `{runs:[...]}`; `GET /api/status/coverage` → `{total, enriched, unenriched}`.
-  - Admin (Phase 2 `admin.py`): `GET /api/admin/users?status=`, `POST /api/admin/users/{id}/approve {role_ids}`, `/disable`, `/enable`, `/reject`, `PUT /api/admin/users/{id}/roles {role_ids}`; `GET/POST/PUT/DELETE /api/admin/roles`; `GET /api/admin/permissions`; `GET/PUT /api/admin/settings {registration_enabled, allowed_domains}`. Error codes to surface: `409 last_admin`, `422 admin_pair`, `409 system_role_immutable`, `409 role_in_use`.
+  - Admin users (Phase 2 `admin.py`): `GET /api/admin/users?status=` (list), `GET /api/admin/users/{id}` (one user with roles), `POST /api/admin/users/{id}/approve {role_ids}`, `/disable`, `/enable`, `/reject`, `POST /api/admin/users/{id}/reset-password {password}` (admin recovery path — Directory action), `PUT /api/admin/users/{id}/roles {role_ids}`, `DELETE /api/admin/users/{id}` (subject to `last_admin`). All mutating → CSRF header.
+  - Admin roles/settings: `GET/POST/PUT/DELETE /api/admin/roles`; `GET /api/admin/permissions`; `GET/PUT /api/admin/settings {registration_enabled, allowed_domains}`.
+  - Error codes to surface inline (friendly copy, never the raw code): `409 last_admin`, `422 admin_pair`, `409 system_role_immutable`, `409 role_in_use`.
 - **Permissions gate the nav** (spec §7): `prd.read`→Library/Search, `prd.ask`→Ask, `status.view`→Status, `users.manage`→Users, `roles.manage`→Roles/Settings. Sections with no permitted items don't render. UI gating is defense-in-depth; the API still enforces.
 - **CSRF:** every mutating fetch sends header `X-Requested-With: prd-app` and `credentials: 'same-origin'`. A shared `apiFetch` wrapper enforces this — no raw `fetch` in components.
 - **SSE via fetch, not EventSource** (spec §7, Codex-confirmed): the chat POST carries a JSON body + CSRF header, which `EventSource` cannot do. A `streamChat()` helper reads the `ReadableStream` and parses SSE frames.
@@ -183,7 +185,7 @@ import { describe, it, expect } from 'vitest';
 import { parseSSEChunk } from './sse';
 
 describe('parseSSEChunk', () => {
-  it('parses complete frames and keeps the partial remainder', () => {
+  it('parses complete frames and keeps the partial remainder (LF)', () => {
     const buf = 'event: rewrite\ndata: standalone q\n\nevent: token\ndata: He\n\nevent: tok';
     const { events, rest } = parseSSEChunk(buf);
     expect(events).toEqual([
@@ -193,13 +195,37 @@ describe('parseSSEChunk', () => {
     expect(rest).toBe('event: tok');
   });
 
+  it('parses CRLF-framed SSE (Codex #1 — sse-starlette/proxies may emit CRLF)', () => {
+    const buf = 'event: token\r\ndata: He\r\n\r\nevent: token\r\ndata: llo\r\n\r\n';
+    const { events, rest } = parseSSEChunk(buf);
+    expect(events).toEqual([{ event: 'token', data: 'He' }, { event: 'token', data: 'llo' }]);
+    expect(rest).toBe('');
+  });
+
+  it('reassembles a frame split across two network chunks', () => {
+    const a = parseSSEChunk('event: token\ndata: par');
+    expect(a.events).toEqual([]);
+    const b = parseSSEChunk(a.rest + 'tial\n\n');   // caller concatenates rest + next chunk
+    expect(b.events).toEqual([{ event: 'token', data: 'partial' }]);
+  });
+
+  it('keeps a colon inside data intact', () => {
+    const { events } = parseSSEChunk('event: token\ndata: a: b: c\n\n');
+    expect(events).toEqual([{ event: 'token', data: 'a: b: c' }]);
+  });
+
+  it('joins true multi-line data', () => {
+    const { events } = parseSSEChunk('event: token\ndata: line1\ndata: line2\n\n');
+    expect(events).toEqual([{ event: 'token', data: 'line1\nline2' }]);
+  });
+
   it('returns no events when no complete frame yet', () => {
     const { events, rest } = parseSSEChunk('event: token\ndata: partial');
     expect(events).toEqual([]);
     expect(rest).toBe('event: token\ndata: partial');
   });
 
-  it('handles multi-line data and ignores comments/heartbeats', () => {
+  it('ignores comments/heartbeats', () => {
     const { events } = parseSSEChunk(': heartbeat\n\nevent: token\ndata: a\n\n');
     expect(events).toEqual([{ event: 'token', data: 'a' }]);
   });
@@ -219,12 +245,13 @@ import { ApiError } from './api';
 
 export function parseSSEChunk(buffer: string): { events: { event: string; data: string }[]; rest: string } {
   const events: { event: string; data: string }[] = [];
-  const parts = buffer.split('\n\n');
+  // SSE frames are separated by a blank line, which may be LF or CRLF (Codex #1).
+  const parts = buffer.split(/\r\n\r\n|\n\n|\r\r/);
   const rest = parts.pop() ?? '';   // last piece is incomplete (no trailing blank line yet)
   for (const block of parts) {
     let event = 'message';
     const dataLines: string[] = [];
-    for (const line of block.split('\n')) {
+    for (const line of block.split(/\r\n|\n|\r/)) {   // lines may end in CRLF, LF, or CR
       if (line.startsWith(':')) continue;             // comment/heartbeat
       if (line.startsWith('event:')) event = line.slice(6).trim();
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
@@ -256,12 +283,8 @@ export async function streamChat(convId: string, content: string, h: ChatHandler
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const { events, rest } = parseSSEChunk(buffer);
-    buffer = rest;
+
+  const dispatch = (events: { event: string; data: string }[]) => {
     for (const ev of events) {
       if (ev.event === 'rewrite') h.onRewrite?.(ev.data);
       else if (ev.event === 'sources') h.onSources?.(JSON.parse(ev.data));
@@ -269,6 +292,15 @@ export async function streamChat(convId: string, content: string, h: ChatHandler
       else if (ev.event === 'done') h.onDone?.(ev.data);
       else if (ev.event === 'error') h.onError?.(ev.data);
     }
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });  // flush on final read (done -> stream:false)
+    const { events, rest } = parseSSEChunk(buffer);
+    buffer = rest;
+    dispatch(events);
+    if (done) break;
   }
 }
 ```
@@ -519,12 +551,46 @@ describe('Ask streaming', () => {
     expect(screen.getByText('EP-457')).toBeInTheDocument();   // sources panel
   });
 
-  it('disables send while generating and surfaces a busy error', async () => {
+  it('disables Send WHILE a stream is in flight (deferred mock), re-enables after', async () => {
+    // Codex #4: a deferred promise keeps the stream "in flight" so we can assert the disabled state.
+    let resolveStream: () => void;
+    vi.spyOn(sse, 'streamChat').mockImplementation((_c, _content, h) => new Promise<void>((res) => {
+      resolveStream = () => { h.onToken('done'); h.onDone?.('1'); res(); };
+    }));
+    renderWithProviders(<Ask />, { me: { permissions: ['prd.read', 'prd.ask'] }, route: '/ask' });
+    await userEvent.type(screen.getByRole('textbox', { name: /message/i }), 'hi');
+    await userEvent.click(screen.getByRole('button', { name: /send/i }));
+    expect(screen.getByRole('button', { name: /send/i })).toBeDisabled();   // in flight
+    resolveStream!();
+    await screen.findByText(/done/);
+    expect(screen.getByRole('button', { name: /send/i })).not.toBeDisabled(); // re-enabled
+  });
+
+  it('surfaces a friendly busy message on 409 conversation_busy', async () => {
     vi.spyOn(sse, 'streamChat').mockRejectedValue(Object.assign(new Error('busy'), { code: 'conversation_busy', status: 409 }));
     renderWithProviders(<Ask />, { me: { permissions: ['prd.read', 'prd.ask'] }, route: '/ask' });
     await userEvent.type(screen.getByRole('textbox', { name: /message/i }), 'hi');
     await userEvent.click(screen.getByRole('button', { name: /send/i }));
-    expect(await screen.findByText(/already (generating|in progress)/i)).toBeInTheDocument();
+    expect(await screen.findByText(/already being generated/i)).toBeInTheDocument();  // ERROR_COPY.conversation_busy
+  });
+
+  it('re-calls streamChat on each turn (re-retrieve per turn) and keeps per-turn sources', async () => {
+    // Codex #4: prove multi-turn sends invoke streamChat again AND each assistant turn keeps its own sources.
+    const calls: string[] = [];
+    vi.spyOn(sse, 'streamChat').mockImplementation(async (_c, content, h) => {
+      calls.push(content);
+      h.onSources?.({ sources: [{ id: `EP-${calls.length}`, title: `T${calls.length}`, source_url: '', obsidian_link: '' }], verdict: 'match' });
+      h.onToken(`answer ${calls.length}`); h.onDone?.(String(calls.length));
+    });
+    renderWithProviders(<Ask />, { me: { permissions: ['prd.read', 'prd.ask'] }, route: '/ask' });
+    const box = screen.getByRole('textbox', { name: /message/i });
+    await userEvent.type(box, 'first'); await userEvent.click(screen.getByRole('button', { name: /send/i }));
+    await screen.findByText('answer 1');
+    await userEvent.type(box, 'second'); await userEvent.click(screen.getByRole('button', { name: /send/i }));
+    await screen.findByText('answer 2');
+    expect(calls).toEqual(['first', 'second']);          // re-retrieve per turn
+    expect(screen.getByText('EP-1')).toBeInTheDocument(); // turn-1 sources retained
+    expect(screen.getByText('EP-2')).toBeInTheDocument(); // turn-2 sources
   });
 });
 ```
@@ -562,7 +628,7 @@ it('shows a halt banner with the reason when the chain was halted', async () => 
 
 **Files:** Create `pages/admin/{Approvals,Directory,Roles,Settings}.tsx`; Test `pages/admin/Approvals.test.tsx`, `Roles.test.tsx`.
 
-**Interfaces:** Consumes the Phase 2 admin endpoints. The load-bearing behavior to test is **inline handling of the invariant error codes** (`422 admin_pair`, `409 last_admin`, `409 system_role_immutable`, `409 role_in_use`) — surfaced as clear messages, not raw codes.
+**Interfaces:** Consumes the Phase 2 admin endpoints. **Approvals** = pending queue (action cards: email, requested-at, role checkboxes, Approve/Reject). **Directory** = active/disabled table with disable/enable, **reset-password** (`POST /users/{id}/reset-password {password}`), change roles (`PUT /users/{id}/roles`), and **delete** (`DELETE /users/{id}`). **Roles** = list/create/edit/delete custom roles; system roles locked. **Settings** = registration toggle + allowlist. The load-bearing behavior to test is **inline handling of ALL FOUR invariant error codes** (`422 admin_pair`, `409 last_admin`, `409 system_role_immutable`, `409 role_in_use`) — surfaced as the friendly `ERROR_COPY` message, never the raw code.
 
 - [ ] **Step 1: failing test (Approvals inline error + Roles locked system role)**
 
@@ -591,7 +657,43 @@ it('renders system roles as locked (no edit/delete)', async () => {
   expect(within(screen.getByTestId('role-admin')).queryByRole('button', { name: /delete/i })).not.toBeInTheDocument();
   expect(within(screen.getByTestId('role-reviewer')).getByRole('button', { name: /delete/i })).toBeInTheDocument();
 });
+
+it('shows friendly copy (not the raw code) when deleting an in-use role (409 role_in_use)', async () => {
+  server.use(
+    http.get('/api/admin/roles', () => HttpResponse.json([{ id: 'r2', name: 'reviewer', is_system: false, permissions: ['prd.read'] }])),
+    http.delete('/api/admin/roles/r2', () => HttpResponse.json({ error: { code: 'role_in_use', message: 'x' } }, { status: 409 })),
+  );
+  renderWithProviders(<Roles />, { me: { permissions: ['roles.manage'] } });
+  await userEvent.click(within(await screen.findByTestId('role-reviewer')).getByRole('button', { name: /delete/i }));
+  expect(await screen.findByText(/still assigned to users/i)).toBeInTheDocument();   // ERROR_COPY.role_in_use
+  expect(screen.queryByText('role_in_use')).not.toBeInTheDocument();                  // never the raw code
+});
 ```
+
+```tsx
+// pages/admin/Directory.test.tsx
+it('shows friendly copy when deleting the last admin (409 last_admin)', async () => {
+  server.use(
+    http.get('/api/admin/users', () => HttpResponse.json([{ id: 'a1', email: 'admin@ringkas.co.id', status: 'active', roles: [{ id: 'r1', name: 'admin' }] }])),
+    http.delete('/api/admin/users/a1', () => HttpResponse.json({ error: { code: 'last_admin', message: 'x' } }, { status: 409 })),
+  );
+  renderWithProviders(<Directory />, { me: { permissions: ['users.manage', 'roles.manage'] } });
+  await userEvent.click(within(await screen.findByTestId('user-a1')).getByRole('button', { name: /delete/i }));
+  expect(await screen.findByText(/no active admin/i)).toBeInTheDocument();   // ERROR_COPY.last_admin
+  expect(screen.queryByText('last_admin')).not.toBeInTheDocument();
+});
+
+it('shows reset-password action and surfaces success', async () => {
+  server.use(
+    http.get('/api/admin/users', () => HttpResponse.json([{ id: 'u2', email: 'm@ringkas.co.id', status: 'active', roles: [{ id: 'r2', name: 'member' }] }])),
+    http.post('/api/admin/users/u2/reset-password', () => HttpResponse.json({ status: 'ok' })),
+  );
+  renderWithProviders(<Directory />, { me: { permissions: ['users.manage'] } });
+  expect(within(await screen.findByTestId('user-u2')).getByRole('button', { name: /reset password/i })).toBeInTheDocument();
+});
+```
+
+(A `system_role_immutable` case is also added to `Roles.test.tsx`: attempting an edit on a system role that reaches the API returns `409 system_role_immutable` → assert `ERROR_COPY.system_role_immutable` copy. Since system-role edit controls are hidden in the happy path, this guards the defense-in-depth path where the API still rejects.)
 
 - [ ] **Step 2–4: run → fail → implement the four admin pages (Approvals queue as action cards; Directory table; Roles with locked system roles + a friendly map for the invariant codes; Settings toggle + allowlist editor) → run → pass.** Step 5: commit `feat(web-ui): admin Approvals/Directory/Roles/Settings with invariant-aware messaging`.
 
@@ -681,3 +783,9 @@ Expected: a static bundle in `dist/`. Confirm `apiFetch` uses RELATIVE `/api/...
 **TDD teeth:** tests target behavior with real failure modes (no_match rendering, streaming accumulation, busy/CSRF errors, permission-gated nav, locked system roles, anti-enumeration), not static-markup snapshots. ✓
 
 **Cross-plan:** consumes Plan A (API shapes) + Phase 2 (auth/admin endpoints, /me). MSW mocks the backend so the UI is buildable/testable before Plan A deploys; the shapes must stay in sync (a drift would surface as a failing MSW-backed test once integrated).
+
+**Codex review iteration 1 (4 findings) — all addressed:**
+- #1 blocker (CRLF SSE) — `parseSSEChunk` now splits frames on `\r\n\r\n|\n\n|\r\r` and lines on `\r\n|\n|\r`; `streamChat` flushes the decoder on the final read and breaks after dispatching the last buffer; added tests for CRLF, chunk-split frames, colon-in-data, multi-line data.
+- #2 major (missing admin endpoints) — Global Constraints + Task 8 now include `GET /users/{id}`, `POST /users/{id}/reset-password`, `DELETE /users/{id}`, with Directory actions spelled out.
+- #3 major (only admin_pair tested) — added MSW tests for `last_admin` (Directory delete), `role_in_use` (Roles delete), `system_role_immutable` (Roles edit defense-in-depth), each asserting friendly `ERROR_COPY` and NO raw code; plus a reset-password action test.
+- #4 minor (Ask tests weak) — deferred-promise mock proves Send is disabled WHILE streaming and re-enabled after; a two-turn test proves `streamChat` is re-called per turn (re-retrieve) and each assistant turn retains its own sources.
