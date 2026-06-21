@@ -10,8 +10,9 @@
 
 ## Global Constraints
 
-- **Depends on Phase 2 landing** (tasks 5–11 of the auth build) — this plan executes after. It consumes, verbatim: `require_permission(name)` and `current_user` (`prd_mcp/web/rbac.py`), `get_db` (`prd_mcp/web/db.py`), `create_app(settings, sessionmaker, *, run_startup=True)` and the `{error:{code,message}}` envelope + `CSRFMiddleware` (`prd_mcp/web/app.py`), `WebSettings` (`prd_mcp/web/settings.py`), the `Base` declarative class (`prd_mcp/web/db.py`), `User` model (`prd_mcp/web/models.py`).
-- **Depends on Plan B** for the Status API: imports `read_latest_run(vault_path)` and `read_run_history(vault_path, limit)` from `prd_mcp.web.manifests` (locked interface, Codex-SHIP).
+- **HARD DEPENDENCY — Phase 2 must be merged** (tasks 5–11 of the auth build) before ANY task here. This plan consumes, verbatim: `require_permission(name)` and `current_user` (`prd_mcp/web/rbac.py`), `get_db` (`prd_mcp/web/db.py`), `create_app(settings, sessionmaker, *, run_startup=True)` and the `{error:{code,message}}` envelope + `CSRFMiddleware` (`prd_mcp/web/app.py`), `WebSettings` + `load_settings` (`prd_mcp/web/settings.py`), the `Base` declarative class (`prd_mcp/web/db.py`), `User` model (`prd_mcp/web/models.py`).
+- **HARD DEPENDENCY — Plan B (pipeline orchestrator) must be merged** before Task 8 (Status) and Task 8's `web` CLI wiring. Plan B creates BOTH modules this plan imports: `prd_mcp/web/manifests.py` (`read_latest_run`, `read_run_history` — Codex-SHIP locked interface) AND `prd_mcp/env_secret.py` (`read_secret_from_env`, used by the `web` CLI under `PRD_SECRETS=env`). **Task 0 (preflight) below asserts both exist before this plan runs** — do not re-create them here (Codex #1, #2).
+- **Execution order:** Phase 2 merged → Plan B merged → this plan. The preflight (Task 0) fails fast if either dependency is missing.
 - **Permissions (exact, from `rbac.py` PERMISSIONS):** `prd.read` (Library+Search), `prd.ask` (Ask), `status.view` (Status). Every router endpoint declares its `require_permission`.
 - **CSRF:** every state-changing request (incl. the chat POST) must carry `X-Requested-With: prd-app` (Phase 2's `CSRFMiddleware` enforces 403 otherwise). The SSE endpoint is POST → subject to CSRF.
 - **Single uvicorn worker** (Phase 2's rate limiter requires it). Therefore: `chat_stream` is **async**; every **sync** core call the chat route makes (`rewrite_query`→sync `chat`, `embed`, `retrieve`) is offloaded via `anyio.to_thread.run_sync`. No DB transaction is held open across a stream.
@@ -39,6 +40,158 @@
 - `mcp/pyproject.toml` — MODIFY. Add `sse-starlette`.
 
 **Tests:** `mcp/tests/test_answer_stream.py`, `mcp/tests/web/test_prd_api.py`, `mcp/tests/web/test_chat_api.py`, `mcp/tests/web/test_status_api.py` (+ a fake-core fixture in `mcp/tests/web/conftest.py`).
+
+---
+
+### Task 0: Preflight — assert cross-plan dependencies exist
+
+**Files:** none created — a gate before implementation.
+
+**Why (Codex #1, #2):** this plan imports `prd_mcp.web.manifests` (Status) and `prd_mcp.env_secret` (web CLI), both authored by Plan B, and the whole Phase 2 web package. If Plan B or Phase 2 isn't merged into this checkout, several tasks import-fail at runtime. Verify before starting.
+
+- [ ] **Step 1: Verify Phase 2 + Plan B modules are present**
+
+Run:
+```bash
+cd mcp && .venv/bin/python -c "
+import prd_mcp.web.app, prd_mcp.web.rbac, prd_mcp.web.db, prd_mcp.web.models, prd_mcp.web.settings
+import prd_mcp.web.manifests   # Plan B
+import prd_mcp.env_secret      # Plan B
+from prd_mcp.web.manifests import read_latest_run, read_run_history
+from prd_mcp.env_secret import read_secret_from_env
+from prd_mcp.web.rbac import require_permission, current_user, PERMISSIONS
+assert {'prd.read','prd.ask','status.view'} <= set(PERMISSIONS)
+print('preflight OK')
+"
+```
+Expected: `preflight OK`. If any import fails, STOP — merge Phase 2 and/or Plan B first; do not proceed.
+
+---
+
+### Task 0.5: Web test fixtures (concrete, before any dependent test) — Codex #8
+
+**Files:**
+- Modify: `mcp/tests/web/conftest.py` (add ALL Phase-3 web fixtures used by Tasks 4/6/7/8/9)
+
+**Why:** the existing `conftest.py` provides only `app`/`client` (+ Phase 2's `db_session`/`make_user`). Tasks 4/6/7/8/9 need permission-scoped clients, a fake core on the app, and chat fixtures. Define them ALL here, up front, so every later test task is runnable independently and in any order.
+
+**Interfaces produced (fixtures):** `fake_core`; `app_with_core`; `client_prd_read`, `client_prd_ask`, `client_status_view`, `client_no_perms` (each an async httpx client over the ASGI app whose `current_user` + permission resolution is overridden to a user holding exactly that permission, or none); `conv_id` (an owned empty conversation); `busy_conv_id` (an owned conversation with `generating=True`); `other_users_conversation_id` (a conversation owned by a DIFFERENT user).
+
+- [ ] **Step 1: Implement the fixtures**
+
+Add to `mcp/tests/web/conftest.py` (uses Phase 2's existing `make_user`/`db_session`/sessionmaker fixtures and FastAPI dependency overrides):
+
+```python
+import uuid
+import pytest_asyncio
+import httpx
+from prd_mcp.web.app import create_app
+from prd_mcp.web.coredeps import Core
+from prd_mcp.web.rbac import require_permission, current_user
+from prd_mcp.web.chatmodels import Conversation
+
+
+def _fake_core():
+    class FakeStore:
+        def stored_hashes(self): return {"EP-1": "h", "EP-2": ""}
+        def list_cards(self, status=None, tag=None, cursor=None, limit=50):
+            return {"results": [{"id": "EP-1", "title": "T", "status": "active", "tags": [], "summary": "s", "source_url": ""}], "next_cursor": None}
+    class FakeLlm:
+        def embed(self, texts): return [[0.1, 0.2]]
+        def chat(self, messages): return "rewritten"
+        async def chat_stream(self, messages):
+            for t in ["a", "b"]:
+                yield t
+    class FakeCfg:
+        prds_dir = "/tmp/prds"; score_threshold = -0.15; top_k = 8; vault_path = "/tmp/vault"; chroma_path = "/tmp/chroma"
+    return Core(cfg=FakeCfg(), store=FakeStore(), llm=FakeLlm())
+
+
+@pytest_asyncio.fixture
+async def app_with_core(sessionmaker_fixture):   # reuse Phase 2's sessionmaker fixture name
+    from prd_mcp.web.settings import load_settings
+    app = create_app(load_settings(), sessionmaker_fixture, run_startup=False, core=_fake_core())
+    return app
+
+
+def _client_with_perms(app, user):
+    # Override current_user so require_permission sees a user with the desired perms.
+    async def _fake_current_user():
+        return user
+    app.dependency_overrides[current_user] = _fake_current_user
+    transport = httpx.ASGITransport(app=app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+@pytest_asyncio.fixture
+async def client_prd_read(app_with_core, make_user):
+    user = await make_user(email="reader@ringkas.co.id", permissions={"prd.read"})
+    async with _client_with_perms(app_with_core, user) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def client_prd_ask(app_with_core, make_user):
+    user = await make_user(email="asker@ringkas.co.id", permissions={"prd.read", "prd.ask"})
+    app_with_core.state._test_user = user
+    async with _client_with_perms(app_with_core, user) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def client_status_view(app_with_core, make_user):
+    user = await make_user(email="ops@ringkas.co.id", permissions={"status.view"})
+    async with _client_with_perms(app_with_core, user) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def client_no_perms(app_with_core, make_user):
+    user = await make_user(email="noperm@ringkas.co.id", permissions=set())
+    async with _client_with_perms(app_with_core, user) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def conv_id(db_session, app_with_core):
+    user = app_with_core.state._test_user
+    conv = Conversation(user_id=user.id, title="")
+    db_session.add(conv); await db_session.commit()
+    return str(conv.id)
+
+
+@pytest_asyncio.fixture
+async def busy_conv_id(db_session, app_with_core):
+    user = app_with_core.state._test_user
+    conv = Conversation(user_id=user.id, title="", generating=True)
+    db_session.add(conv); await db_session.commit()
+    return str(conv.id)
+
+
+@pytest_asyncio.fixture
+async def other_users_conversation_id(db_session, make_user):
+    other = await make_user(email="other@ringkas.co.id", permissions={"prd.ask"})
+    conv = Conversation(user_id=other.id, title="")
+    db_session.add(conv); await db_session.commit()
+    return str(conv.id)
+```
+
+**Implementer notes:**
+- `make_user(email, permissions={...})` — Phase 2's `make_user` may not take `permissions`; if not, extend it (or assign roles whose perms equal the set) so `effective_permissions(user)` returns the desired set. The permission-scoped clients rely on `require_permission` resolving from the real user, so the user must genuinely hold the perms (don't override `require_permission` itself — override `current_user` and give the user real roles, exercising the real guard).
+- `sessionmaker_fixture`/`db_session`/`make_user` are Phase 2 conftest fixtures — reuse their actual names (check `mcp/tests/web/conftest.py`); rename the references above to match.
+- These fixtures depend on `chatmodels` being importable (Task 5) and `create_app(core=...)` (Task 8). For tasks that run before Task 8 lands, the `core=` param already defaults safely; the chat fixtures need Task 5's models. Land Task 0.5's non-chat fixtures first if running tests strictly in order, or land Tasks 5 + 8 before executing the chat/status test steps.
+
+- [ ] **Step 2: Smoke the fixtures**
+
+Run: `cd mcp && .venv/bin/pytest tests/web -q -k "fixture or smoke" || true` then a real dependent test once Task 4 exists.
+Expected: no fixture-resolution errors (`fixture 'client_prd_ask' not found` must not appear in any later task).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add mcp/tests/web/conftest.py
+git commit -m "test(web): concrete permission/core/chat fixtures for the Phase 3 web suite"
+```
 
 ---
 
@@ -205,37 +358,62 @@ async def answer_stream(question: str, retrieved: list, verdict: str, chat_strea
         yield tok
 ```
 
-Add to `mcp/prd_mcp/llm.py` (`LlmClient`), using an injectable async streamer so it's testable; the default uses `httpx.AsyncClient`:
+Add to `mcp/prd_mcp/llm.py` (`LlmClient`). Make the async streamer **injectable** (`stream_opener`) so tests pass a fake transport, and add **connect-time retry** mirroring the sync `_retry` (retry the initial connection/non-2xx on 429/5xx with async backoff; do NOT retry mid-stream — once tokens flow, a drop ends the turn, which the route records as `llm_error`). This satisfies spec §3's retry promise + testability (Codex #10):
 
 ```python
 # at top of llm.py
+import asyncio
 import json
 import httpx
 
-# inside class LlmClient:
-    async def chat_stream(self, messages):
+# inside class LlmClient — store an optional async sleeper + stream opener (defaults are real):
+    def _default_stream_opener(self):
+        # returns an async context manager factory for the streaming POST
+        def opener(url, headers, body, timeout):
+            client = httpx.AsyncClient(timeout=timeout)
+            return client, client.stream("POST", url, headers=headers, json=body)
+        return opener
+
+    async def chat_stream(self, messages, stream_opener=None, async_sleep=asyncio.sleep):
         url = f"{self.cfg.minimax_base}/chat/completions"
-        headers = {"content-type": "application/json",
-                   "authorization": f"Bearer {self.cfg.minimax_key}"}
-        body = {"model": self.cfg.chat_model, "messages": messages,
-                "temperature": 0.2, "stream": True}
+        headers = {"content-type": "application/json", "authorization": f"Bearer {self.cfg.minimax_key}"}
+        body = {"model": self.cfg.chat_model, "messages": messages, "temperature": 0.2, "stream": True}
         timeout = getattr(self.cfg, "request_timeout", 60)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        delta = json.loads(data)["choices"][0]["delta"].get("content")
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-                    if delta:
-                        yield delta
+        opener = stream_opener or self._default_stream_opener()
+
+        attempt = 0
+        while True:  # retry only the CONNECT/first-response, per spec §3 (mirrors sync _retry)
+            try:
+                client, ctx = opener(url, headers, body, timeout)
+                async with ctx as resp:
+                    if resp.status_code >= 400:
+                        status = resp.status_code
+                        if (status == 429 or status >= 500) and attempt < self.max_retries:
+                            await async_sleep(min(2 ** attempt * 0.3, 5)); attempt += 1
+                            await client.aclose(); continue
+                        await client.aclose()
+                        raise Exception(f"http {status}")
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            delta = json.loads(data)["choices"][0]["delta"].get("content")
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if delta:
+                            yield delta
+                await client.aclose()
+                return
+            except (httpx.ConnectError, httpx.ReadTimeout) as err:  # pre-stream connection failures
+                if attempt < self.max_retries:
+                    await async_sleep(min(2 ** attempt * 0.3, 5)); attempt += 1; continue
+                raise
 ```
+
+Add a light unit test (fake `stream_opener` + fake `async_sleep`) asserting: (a) tokens are yielded from a fake stream; (b) a 503-then-200 opener retries once and then streams; (c) `async_sleep` is called on retry. Keep it fast — fakes only, no network.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -349,7 +527,76 @@ git commit -m "feat(web): Core container + app.state accessor for the HTTP door"
 - Consumes: `get_core` (Task 3); `require_permission("prd.read")` (Phase 2); `search_prds_impl`, `keyword_search_impl`, `read_prd_impl` from `prd_mcp.server` (verified signatures: `search_prds_impl(cfg, store, llm, query, k)`, `keyword_search_impl(cfg, store, llm, query, k)`, `read_prd_impl(cfg, prd_id)`).
 - Produces: `router = APIRouter(prefix="/api/prd")` with `GET /search`, `GET /{id}`, `GET /library`.
 
-**Note:** `search_prds_impl`/`keyword_search_impl`/`read_prd_impl` are SYNC and touch Chroma; offload them with `anyio.to_thread.run_sync` so the single worker isn't blocked. Library reuses keyword/search infra: for v1, `GET /library` returns a simple listing via `read_prd_impl`-style vault listing is overkill — instead library lists from the store's metadata. To stay within the locked core, **library is implemented as an empty-query-guarded listing built from `store`**; expose a `list_library(cfg, store, status, tag, cursor, limit)` helper in `prd.py` that pages over `store` metadata. (If the store lacks a list primitive, the helper falls back to `read_prd_impl` over `list_docs`; the test uses a fake core exposing a `list_library`-compatible store.)
+**Note:** `search_prds_impl`/`keyword_search_impl`/`read_prd_impl` are SYNC and touch Chroma; offload them with `anyio.to_thread.run_sync` so the single worker isn't blocked. **Library (Codex #5):** there is no `store.card_for` in the real `Store`. We add a real `Store.list_cards()` method (Step 0 below) that builds one card per PRD from the per-chunk metadata the store already holds (`doc_id`, `title`, `status`, `tags`, `summary`, `source_url` — verified in `store.py:19-25`), with `status`/`tag` filtering and cursor pagination. The router calls it (offloaded). No fallback hack.
+
+- [ ] **Step 0: Add a real `Store.list_cards` (with its own test) — Codex #5**
+
+Add to `mcp/tests/test_store_cards.py`:
+
+```python
+from prd_mcp.store import Store
+
+
+class _FakeCollection:
+    def __init__(self, rows): self._rows = rows
+    def get(self, include=None, where=None, limit=None):
+        return {"metadatas": self._rows}
+
+
+def _md(stem, status="active", tags="crm,referral"):
+    return {"doc_stem": stem, "doc_id": stem, "title": f"Title {stem}", "status": status,
+            "tags": tags, "summary": f"sum {stem}", "source_url": "u", "chunk_type": "summary", "body_hash": "h"}
+
+
+def test_list_cards_dedupes_to_one_per_prd_and_filters():
+    rows = [_md("EP-1"), _md("EP-1"), _md("EP-2", status="draft"), _md("EP-3", tags="kpr")]
+    store = Store(_FakeCollection(rows))
+    cards = store.list_cards()
+    ids = sorted(c["id"] for c in cards["results"])
+    assert ids == ["EP-1", "EP-2", "EP-3"]  # one card per PRD
+    only_active = store.list_cards(status="active")
+    assert all(c["status"] == "active" for c in only_active["results"])
+    only_kpr = store.list_cards(tag="kpr")
+    assert [c["id"] for c in only_kpr["results"]] == ["EP-3"]
+
+
+def test_list_cards_paginates_by_cursor():
+    rows = [_md(f"EP-{i}") for i in range(5)]
+    store = Store(_FakeCollection(rows))
+    page1 = store.list_cards(limit=2)
+    assert len(page1["results"]) == 2 and page1["next_cursor"] is not None
+    page2 = store.list_cards(limit=2, cursor=page1["next_cursor"])
+    assert page1["results"][0]["id"] != page2["results"][0]["id"]
+```
+
+Add to `mcp/prd_mcp/store.py`:
+
+```python
+    def list_cards(self, status: str | None = None, tag: str | None = None,
+                   cursor: str | None = None, limit: int = 50) -> dict:
+        """One Library card per PRD, built from stored chunk metadata. Dedupes by
+        doc_stem (a PRD has many chunks), filters by status/tag, paginates by stem cursor."""
+        got = self.collection.get(include=["metadatas"])
+        by_stem = {}
+        for md in got.get("metadatas", []) or []:
+            stem = md["doc_stem"]
+            if stem in by_stem:
+                continue
+            tags = [t for t in (md.get("tags") or "").split(",") if t]
+            by_stem[stem] = {"id": md.get("doc_id", stem), "stem": stem, "title": md.get("title", ""),
+                             "status": md.get("status", ""), "tags": tags,
+                             "summary": md.get("summary", "") or "", "source_url": md.get("source_url", "")}
+        cards = [c for c in by_stem.values()
+                 if (status is None or c["status"] == status) and (tag is None or tag in c["tags"])]
+        cards.sort(key=lambda c: c["id"])
+        start = next((i + 1 for i, c in enumerate(cards) if c["id"] == cursor), 0)
+        limit = max(1, min(limit, 100))
+        page = cards[start:start + limit]
+        next_cursor = page[-1]["id"] if (start + limit) < len(cards) and page else None
+        return {"results": page, "next_cursor": next_cursor}
+```
+
+Run: `cd mcp && .venv/bin/pytest tests/test_store_cards.py -v` → after implementing, PASS (2 tests).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -364,6 +611,8 @@ def fake_core():
     # minimal fakes; the router calls server._impl funcs which take (cfg, store, llm, ...)
     class FakeStore:
         def stored_hashes(self): return {"EP-1": "h"}
+        def list_cards(self, status=None, tag=None, cursor=None, limit=50):
+            return {"results": [{"id": "EP-1", "title": "T", "status": "active", "tags": [], "summary": "s", "source_url": ""}], "next_cursor": None}
     class FakeLlm:
         def embed(self, texts): return [[0.1, 0.2]]
     class FakeCfg:
@@ -399,7 +648,7 @@ async def test_read_unknown_id_404(client_prd_read, monkeypatch):
     assert r.json()["error"]["code"] == "not_found"
 ```
 
-(`client_prd_read` / `client_no_perms` are fixtures added in Task 7's conftest — a test client whose `current_user`/`require_permission` is overridden to a user holding `prd.read` / no perms, with the fake core set on the app. This task's test will be RED until Task 7's fixtures exist; run it after Task 7, OR stub the fixtures locally first. To keep tasks independently runnable, add the fixtures in this task's conftest if not present.)
+(`client_prd_read` / `client_no_perms` are defined in **Task 0.5** (conftest) — clients whose `current_user` is overridden to a real user holding `prd.read` / no perms, with the fake core on the app. Task 0.5 lands before this task, so these resolve. The `fake_core` fixture above is illustrative — the canonical one lives in conftest; you can drop the local copy and rely on `app_with_core`.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -437,7 +686,9 @@ async def search(q: str = Query(""), mode: str = Query("semantic"), k: int = Que
 async def library(status: str = Query(None), tag: str = Query(None),
                   cursor: str = Query(None), limit: int = Query(50),
                   core: Core = Depends(get_core), _=Depends(require_permission("prd.read"))):
-    return await anyio.to_thread.run_sync(list_library, core.cfg, core.store, status, tag, cursor, limit)
+    # Store.list_cards (Step 0) is sync + touches Chroma -> offload.
+    return await anyio.to_thread.run_sync(
+        lambda: core.store.list_cards(status=status, tag=tag, cursor=cursor, limit=limit))
 
 
 @router.get("/{prd_id}")
@@ -447,21 +698,7 @@ async def read_one(prd_id: str, core: Core = Depends(get_core),
     if not res.get("found"):
         return JSONResponse(status_code=404, content={"error": {"code": "not_found", "message": "PRD not found"}})
     return res
-
-
-def list_library(cfg, store, status, tag, cursor, limit):
-    # Page over the index's per-PRD metadata. Uses the store's existing listing
-    # (stored_hashes gives stems; metadata via the store's get). Falls back to a
-    # vault listing if needed. Returns {results:[{id,title,status,tags,summary,source_url}], next_cursor}.
-    stems = sorted(store.stored_hashes().keys())
-    start = stems.index(cursor) + 1 if cursor in stems else 0
-    page = stems[start:start + max(1, min(limit, 100))]
-    results = [store.card_for(stem) for stem in page] if hasattr(store, "card_for") else [{"id": s} for s in page]
-    next_cursor = page[-1] if len(page) == limit and (start + limit) < len(stems) else None
-    return {"results": results, "next_cursor": next_cursor}
 ```
-
-**Note for the implementer:** `store.card_for(stem)` is the metadata accessor; if `Store` doesn't expose it yet, add a thin `card_for` to `store.py` returning `{id,title,status,tags,summary,source_url}` from the stored metadata, and unit-test it there. The fake core's store in the test provides `card_for` (or `stored_hashes` only, exercising the fallback).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -471,8 +708,8 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mcp/prd_mcp/web/prd.py mcp/tests/web/test_prd_api.py
-git commit -m "feat(web): PRD read router (library/search/read) over the shared core, offloaded"
+git add mcp/prd_mcp/store.py mcp/tests/test_store_cards.py mcp/prd_mcp/web/prd.py mcp/tests/web/test_prd_api.py
+git commit -m "feat(web): Store.list_cards + PRD read router (library/search/read) over the shared core, offloaded"
 ```
 
 ---
@@ -526,44 +763,46 @@ Expected: FAIL — `chatmodels` not found.
 
 ```python
 # mcp/prd_mcp/web/chatmodels.py
+# DB types + defaults mirror Phase 2's models.py EXACTLY (Codex #4): UUID PK via
+# server_default text("gen_random_uuid()"), timestamps via server_default func.now(),
+# seq as BigInteger. Server-side defaults so the DB (not Python) is the source of truth.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, Text,
+    UniqueConstraint, func, text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from prd_mcp.web.db import Base
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 class Conversation(Base):
     __tablename__ = "conversations"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    generating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    generating: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     __table_args__ = (Index("ix_conversations_user_updated", "user_id", "updated_at"),)
 
 
 class Message(Base):
     __tablename__ = "messages"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    sources: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    sources: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     grounded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     finish_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     __table_args__ = (
         UniqueConstraint("conversation_id", "seq", name="uq_messages_conv_seq"),
         Index("ix_messages_conv_seq", "conversation_id", "seq"),
@@ -571,21 +810,36 @@ class Message(Base):
     )
 ```
 
-- [ ] **Step 4: Generate + verify the Alembic migration**
+- [ ] **Step 4: Register `chatmodels` with `Base.metadata` (Alembic + tests) — Codex #3**
+
+Autogenerate and the test metadata only see models that have been IMPORTED. `migrations/env.py:13` imports `prd_mcp.web.db.Base` and (transitively) `prd_mcp.web.models`, but NOT `chatmodels`; `mcp/tests/web/conftest.py:13` has an F401 import to register tables on `Base.metadata`. Add the import in BOTH places so the new tables are seen.
+
+In `migrations/env.py`, after the existing `from prd_mcp.web.db import Base` line, add:
+```python
+import prd_mcp.web.models  # noqa: F401  (register auth tables on Base.metadata)
+import prd_mcp.web.chatmodels  # noqa: F401  (register chat tables on Base.metadata)
+```
+
+In `mcp/tests/web/conftest.py`, alongside the existing table-registration import, add:
+```python
+import prd_mcp.web.chatmodels  # noqa: F401  (register chat tables for create_all)
+```
+
+- [ ] **Step 5: Generate + verify the Alembic migration**
 
 Run: `cd mcp && .venv/bin/alembic revision --autogenerate -m "chat tables" && .venv/bin/alembic upgrade head`
-Expected: a migration creating `conversations`/`messages` with the FK/unique/index/check; `upgrade head` succeeds against the test DB. Inspect the generated file to confirm both tables, the `uq_messages_conv_seq` unique, and both FKs with `ondelete=CASCADE`.
+Expected: a migration creating `conversations`/`messages` with the FK/unique/index/check; `upgrade head` succeeds against the test DB. Inspect the generated file to confirm both tables appear (they will NOT if Step 4 was skipped), the `uq_messages_conv_seq` unique, `seq` as `BigInteger`, the server defaults (`gen_random_uuid()`, `now()`), and both FKs with `ondelete=CASCADE`.
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 6: Run test to verify it passes**
 
 Run: `cd mcp && .venv/bin/pytest tests/web/test_chatmodels.py -v`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add mcp/prd_mcp/web/chatmodels.py migrations/versions/*chat_tables.py mcp/tests/web/test_chatmodels.py
-git commit -m "feat(web): Conversation/Message models + chat-tables migration (seq, generating, finish_reason)"
+git add mcp/prd_mcp/web/chatmodels.py migrations/env.py migrations/versions/*chat_tables.py mcp/tests/web/conftest.py mcp/tests/web/test_chatmodels.py
+git commit -m "feat(web): Conversation/Message models + chat-tables migration (seq bigint, server defaults)"
 ```
 
 ---
@@ -825,6 +1079,8 @@ async def post_message(cid: str, body: MessageIn,
         conv.title = body.content[:80]
     await db.commit()
 
+    conv_id_val = conv.id  # capture before the request session goes away
+
     async def event_gen():
         acc, sources, grounded, finish = [], [], None, "complete"
         try:
@@ -834,7 +1090,7 @@ async def post_message(cid: str, body: MessageIn,
                 retrieve, standalone, core.store, core.llm.embed, core.cfg.top_k, core.cfg.score_threshold)
             sources = format_sources(results)
             grounded = verdict != "no_match"
-            yield {"event": "sources", "data": __import__("json").dumps({"sources": sources, "verdict": verdict})}
+            yield {"event": "sources", "data": json.dumps({"sources": sources, "verdict": verdict})}
             async for tok in answer_stream(body.content, results, verdict, core.llm.chat_stream):
                 acc.append(tok)
                 yield {"event": "token", "data": tok}
@@ -845,24 +1101,26 @@ async def post_message(cid: str, body: MessageIn,
             finish = "llm_error"
             yield {"event": "error", "data": "generation failed"}
         finally:
-            # Persist the assistant row (best-effort) + release the lock, in a fresh txn.
-            async with db.begin_nested() if db.in_transaction() else _null_ctx():
-                pass
-            a_seq = await _next_seq(db, conv.id)
-            db.add(Message(conversation_id=conv.id, seq=a_seq, role="assistant",
-                           content="".join(acc) or "", sources=sources,
-                           grounded=grounded if finish == "complete" else None,
-                           finish_reason=finish))
-            await db.execute(update(Conversation).where(Conversation.id == conv.id)
-                             .values(generating=False, updated_at=func.now()))
-            await db.commit()
+            # Codex #9: do NOT reuse the request-scoped `db` here — it may be closing as the
+            # response streams. Open a FRESH short-lived session for the final persist + lock
+            # release, so this is correct regardless of the request session's lifecycle.
+            async with db_mod._sessionmaker() as s:  # the live sessionmaker set in create_app
+                a_seq = (await s.execute(
+                    select(func.coalesce(func.max(Message.seq), 0)).where(Message.conversation_id == conv_id_val))).scalar_one() + 1
+                s.add(Message(conversation_id=conv_id_val, seq=a_seq, role="assistant",
+                              content="".join(acc) or "", sources=sources,
+                              grounded=grounded if finish == "complete" else None,
+                              finish_reason=finish))
+                await s.execute(update(Conversation).where(Conversation.id == conv_id_val)
+                                .values(generating=False, updated_at=func.now()))
+                await s.commit()
             if finish == "complete":
                 yield {"event": "done", "data": str(a_seq)}
 
     return EventSourceResponse(event_gen())
 ```
 
-**Implementer note (concurrency + DB session):** `get_db` yields one session for the request; holding it across a long stream is acceptable here ONLY because we do not keep an open transaction during token streaming (each `commit()` closes the txn; the stream's LLM work touches no txn). If the test client's session lifecycle complains, switch `event_gen` to open its OWN short-lived session from the sessionmaker for the final persist (preferred in production). Add `from contextlib import nullcontext as _null_ctx`. Remove the placeholder `begin_nested` block if you adopt a fresh session — it's a guard, not required logic.
+**Implementer note (DB session lifecycle — Codex #9, resolved):** the SSE generator runs AFTER the route returns its response object, so the request-scoped `db` (from `get_db`) may already be closing. Therefore the final assistant-row persist + lock release open a **fresh** session from the live sessionmaker (`db_mod._sessionmaker()`), not `db`. The pre-stream work (claim lock, load history, persist user row) DOES use the request `db` and is fully committed before streaming starts. Add `import json` and `from prd_mcp.web import db as db_mod` at the top of `chat.py`. There is NO `begin_nested`/`nullcontext` placeholder — it's removed.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -933,6 +1191,7 @@ Expected: FAIL — `prd_mcp.web.status` not found.
 # mcp/prd_mcp/web/status.py
 from __future__ import annotations
 
+import anyio
 from fastapi import APIRouter, Depends, Query
 
 from prd_mcp.web.coredeps import Core, get_core
@@ -944,7 +1203,8 @@ router = APIRouter(prefix="/api/status")
 
 @router.get("/pipeline")
 async def pipeline(core: Core = Depends(get_core), _=Depends(require_permission("status.view"))):
-    latest = read_latest_run(core.cfg.vault_path)
+    # read_latest_run does filesystem I/O -> offload (Codex #6).
+    latest = await anyio.to_thread.run_sync(read_latest_run, core.cfg.vault_path)
     if latest is None:
         return {"run_id": None, "stages": {}, "halted": False, "halt_reason": None, "halted_at": None}
     return latest
@@ -953,13 +1213,15 @@ async def pipeline(core: Core = Depends(get_core), _=Depends(require_permission(
 @router.get("/history")
 async def history(limit: int = Query(10), core: Core = Depends(get_core),
                   _=Depends(require_permission("status.view"))):
-    return {"runs": read_run_history(core.cfg.vault_path, limit)}
+    runs = await anyio.to_thread.run_sync(read_run_history, core.cfg.vault_path, limit)
+    return {"runs": runs}
 
 
 @router.get("/coverage")
 async def coverage(core: Core = Depends(get_core), _=Depends(require_permission("status.view"))):
-    # total PRDs vs how many are enriched (have a body_hash in the index)
-    hashes = core.store.stored_hashes()
+    # total PRDs vs how many are enriched (have a body_hash in the index).
+    # store.stored_hashes() hits Chroma -> offload (Codex #6).
+    hashes = await anyio.to_thread.run_sync(core.store.stored_hashes)
     total = len(hashes)
     enriched = sum(1 for h in hashes.values() if h)
     return {"total": total, "enriched": enriched, "unenriched": total - enriched}
@@ -998,7 +1260,7 @@ Then in `cli.py`'s `web` branch, build the core and pass it. Replace the `web` b
         sm = make_sessionmaker(engine)
         # Build the PRD core for the HTTP door (same cfg/store/llm as index/serve).
         if os.environ.get("PRD_SECRETS") == "env":
-            from prd_mcp.env_secret import read_secret_from_env as secret_reader
+            from prd_mcp.env_secret import read_secret_from_env as secret_reader  # from Plan B (Task 5b)
         else:
             secret_reader = read_secret
         cfg = load_config(os.environ, secret_reader)
@@ -1043,29 +1305,37 @@ git commit -m "feat(web): status router + mount prd/chat/status into create_app;
 
 ```python
 # mcp/tests/web/test_chat_concurrency.py
+import time
 import anyio
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_healthz_responds_during_a_slow_stream(client_prd_ask, conv_id, monkeypatch):
+async def test_healthz_responds_while_BLOCKING_sync_core_is_in_flight(client_prd_ask, conv_id, monkeypatch):
+    # Codex #7: the sync core calls must be BLOCKING fakes (time.sleep), NOT fast lambdas —
+    # otherwise the test passes even if the route ran them on the event loop. The route MUST
+    # offload them via anyio.to_thread.run_sync for /healthz to stay responsive.
     import prd_mcp.web.chat as chatmod
-    monkeypatch.setattr(chatmod, "rewrite_query", lambda h, l, fn: l)
-    monkeypatch.setattr(chatmod, "retrieve", lambda q, s, e, k, t: ([_FakeR()], "match"))
 
-    async def slow_stream(question, retrieved, verdict, fn):
-        for t in ["x", "y", "z"]:
-            await anyio.sleep(0.2)   # simulate a slow provider
-            yield t
-    monkeypatch.setattr(chatmod, "answer_stream", slow_stream)
+    def blocking_rewrite(history, latest, fn):
+        time.sleep(0.4)   # blocks the CALLING thread; only a threadpool offload keeps the loop free
+        return latest
+    def blocking_retrieve(q, store, embed, k, th):
+        time.sleep(0.4)
+        return ([_FakeR()], "match")
+    async def fast_stream(question, retrieved, verdict, fn):
+        yield "ok"
+    monkeypatch.setattr(chatmod, "rewrite_query", blocking_rewrite)
+    monkeypatch.setattr(chatmod, "retrieve", blocking_retrieve)
+    monkeypatch.setattr(chatmod, "answer_stream", fast_stream)
 
     async with anyio.create_task_group() as tg:
         async def start_stream():
             await client_prd_ask.post(f"/api/chat/conversations/{conv_id}/messages",
                                       json={"content": "hi"}, headers={"x-requested-with": "prd-app"})
         tg.start_soon(start_stream)
-        await anyio.sleep(0.1)  # stream is mid-flight
-        with anyio.fail_after(0.5):  # /healthz must answer well before the stream finishes
+        await anyio.sleep(0.1)  # the blocking rewrite/retrieve are now in flight (~0.8s total)
+        with anyio.fail_after(0.3):  # MUST answer well before the 0.8s of blocking work finishes
             r = await client_prd_ask.get("/healthz")
             assert r.status_code in (200, 503)
 
@@ -1073,6 +1343,8 @@ async def test_healthz_responds_during_a_slow_stream(client_prd_ask, conv_id, mo
 class _FakeR:
     doc_stem = "EP-1"; doc_id = "EP-1"; title = "T"; source_url = ""; summary = "s"; tags = []; status = ""; text = "ctx"; score = 0.5
 ```
+
+**Why this is the real proof (Codex #7):** with `time.sleep` (a *synchronous* block) inside the monkeypatched `rewrite_query`/`retrieve`, the only way `/healthz` answers within 0.3s — while ~0.8s of blocking work runs — is if the route offloaded those calls to a worker thread via `anyio.to_thread.run_sync`. If the route called them directly, the single event-loop thread would be blocked and `fail_after(0.3)` would trip. (Note: the ASGI test client must drive the app on the event loop, not a sync transport — use the async httpx client over ASGI that the conftest provides.)
 
 - [ ] **Step 2: Run test to verify it fails (or reveals blocking)**
 
@@ -1112,12 +1384,22 @@ git commit -m "test(web): /healthz stays responsive during a slow chat stream (s
 - Mount into Phase 2 app, core threaded via cli `web` (Tasks 3, 8) — §3. ✓
 - Deploy: sse-starlette, LLM keys in web container, vault/chroma paths — §8. ✓
 
-**Placeholder scan:** the one soft spot is `store.card_for` (Task 4) and the chat session-lifecycle note (Task 7) — both are called out explicitly with a concrete fallback and an implementer note, not left as "TBD". No bare TODO/TBD. The library listing has a defined fallback. ✓
+**Placeholder scan:** the two soft spots from the first draft are now resolved concretely — `Store.list_cards` is a real method with a test (Task 4 Step 0), and the chat session-lifecycle uses a fresh sessionmaker session (Task 7), with the placeholder removed. No bare TODO/TBD. ✓
 
 **Type/interface consistency:** `Core(cfg,store,llm)` defined Task 3, used Tasks 4/7/8; `search_prds_impl(cfg,store,llm,query,k)`/`keyword_search_impl(...)`/`read_prd_impl(cfg,prd_id)` match `server.py` (verified); `retrieve(query, store, embed_fn, k, threshold)` matches `retrieve.py` (verified); `format_sources`/`build_messages` reused from `answer.py` (verified); `read_latest_run`/`read_run_history` match Plan B's locked names; `require_permission`/`current_user`/`get_db`/`create_app` match Phase 2 (verified). ✓
 
 **Cross-plan dependencies:** Plan B (`manifests.py`) must be merged before Task 8. Phase 2 (auth) must be merged before any task. Plan C (frontend) consumes these endpoint shapes.
 
-**Known soft spots flagged for the implementer (not placeholders — decisions with a default):**
-1. `store.card_for(stem)` — add to `store.py` if absent (Task 4 note), with a `stored_hashes`-only fallback.
-2. Chat streaming DB-session lifecycle (Task 7 note) — prefer a fresh short-lived session for the final persist in production; the request-scoped session is acceptable because no txn is held across the stream.
+**Codex review iteration 1 (10 findings) — all addressed:**
+- #1 (env_secret module) — Task 0 preflight asserts Plan B's `env_secret.py` exists; the `web` CLI imports it, doesn't redefine it.
+- #2 (manifests module) — Task 0 preflight asserts Plan B's `manifests.py` exists; Global Constraints make Plan B a hard pre-dependency.
+- #3 (Alembic/test metadata blind to chatmodels) — Task 5 Step 4 imports `chatmodels` in `migrations/env.py` AND `conftest.py`.
+- #4 (DB types/defaults) — Task 5 uses `BigInteger` seq + `server_default=text("gen_random_uuid()")`/`func.now()`, matching Phase 2 `models.py`.
+- #5 (`store.card_for` absent) — Task 4 Step 0 adds a real `Store.list_cards` (dedupe/filter/paginate) with its own test; router calls it offloaded.
+- #6 (status sync in async route) — Task 8 offloads `read_latest_run`/`read_run_history`/`stored_hashes` via `anyio.to_thread`.
+- #7 (concurrency test didn't prove offloading) — Task 9 now uses BLOCKING `time.sleep` sync fakes so `/healthz` only stays responsive if the route offloaded.
+- #8 (fixtures not concrete/ordered) — Task 0.5 defines ALL web fixtures up front (clients per permission, `conv_id`, `busy_conv_id`, `other_users_conversation_id`).
+- #9 (streaming DB lifecycle) — Task 7 opens a FRESH sessionmaker session for the final persist; `begin_nested`/`nullcontext` placeholder removed.
+- #10 (`chat_stream` retry/injectability) — Task 2 makes it injectable (`stream_opener`/`async_sleep`) with connect-time retry mirroring sync `_retry`, plus a fake-transport unit test.
+
+**Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan.
