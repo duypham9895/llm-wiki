@@ -125,3 +125,28 @@ async def test_purge_expired(db, settings):
     n = await S.purge_expired(db, now=now)
     await db.commit()
     assert n == 1
+
+
+async def test_purge_once_deletes_expired(sessionmaker_, settings):
+    from sqlalchemy import select as sa_select
+    from prd_mcp.web import app as app_mod
+    from prd_mcp.web.models import Session
+
+    # Create an expired session via sessionmaker_
+    async with sessionmaker_() as s:
+        u = User(email="purge_once@ringkas.co.id", password_hash="x", status="active")
+        s.add(u)
+        await s.commit()
+        await s.refresh(u)
+        _, row = await S.create_session(s, u.id, settings, now=utc() - timedelta(days=40))
+        await s.commit()
+        session_id = row.id
+
+    await app_mod._purge_once(sessionmaker_)
+
+    # The expired row must be gone
+    async with sessionmaker_() as s:
+        remaining = (await s.execute(
+            sa_select(Session).where(Session.id == session_id)
+        )).scalar_one_or_none()
+    assert remaining is None

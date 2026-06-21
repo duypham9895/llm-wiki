@@ -44,3 +44,23 @@ async def test_allowed_domains_is_text_array(db):
     await db.commit()
     await db.refresh(s)
     assert s.allowed_domains == ["ringkas.co.id", "example.com"]
+
+
+async def test_approved_by_set_null_on_approver_delete(db):
+    """ON DELETE SET NULL: deleting the approver must null out approved_by, not cascade-delete."""
+    approver = User(email="approver@ringkas.co.id", password_hash="x", status="active")
+    approvee = User(email="approvee@ringkas.co.id", password_hash="x", status="active")
+    db.add(approver)
+    db.add(approvee)
+    await db.commit()
+    await db.refresh(approver)
+    await db.refresh(approvee)
+
+    approvee.approved_by = approver.id
+    await db.commit()
+
+    await db.delete(approver)
+    await db.commit()
+
+    await db.refresh(approvee)
+    assert approvee.approved_by is None, "approved_by must be SET NULL when approver is deleted"
