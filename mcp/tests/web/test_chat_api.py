@@ -277,6 +277,87 @@ async def test_assistant_row_finish_reason_on_happy_path(
 
 
 # ---------------------------------------------------------------------------
+# Generation timeout — sweep-cutoff invariant enforcement (Codex blocker fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_generation_timeout_releases_lock_and_sets_finish_reason(
+    client_prd_ask, conv_id, monkeypatch, sessionmaker_
+):
+    """Verify that when GENERATION_TIMEOUT_SECONDS fires:
+    1. The request completes (does not hang indefinitely).
+    2. The generating lock is released (generating=False), so a second message succeeds.
+    3. The persisted assistant row has finish_reason='timeout'.
+
+    Mechanism: monkeypatch GENERATION_TIMEOUT_SECONDS to 0.5 s and fake answer_stream
+    to yield slowly (1 s sleep between tokens). move_on_after fires before any token is
+    yielded; the shielded finally persists the (empty) assistant row and releases the lock.
+    """
+    import asyncio
+    import uuid as _uuid
+    import prd_mcp.web.chat as chatmod
+    import sqlalchemy
+
+    # Inject a very short timeout to make the test fast.
+    monkeypatch.setattr(chatmod, "GENERATION_TIMEOUT_SECONDS", 0.5)
+
+    monkeypatch.setattr(chatmod, "rewrite_query", lambda h, l, fn: l)
+    monkeypatch.setattr(chatmod, "retrieve", lambda q, store, embed, k, th: ([_FakeR()], "match"))
+
+    async def _slow_stream(question, retrieved, verdict, fn):
+        await asyncio.sleep(5)  # far longer than the 0.5 s timeout
+        yield "never_reached"
+
+    monkeypatch.setattr(chatmod, "answer_stream", _slow_stream)
+
+    # 1. Request must complete (not hang).
+    r = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "timeout test"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r.status_code == 200
+
+    # "done" event must NOT be emitted on timeout (only on "complete").
+    assert "event: done" not in r.text
+
+    # 2. Lock released — DB generating=False.
+    from prd_mcp.web.chatmodels import Conversation as Conv, Message as Msg
+    async with sessionmaker_() as s:
+        conv_row = (await s.execute(
+            sqlalchemy.select(Conv).where(Conv.id == _uuid.UUID(conv_id))
+        )).scalar_one()
+        assert conv_row.generating is False, (
+            "generating stuck True after timeout — lock was NOT released"
+        )
+
+    # 3. finish_reason of the persisted assistant row must be "timeout".
+    async with sessionmaker_() as s:
+        msgs = (await s.execute(
+            sqlalchemy.select(Msg)
+            .where(Msg.conversation_id == _uuid.UUID(conv_id))
+            .order_by(Msg.seq)
+        )).scalars().all()
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert len(assistant_msgs) == 1, f"Expected 1 assistant row, got {len(assistant_msgs)}"
+    assert assistant_msgs[0].finish_reason == "timeout", (
+        f"Expected finish_reason='timeout', got {assistant_msgs[0].finish_reason!r}"
+    )
+
+    # 4. Second message succeeds (lock was actually released, not just DB-refreshed).
+    _patch_happy(monkeypatch)
+    monkeypatch.setattr(chatmod, "GENERATION_TIMEOUT_SECONDS", 600)  # restore
+    r2 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "after timeout"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r2.status_code == 200, (
+        f"Second POST returned {r2.status_code} — lock NOT released after timeout. Body: {r2.text}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # sweep_stale_generating — purge-loop self-heal for pre-iteration disconnects
 # ---------------------------------------------------------------------------
 

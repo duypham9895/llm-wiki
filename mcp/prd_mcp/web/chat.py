@@ -24,6 +24,24 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat")
 
+# ---------------------------------------------------------------------------
+# Generation lifetime bound — INVARIANT ENFORCEMENT
+# ---------------------------------------------------------------------------
+# A stream that runs longer than GENERATION_TIMEOUT_SECONDS is force-ended by
+# move_on_after() below.  The shielded finally then persists a partial assistant
+# row (finish_reason="timeout") and releases the generating lock as normal.
+#
+# INVARIANT: GENERATION_TIMEOUT_SECONDS MUST remain strictly less than the
+# sweep cutoff (sweep_stale_generating's older_than_minutes * 60 = 1800 s).
+# With this bound in place the sweep can ONLY ever reap a generation that has
+# ALREADY been force-ended and whose lock has ALREADY been released.  A still-
+# running generation can therefore never be reaped by the sweep — the one-at-a-
+# time invariant holds by construction.
+#
+# Typical LLM per-turn timeout is ~60 s (request_timeout on the LLM client);
+# 600 s (10 min) is far above any real stream and far below the 1800 s sweep.
+GENERATION_TIMEOUT_SECONDS: float = 600
+
 
 async def sweep_stale_generating(session, *, older_than_minutes: int = 30, now=None) -> int:
     """Clear generating=True on conversations whose updated_at is stale.
@@ -32,9 +50,14 @@ async def sweep_stale_generating(session, *, older_than_minutes: int = 30, now=N
     when it releases the lock in the finally block.  30 minutes (default) is far
     longer than any real stream, so only genuinely-wedged locks — caused by a
     rare client disconnect in the gap between the lock-claim commit and
-    sse-starlette first iterating the generator — are swept.  The threshold is
-    deliberately conservative to never interrupt a legitimately long in-flight
-    stream.
+    sse-starlette first iterating the generator — are swept.
+
+    INVARIANT (matches GENERATION_TIMEOUT_SECONDS above):
+    Every generation is force-ended by move_on_after(GENERATION_TIMEOUT_SECONDS)
+    (600 s) and its lock is released before the sweep cutoff (older_than_minutes*60
+    = 1800 s) would ever fire.  This sweep therefore only ever acts on rows whose
+    generation has ALREADY been ended and whose lock has ALREADY been released — it
+    can NEVER interrupt an active generation.
 
     Does NOT commit; the caller is responsible for committing (mirrors the
     contract used by sessions_mod.purge_expired in _purge_once).
@@ -191,22 +214,39 @@ async def post_message(
 
             # ----------------------------------------------------------------
             # LLM pipeline: rewrite → retrieve → stream
+            #
+            # Wrapped in move_on_after(GENERATION_TIMEOUT_SECONDS) to enforce
+            # the sweep-cutoff invariant: a generation is force-ended at
+            # GENERATION_TIMEOUT_SECONDS (600 s), which is far below the sweep
+            # cutoff (1800 s).  The sweep therefore can NEVER act on a still-
+            # running generation — it only ever sees already-released locks.
+            #
+            # move_on_after uses a cancel scope (not CancelledError), so after
+            # the `with` block we check scope.cancelled_caught to distinguish
+            # "timed out" from a real client-disconnect CancelledError (which
+            # propagates past the scope and is caught by the except clause below).
             # ----------------------------------------------------------------
-            standalone = await anyio.to_thread.run_sync(
-                rewrite_query, history, content_val, core.llm.chat
-            )
-            yield {"event": "rewrite", "data": standalone}
+            with anyio.move_on_after(GENERATION_TIMEOUT_SECONDS) as _gen_scope:
+                standalone = await anyio.to_thread.run_sync(
+                    rewrite_query, history, content_val, core.llm.chat
+                )
+                yield {"event": "rewrite", "data": standalone}
 
-            results, verdict = await anyio.to_thread.run_sync(
-                retrieve, standalone, core.store, core.llm.embed, core.cfg.top_k, core.cfg.score_threshold
-            )
-            sources = format_sources(results)
-            grounded = verdict != "no_match"
-            yield {"event": "sources", "data": json.dumps({"sources": sources, "verdict": verdict})}
+                results, verdict = await anyio.to_thread.run_sync(
+                    retrieve, standalone, core.store, core.llm.embed, core.cfg.top_k, core.cfg.score_threshold
+                )
+                sources = format_sources(results)
+                grounded = verdict != "no_match"
+                yield {"event": "sources", "data": json.dumps({"sources": sources, "verdict": verdict})}
 
-            async for tok in answer_stream(content_val, results, verdict, core.llm.chat_stream):
-                acc.append(tok)
-                yield {"event": "token", "data": tok}
+                async for tok in answer_stream(content_val, results, verdict, core.llm.chat_stream):
+                    acc.append(tok)
+                    yield {"event": "token", "data": tok}
+
+            # move_on_after cancelled the scope (timeout fired) — NOT a client disconnect.
+            # Treat as a timeout: the finally will persist a partial row and release the lock.
+            if _gen_scope.cancelled_caught:
+                finish = "timeout"
 
         except anyio.get_cancelled_exc_class():
             finish = "client_disconnected"
