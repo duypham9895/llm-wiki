@@ -250,11 +250,13 @@ async def post_message(
             # ----------------------------------------------------------------
             # LLM pipeline: rewrite → retrieve → stream
             #
-            # Wrapped in move_on_after(GENERATION_TIMEOUT_SECONDS) to enforce
-            # the sweep-cutoff invariant: a generation is force-ended at
-            # GENERATION_TIMEOUT_SECONDS (600 s), which is far below the sweep
-            # cutoff (1800 s).  The sweep therefore can NEVER act on a still-
-            # running generation — it only ever sees already-released locks.
+            # Wrapped in move_on_after(GENERATION_TIMEOUT_SECONDS): the async
+            # token loop is force-ended at 600 s, far below the 6 h sweep cutoff
+            # (DEFAULT_SWEEP_CUTOFF_MINUTES). The offloaded sync calls are bounded
+            # in the COMMON case by the LLM client timeout × retries (~255 s) — see
+            # the GENERATION_TIMEOUT_SECONDS block for the per-operation-timeout
+            # residual edge and why the cutoff is 6 h, not minutes. In practice the
+            # sweep only ever sees already-released locks.
             #
             # move_on_after uses a cancel scope (not CancelledError), so after
             # the `with` block we check scope.cancelled_caught to distinguish

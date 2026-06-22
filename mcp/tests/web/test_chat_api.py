@@ -384,6 +384,9 @@ async def test_sweep_clears_stale_generating_lock(db, ask_user):
     await db.commit()
 
     now = datetime.now(timezone.utc)
+    # Explicit custom window (NOT the 6h production default): this test sets
+    # updated_at to 1h ago, so a 30-min window classifies it stale. Tests the
+    # sweep FUNCTION's behavior at a chosen cutoff, independent of the default.
     swept = await sweep_stale_generating(db, older_than_minutes=30, now=now)
     await db.commit()
 
@@ -413,6 +416,8 @@ async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
     )
     await db.commit()
 
+    # Explicit custom window (not the 6h default) — recent updated_at vs a 30-min
+    # cutoff proves a fresh lock is spared regardless of the chosen window.
     swept = await sweep_stale_generating(db, older_than_minutes=30, now=now)
     await db.commit()
 
@@ -452,9 +457,10 @@ def test_generation_timeout_below_sweep_cutoff():
         f"than sweep cutoff ({sweep_cutoff_seconds} s). "
         "Raising it past the sweep window breaks the one-at-a-time invariant."
     )
-    # Sync-call common-case bound REQUEST_TIMEOUT × (MAX_RETRIES+1) ≈ 255 s must also
-    # stay below the cutoff (env-config, so documented not runtime-asserted here):
-    assert 60 * 4 < sweep_cutoff_seconds  # default REQUEST_TIMEOUT×(MAX_RETRIES+1)
+    # Sync-call common-case bound ≈ REQUEST_TIMEOUT × (MAX_RETRIES+1) + backoff
+    # = 60×4 + ~15 ≈ 255 s must also stay below the cutoff (env-config, so this pins
+    # the DEFAULT relationship; the per-operation-timeout residual edge is documented):
+    assert 60 * 4 + 15 < sweep_cutoff_seconds  # ~255 s default common-case bound
 
 
 @pytest.mark.asyncio
@@ -545,6 +551,8 @@ async def test_claim_refreshes_updated_at_so_sweep_spares_active_lock(db, ask_us
     # The conversation is now generating=True (lock held, NOT released). Run the sweep with
     # a reference time 1 minute in the future. Because the claim refreshed updated_at to ~now,
     # the (formerly 2h-old) conversation must NOT be swept out from under the active lock.
+    # Explicit 30-min custom window (not the 6h default): the claim refresh must win
+    # against ANY window, so the smaller window is the stronger test here.
     swept = await sweep_stale_generating(db, older_than_minutes=30,
                                          now=datetime.now(timezone.utc) + timedelta(minutes=1))
     await db.commit()
