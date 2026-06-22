@@ -50,7 +50,19 @@ def read_run_history(vault_path: str, limit: int = 10) -> list[dict]:
     out = []
     for run_id in _list_run_ids(vault_path)[:limit]:
         stages = [s for s in STAGES if _read_stage(vault_path, run_id, s) is not None]
-        ok = all((m := _read_stage(vault_path, run_id, s)) and m.get("ok") for s in stages) if stages else False
+        # A run is `ok` only if the orchestrator did NOT halt it AND all three stages
+        # are present and individually ok. Consulting summary.extra.halted is REQUIRED:
+        # a halted run (e.g. sync ok, enrich failed, index never ran) would otherwise
+        # report ok=True here while read_latest_run correctly reports halted=True — a
+        # cross-function inconsistency (Codex full-stack audit #1). Keep the two readers
+        # in agreement about what "ok" means.
+        summary = _read_stage(vault_path, run_id, "summary") or {}
+        halted = (summary.get("extra") or {}).get("halted")
+        all_stages_ok = (
+            len(stages) == len(STAGES)
+            and all((m := _read_stage(vault_path, run_id, s)) and m.get("ok") for s in STAGES)
+        )
+        ok = bool(all_stages_ok and halted is not True)
         out.append({"run_id": run_id, "ok": ok, "stage_count": len(stages)})
     return out
 
