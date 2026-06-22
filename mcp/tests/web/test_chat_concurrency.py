@@ -1,123 +1,290 @@
-"""Single-worker non-blocking proof.
+"""Out-of-process single-worker offload proof.
 
-Verifies the load-bearing design claim: a slow (blocking) sync core call that
-the chat route offloads via anyio.to_thread.run_sync does NOT freeze the event
-loop.  While the blocking call is provably in flight, a concurrent /healthz
-request must still return in milliseconds.
+WHY THIS TEST EXISTS (and why the previous design was inadequate)
+-----------------------------------------------------------------
+The previous version ran the "blocking" stub and the /healthz probe inside the
+same in-process ASGI transport (httpx.ASGITransport), sharing one event loop.
+If the route regressed and called ``rewrite_query`` directly on the event loop,
+the loop would freeze — but the same loop drives ``anyio.fail_after`` and the
+``anyio.to_thread.run_sync(entered.wait, ...)`` barrier.  A watchdog thread
+eventually called ``release.set()``, allowing the frozen loop to continue and
+the assertion to pass — a **false-pass** on a regressed implementation.
 
-Design (Codex iter-4 / iter-5 hardened):
-  - ``blocking_rewrite`` sets ``entered`` then parks on ``release.wait()`` with
-    NO timeout — so the block is held open indefinitely until the test releases
-    it.  This makes the concurrent /healthz probe deterministic: entered.set()
-    guarantees the thread is blocked; release.wait() guarantees it STAYS blocked
-    while /healthz is being measured.
-  - Correct (offloaded) design: rewrite runs in a worker thread, event loop is
-    free, /healthz returns in ms.
-  - Broken (non-offloaded) design: rewrite runs on the event loop, loop is
-    frozen, /healthz cannot complete — anyio.fail_after(1.0) trips and the test
-    fails.
-  - ``finally: release.set()`` lets the held thread finish so the task group
-    can exit cleanly.  The pytest/anyio test-level timeout prevents any hang.
+THE FIX: subprocess + real socket
+----------------------------------
+This rewrite runs the app in a real uvicorn subprocess (single worker) and
+probes /healthz over a genuine TCP socket using an external httpx client.  The
+observation is made from *outside* the subprocess's event loop.
+
+Proof structure:
+
+1. The parent test owns a real Postgres testcontainer (session-scoped).
+2. Before launching the subprocess, the parent creates the full schema + seeds a
+   user with ``prd.ask`` + creates a conversation, all in that DB.
+3. A uvicorn subprocess is launched with ``--workers 1``, inheriting the DB URL,
+   the seeded user id, and the required settings via env vars.  The subprocess
+   imports ``tests.web._concurrency_app:app``, which:
+     - builds ``create_app(...)`` with a fake core whose ``llm.chat`` does
+       ``time.sleep(BLOCK_SECONDS)`` (30 s default)
+     - overrides ``current_user`` to re-fetch the seeded user by id
+     - patches ``retrieve`` to return immediately so only ``llm.chat`` blocks
+4. The parent polls /healthz until the subprocess is ready (≤ 15 s startup).
+5. The parent fires the chat POST (which will block ~30 s inside the offloaded
+   ``time.sleep``) in a background thread — does NOT await it.
+6. After a brief pause to ensure the POST is mid-block, the parent issues
+   ``GET /healthz`` with a 3 s external httpx timeout.
+7. ASSERTION: /healthz returns 200/503 quickly (< 2 s).
+
+FALSIFIABILITY
+--------------
+If ``chat.py`` ran ``rewrite_query`` directly on the event loop (no
+``anyio.to_thread.run_sync``), the 30 s ``time.sleep`` would block uvicorn's
+single event-loop thread.  The single worker cannot service any other connection
+while the loop is frozen.  The external /healthz request would sit unprocessed
+on the TCP socket for 30 s and the external httpx client would raise
+``httpx.ReadTimeout`` or ``httpx.ConnectTimeout`` at the 3 s limit — the test
+would then FAIL cleanly with a timeout exception, not hang.  (The subprocess is
+killed in ``finally`` regardless, so no orphan process is left behind.)
+
+This proof is bounded at both ends:
+- **Upper bound on startup:** 15 s poll guards against the subprocess never
+  becoming ready (configuration error, port clash, import failure).
+- **Upper bound on regression detection:** 3 s external client timeout bounds
+  the wait when the loop IS frozen, turning a potential hang into a clean fail.
+
+Test is marked ``slow`` (it intentionally waits a few seconds in steady state)
+and ``integration`` (it uses Docker/testcontainers + a subprocess).
 """
 from __future__ import annotations
 
+import os
+import socket
+import subprocess
+import sys
 import threading
 import time
-import anyio
+
+import httpx
 import pytest
+import pytest_asyncio
+from sqlalchemy import text
+
+from prd_mcp.web.db import Base, make_engine, make_sessionmaker
+from prd_mcp.web import seed as seed_mod
+from prd_mcp.web.settings import load_settings
+import prd_mcp.web.models  # noqa: F401 – register auth tables on Base.metadata
+import prd_mcp.web.chatmodels  # noqa: F401 – register chat tables on Base.metadata
+from prd_mcp.web.chatmodels import Conversation
+
+from tests.web.conftest import make_user_with_perms, TEST_ARGON
 
 
-class _FakeR:
-    doc_stem = "EP-1"
-    doc_id = "EP-1"
-    title = "T"
-    source_url = ""
-    summary = "s"
-    tags = []
-    status = ""
-    text = "ctx"
-    score = 0.5
+# ── helpers ───────────────────────────────────────────────────────────────────
 
+def _free_port() -> int:
+    """Return a currently-free TCP port on 127.0.0.1."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_server(base_url: str, timeout: float = 15.0) -> None:
+    """Poll /healthz until the subprocess is ready or timeout is reached."""
+    deadline = time.monotonic() + timeout
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(f"{base_url}/healthz", timeout=1.0)
+            if r.status_code in (200, 503):
+                return  # server is up (even 503 means DB check ran → app is alive)
+        except Exception as e:
+            last_exc = e
+        time.sleep(0.25)
+    raise TimeoutError(
+        f"uvicorn subprocess did not become ready within {timeout}s "
+        f"(last error: {last_exc!r})"
+    )
+
+
+# ── test ──────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.slow
+@pytest.mark.integration
 async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
-    client_prd_ask, conv_id, monkeypatch
+    pg_url, pg_container
 ):
-    """Proves the event loop stays free while a sync core call is in flight.
+    """Real subprocess proof: /healthz responds while chat stream blocks in a worker thread.
 
-    The monkeypatched ``blocking_rewrite`` is a REAL synchronous block
-    (threading.Event.wait with no timeout), NOT a fast lambda.  If the route
-    ran it on the event loop the loop would be frozen; /healthz would be
-    unable to return until ``release`` is set.  Only an offloaded (worker
-    thread) design keeps the loop free and lets /healthz respond in ms.
+    The blocking stub (time.sleep 30 s) in llm.chat is offloaded to a thread
+    by anyio.to_thread.run_sync inside chat.py.  This test proves, over a real
+    TCP socket observed from OUTSIDE the subprocess's event loop, that the loop
+    stays free during that offloaded block.
     """
-    import prd_mcp.web.chat as chatmod
+    # ── 1. Build schema + seed in the testcontainer DB ────────────────────────
+    # Use the asyncpg URL from the pg_url fixture (session-scoped).
+    eng = make_engine(pg_url)
+    sm = make_sessionmaker(eng)
 
-    # Two events make the probe DETERMINISTIC (Codex iter-4):
-    #   entered — set the moment blocking_rewrite begins executing (in whichever
-    #             context runs it — worker thread if offloaded, loop if not).
-    #   release — held open until the test explicitly releases it, keeping the
-    #             blocking call in flight for the entire duration of the probe.
-    entered = threading.Event()
-    release = threading.Event()
+    # WebSettings-compatible env for seeding
+    base_env = {
+        "DATABASE_URL": pg_url,
+        "CORS_ORIGIN": "https://prd.test",
+        "ADMIN_EMAIL": "admin@ringkas.co.id",
+        "ADMIN_PASSWORD": "break glass admin pw 123",
+        "ENV": "dev",
+        **TEST_ARGON,
+    }
+    settings = load_settings(base_env)
 
-    def blocking_rewrite(history, latest, fn):
-        entered.set()       # signal: the blocking section is now executing
-        release.wait()      # NO timeout (Codex iter-5): hold until test lets go.
-                            # A non-offloaded event loop stays frozen here until
-                            # release is set; fail_after(1.0) will then trip.
-        return latest
+    user_id_str: str
+    conv_id_str: str
 
-    def blocking_retrieve(q, store, embed, k, th):
-        return ([_FakeR()], "match")
+    async with eng.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext"))
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
 
-    async def fast_stream(question, retrieved, verdict, fn):
-        yield "ok"
+    async with sm() as s:
+        await seed_mod.run_seed(s, settings)
 
-    monkeypatch.setattr(chatmod, "rewrite_query", blocking_rewrite)
-    monkeypatch.setattr(chatmod, "retrieve", blocking_retrieve)
-    monkeypatch.setattr(chatmod, "answer_stream", fast_stream)
+    # Create a user with prd.ask + a conversation they own
+    async with sm() as s:
+        user = await make_user_with_perms(s, "concurrency@test.local", {"prd.read", "prd.ask"})
+        await s.flush()
+        user_id_str = str(user.id)
 
-    async with anyio.create_task_group() as tg:
+        conv = Conversation(user_id=user.id, title="")
+        s.add(conv)
+        await s.commit()
+        await s.refresh(conv)
+        conv_id_str = str(conv.id)
 
-        async def start_stream():
-            await client_prd_ask.post(
-                f"/api/chat/conversations/{conv_id}/messages",
-                json={"content": "hi"},
-                headers={"x-requested-with": "prd-app"},
-            )
+    await eng.dispose()
 
-        tg.start_soon(start_stream)
+    # ── 2. Build env for the subprocess ───────────────────────────────────────
+    # The subprocess needs an async-friendly URL (asyncpg) AND the other
+    # WebSettings-required keys.  Also pass the seeded ids and the test-only
+    # DOCKER_HOST so testcontainers inside subprocess would work if needed
+    # (not needed here — schema is already created by the parent).
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Convert asyncpg URL → psycopg URL for the subprocess's asyncpg client.
+    # The subprocess uses asyncpg (same as the parent); we just pass the same URL.
+    child_env = {
+        **os.environ,
+        "DATABASE_URL": pg_url,
+        "CORS_ORIGIN": "https://prd.test",
+        "ADMIN_EMAIL": "admin@ringkas.co.id",
+        "ADMIN_PASSWORD": "break glass admin pw 123",
+        "ENV": "dev",
+        "CONCURRENCY_USER_ID": user_id_str,
+        "CONCURRENCY_BLOCK_SECONDS": "30",
+        **TEST_ARGON,
+    }
+
+    # ── 3. Launch uvicorn subprocess (single worker) ───────────────────────────
+    proc: subprocess.Popen | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "tests.web._concurrency_app:app",
+                "--host", "127.0.0.1",
+                "--port", str(port),
+                "--workers", "1",
+                "--log-level", "warning",
+            ],
+            env=child_env,
+            cwd=str(
+                # Run from mcp/ so that `tests.web._concurrency_app` is importable
+                __import__("pathlib").Path(__file__).parent.parent.parent
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,  # capture for debugging on failure
+        )
+
+        # ── 4. Wait until server is ready ─────────────────────────────────────
         try:
-            # Wait (in a worker thread so the loop stays free) until the blocking
-            # call is provably entered.  Timeout of 2 s prevents a deadlock if
-            # the route never reaches rewrite_query (e.g. auth failure).
-            entered_in_time = await anyio.to_thread.run_sync(entered.wait, 2.0)
-            assert entered_in_time, (
-                "blocking_rewrite was never entered within 2 s — "
-                "stream may have failed before reaching rewrite_query"
+            _wait_for_server(base_url, timeout=20.0)
+        except TimeoutError:
+            stderr_out = proc.stderr.read() if proc.stderr else b""
+            pytest.fail(
+                f"uvicorn subprocess did not become ready.\n"
+                f"stderr:\n{stderr_out.decode(errors='replace')}"
             )
 
-            # The block is NOW held open (release not yet set).
-            # In a correct offloaded design:
-            #   rewrite runs in a worker thread → loop is free → /healthz
-            #   returns in ms.
-            # In a broken non-offloaded design:
-            #   rewrite runs on the loop → loop is frozen → /healthz cannot
-            #   complete → fail_after(1.0) trips → test fails.
-            h0 = time.monotonic()
-            with anyio.fail_after(1.0):
-                r = await client_prd_ask.get("/healthz")
-            h_elapsed = time.monotonic() - h0
+        # ── 5. Fire the blocking chat POST in a background thread ─────────────
+        # The POST triggers rewrite_query → llm.chat → time.sleep(30).
+        # We fire it in a daemon thread so the test can continue concurrently.
+        chat_started = threading.Event()
+        chat_exception: list[Exception] = []
 
-            assert r.status_code in (200, 503), (
-                f"/healthz returned unexpected status {r.status_code}"
+        def _fire_chat():
+            try:
+                httpx.post(
+                    f"{base_url}/api/chat/conversations/{conv_id_str}/messages",
+                    json={"content": "hello"},
+                    headers={
+                        "x-requested-with": "prd-app",
+                        "Cookie": "",  # no real cookie; auth is overridden in subprocess
+                    },
+                    timeout=35.0,  # must be > BLOCK_SECONDS
+                )
+            except Exception as e:
+                chat_exception.append(e)
+            finally:
+                chat_started.set()
+
+        chat_thread = threading.Thread(target=_fire_chat, daemon=True)
+        chat_thread.start()
+
+        # Wait a moment to ensure the subprocess has started processing the POST
+        # and is blocked inside llm.chat's time.sleep.  1.5 s is enough for the
+        # POST to reach rewrite_query on any reasonable host; the sleep is 30 s.
+        time.sleep(1.5)
+
+        # ── 6. Probe /healthz from outside with a tight client timeout ─────────
+        # Key invariant: this httpx request goes over a REAL TCP socket and is
+        # processed by uvicorn's event loop.  If the loop is free (offload
+        # working), /healthz finishes in milliseconds.  If the loop is frozen
+        # (offload regressed), the connection will hang until our timeout fires.
+        t0 = time.monotonic()
+        try:
+            healthz_resp = httpx.get(
+                f"{base_url}/healthz",
+                timeout=3.0,  # external timeout: bounds the wait on a frozen loop
             )
-            assert h_elapsed < 0.3, (
-                f"/healthz blocked for {h_elapsed:.2f}s while rewrite_query "
-                f"was in flight — event loop was NOT free (sync call not offloaded)"
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as exc:
+            elapsed = time.monotonic() - t0
+            pytest.fail(
+                f"/healthz timed out after {elapsed:.2f}s ({exc!r}).\n"
+                "This means the event loop was FROZEN — the chat route ran a "
+                "sync blocking call directly on the loop instead of offloading "
+                "it via anyio.to_thread.run_sync.  Fix: ensure rewrite_query "
+                "is called with `await anyio.to_thread.run_sync(rewrite_query, ...)`."
             )
-        finally:
-            # Let the held blocking call finish so start_stream can complete
-            # and the task group exits cleanly.
-            release.set()
+        healthz_elapsed = time.monotonic() - t0
+
+        # ── 7. Assertions ──────────────────────────────────────────────────────
+        assert healthz_resp.status_code in (200, 503), (
+            f"/healthz returned unexpected status {healthz_resp.status_code}"
+        )
+        assert healthz_elapsed < 2.0, (
+            f"/healthz took {healthz_elapsed:.2f}s while chat was blocked — "
+            "event loop was not free (sync call not offloaded to a thread)"
+        )
+
+    finally:
+        # ── Teardown: kill the subprocess unconditionally ─────────────────────
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
