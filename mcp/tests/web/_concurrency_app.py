@@ -47,6 +47,11 @@ from prd_mcp.web.settings import load_settings
 _DATABASE_URL: str = os.environ["DATABASE_URL"]
 _USER_ID: str = os.environ["CONCURRENCY_USER_ID"]
 BLOCK_SECONDS: float = float(os.environ.get("CONCURRENCY_BLOCK_SECONDS", "30"))
+# Marker file written the instant llm.chat ENTERS its block. The parent waits for
+# this file before probing /healthz, so the probe is synchronized with the block
+# actually being in flight — not a fragile fixed sleep that could false-pass if the
+# POST is slow to arrive or fails before reaching rewrite_query (Codex review).
+_MARKER_FILE: str | None = os.environ.get("CONCURRENCY_MARKER_FILE")
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 _engine = make_engine(_DATABASE_URL)
@@ -78,7 +83,17 @@ class _BlockingLlm:
         lands in a worker thread.  A regression that calls it on the
         event loop directly would freeze uvicorn's single worker and
         make /healthz unreachable over the socket.
+
+        Writes the marker file the instant the block is entered, so the
+        parent test probes /healthz only once the block is provably in
+        flight (Codex review — replaces a fragile fixed sleep).
         """
+        if _MARKER_FILE:
+            try:
+                with open(_MARKER_FILE, "w") as fh:
+                    fh.write("entered")
+            except OSError:
+                pass  # best-effort; parent has a bounded wait either way
         time.sleep(BLOCK_SECONDS)
         return "fake answer"
 

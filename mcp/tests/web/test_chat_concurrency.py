@@ -149,14 +149,25 @@ async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
     async with sm() as s:
         await seed_mod.run_seed(s, settings)
 
-    # Create a user with prd.ask + a conversation they own
+    # Create a user with prd.ask + a conversation they own. Seed PRIOR history so the
+    # next message's rewrite_query actually calls llm.chat (the offloaded blocking
+    # call): rewrite_query short-circuits WITHOUT calling the LLM when history is empty
+    # (the no-LLM-on-first-turn guard, Task 1). An empty conversation would never reach
+    # the block — so we add one prior user+assistant turn.
+    from prd_mcp.web.chatmodels import Message
     async with sm() as s:
         user = await make_user_with_perms(s, "concurrency@test.local", {"prd.read", "prd.ask"})
         await s.flush()
         user_id_str = str(user.id)
 
-        conv = Conversation(user_id=user.id, title="")
+        conv = Conversation(user_id=user.id, title="prior")
         s.add(conv)
+        await s.flush()
+        s.add_all([
+            Message(conversation_id=conv.id, seq=1, role="user", content="earlier question"),
+            Message(conversation_id=conv.id, seq=2, role="assistant", content="earlier answer",
+                    sources=[], grounded=True, finish_reason="complete"),
+        ])
         await s.commit()
         await s.refresh(conv)
         conv_id_str = str(conv.id)
@@ -171,6 +182,12 @@ async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
 
+    # Marker file the subprocess writes the instant llm.chat enters its block.
+    # The parent waits for it (bounded) before probing — synchronizes the probe
+    # with the block being genuinely in flight (Codex review: replaces sleep(1.5)).
+    import tempfile
+    marker_path = os.path.join(tempfile.mkdtemp(prefix="conc-proof-"), "entered")
+
     # Convert asyncpg URL → psycopg URL for the subprocess's asyncpg client.
     # The subprocess uses asyncpg (same as the parent); we just pass the same URL.
     child_env = {
@@ -182,6 +199,7 @@ async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
         "ENV": "dev",
         "CONCURRENCY_USER_ID": user_id_str,
         "CONCURRENCY_BLOCK_SECONDS": "30",
+        "CONCURRENCY_MARKER_FILE": marker_path,
         **TEST_ARGON,
     }
 
@@ -212,10 +230,19 @@ async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
         try:
             _wait_for_server(base_url, timeout=20.0)
         except TimeoutError:
-            stderr_out = proc.stderr.read() if proc.stderr else b""
+            # Codex review: do NOT read stderr while the child is still running —
+            # proc.stderr.read() would block until the pipe closes (i.e. the child
+            # exits), which it may never do → the test hangs instead of failing.
+            # Terminate first, THEN drain stderr via communicate() with a timeout.
+            proc.terminate()
+            try:
+                _, stderr_out = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, stderr_out = proc.communicate(timeout=5)
             pytest.fail(
-                f"uvicorn subprocess did not become ready.\n"
-                f"stderr:\n{stderr_out.decode(errors='replace')}"
+                "uvicorn subprocess did not become ready.\n"
+                f"stderr:\n{(stderr_out or b'').decode(errors='replace')}"
             )
 
         # ── 5. Fire the blocking chat POST in a background thread ─────────────
@@ -243,10 +270,29 @@ async def test_healthz_responds_while_blocking_sync_core_is_in_flight(
         chat_thread = threading.Thread(target=_fire_chat, daemon=True)
         chat_thread.start()
 
-        # Wait a moment to ensure the subprocess has started processing the POST
-        # and is blocked inside llm.chat's time.sleep.  1.5 s is enough for the
-        # POST to reach rewrite_query on any reasonable host; the sleep is 30 s.
-        time.sleep(1.5)
+        # Wait until the subprocess has PROVABLY entered the block (marker file
+        # appears), not a fixed sleep (Codex review). This guarantees the /healthz
+        # probe happens while the block is in flight — no false-pass if the POST is
+        # slow to arrive. Bounded: if the block isn't entered within 10s, something
+        # is wrong (POST failed before rewrite_query, auth error, etc.) → fail.
+        marker_deadline = time.monotonic() + 10.0
+        while time.monotonic() < marker_deadline:
+            if os.path.exists(marker_path):
+                break
+            # If the POST thread already finished WITHOUT entering the block, the
+            # block was never reached — surface that rather than waiting the full 10s.
+            if chat_started.is_set() and not os.path.exists(marker_path):
+                pytest.fail(
+                    "chat POST completed/failed before entering llm.chat — block "
+                    f"never started. POST error: {chat_exception[0] if chat_exception else 'none'}"
+                )
+            time.sleep(0.05)
+        else:
+            pytest.fail(
+                "subprocess did not enter the blocking llm.chat within 10s "
+                f"(marker {marker_path!r} never appeared). "
+                f"POST error: {chat_exception[0] if chat_exception else 'none'}"
+            )
 
         # ── 6. Probe /healthz from outside with a tight client timeout ─────────
         # Key invariant: this httpx request goes over a REAL TCP socket and is
