@@ -21,6 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from prd_mcp.web import db as db_mod
 from prd_mcp.web import sessions as sessions_mod
+from prd_mcp.web.coredeps import set_core
 from prd_mcp.web.errors import AppError
 from prd_mcp.web.ratelimit import RateLimiter
 from prd_mcp.web.security import make_password_hasher
@@ -49,7 +50,7 @@ class HSTSMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True) -> FastAPI:
+def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True, core=None) -> FastAPI:
     app = FastAPI(title="PRD Auth")
     app.state.settings = settings
     app.state.ratelimiter = RateLimiter(settings.rate_limit_per_min)
@@ -117,6 +118,15 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
     app.include_router(auth_router)
     app.include_router(admin_router)
 
+    if core is not None:
+        set_core(app, core)
+        from prd_mcp.web.prd import router as prd_router
+        from prd_mcp.web.chat import router as chat_router
+        from prd_mcp.web.status import router as status_router
+        app.include_router(prd_router)
+        app.include_router(chat_router)
+        app.include_router(status_router)
+
     @app.get("/healthz")
     async def healthz():
         try:
@@ -153,8 +163,10 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True)
 async def _purge_once(sessionmaker) -> None:
     """Run one purge cycle. Called by _purge_loop and directly in tests."""
     try:
+        from prd_mcp.web.chat import sweep_stale_generating
         async with sessionmaker() as s:
             await sessions_mod.purge_expired(s, now=datetime.now(timezone.utc))
+            await sweep_stale_generating(s, now=datetime.now(timezone.utc))
             await s.commit()
     except Exception:
         pass

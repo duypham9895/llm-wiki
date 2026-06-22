@@ -1471,3 +1471,31 @@ git commit -m "test(web): /healthz stays responsive during a slow chat stream (s
 **Plan capped after iter 5 (design verified throughout):** the design + all logic findings were resolved by iter 2; iters 3–5 hardened a single concurrency *test* to be race-free. The remaining adjustments were Codex-prescribed one-line changes to that test's synchronization (now applied). The test's millisecond threshold (`h_elapsed < 0.3`) is tunable at implementation time against the real event loop. Treating Plan A as ready.
 
 **Execution dependency:** Phase 2 merged → Plan B merged → Task 0 preflight → this plan. **Within this plan, run order:** 1, 2, 3, 5, 8, 0.5, 4, 6, 7, 9 (fixtures in 0.5 need coredeps/chatmodels/create_app(core=) from 3/5/8).
+
+---
+
+## Known limitation (implementation, documented during build)
+
+**Chat one-at-a-time lock — residual edge under an adversarial LLM server.** The
+per-conversation `generating` lock is released on every normal/error/disconnect path
+(shielded `finally`), and a stale-lock sweep (`sweep_stale_generating`, run hourly in
+`_purge_once`) self-heals the rare wedge where a client disconnects between the lock
+claim and the SSE generator's first iteration. The sweep cutoff is **6 h**
+(`DEFAULT_SWEEP_CUTOFF_MINUTES = 360`), far above every generation bound:
+
+- async token streaming is hard-bounded by `move_on_after(GENERATION_TIMEOUT_SECONDS = 600 s)`;
+- the offloaded sync calls (`rewrite_query`→`llm.chat`, `retrieve`→`llm.embed`) are bounded
+  in the **common case** by the LLM client's httpx timeout × retries (~255 s on defaults).
+
+The residual edge (raised by Codex's whole-branch review): httpx's `timeout` is
+**per-operation** (connect/read/write/pool), not a total wall-clock deadline — a
+degraded/adversarial server that dribbles bytes could in theory keep one sync call alive
+beyond that common-case bound. Because `anyio.to_thread.run_sync` waits for the worker
+thread (`abandon_on_cancel=False`, deliberately — abandoning leaves detached threads), the
+generation timeout does not forcibly interrupt such a call. **Worst case if it ever
+coincided with a sweep:** a second generation starts on that one conversation after 6 h —
+a benign UX glitch (possibly interleaved messages), self-healed by the next sweep; not data
+loss or a security issue. **Deferred hard fix:** make the LLM client fully async and wrap
+each call in `anyio.fail_after(total_deadline)` for a true wall-clock ceiling — deferred
+because it rewrites the shared sync HTTP path used by the MCP door too. The 6 h cutoff makes
+the edge astronomically unlikely in the meantime.

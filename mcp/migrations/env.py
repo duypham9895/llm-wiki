@@ -11,7 +11,8 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from prd_mcp.web.db import Base
-import prd_mcp.web.models  # noqa: F401
+import prd_mcp.web.models  # noqa: F401  (register auth tables on Base.metadata)
+import prd_mcp.web.chatmodels  # noqa: F401  (register chat tables on Base.metadata)
 
 config = context.config
 if config.config_file_name is not None:
