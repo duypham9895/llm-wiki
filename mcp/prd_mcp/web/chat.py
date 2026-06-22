@@ -31,15 +31,42 @@ router = APIRouter(prefix="/api/chat")
 # move_on_after() below.  The shielded finally then persists a partial assistant
 # row (finish_reason="timeout") and releases the generating lock as normal.
 #
-# INVARIANT: GENERATION_TIMEOUT_SECONDS MUST remain strictly less than the
-# sweep cutoff (sweep_stale_generating's older_than_minutes * 60 = 1800 s).
-# With this bound in place the sweep can ONLY ever reap a generation that has
+# TWO INDEPENDENT BOUNDS protect against a hung generation outliving the sweep:
+#
+#   1. ASYNC parts (answer_stream token loop): bounded by move_on_after()
+#      at GENERATION_TIMEOUT_SECONDS (600 s).  move_on_after uses anyio's
+#      cancel scope — no CancelledError, no detached threads.
+#
+#   2. SYNC offloads (rewrite_query → llm.chat, retrieve → llm.embed):
+#      anyio.to_thread.run_sync defaults to abandon_on_cancel=False, so a
+#      cancelled timeout scope WAITS for the worker thread to finish rather
+#      than abandoning it.  These calls are therefore NOT bounded by
+#      move_on_after — they are bounded instead by the LlmClient's per-request
+#      httpx timeout × max_retries:
+#
+#        worst-case sync duration ≈ request_timeout × (max_retries + 1) + backoff
+#                                 ≈ 60 × 4 + 15 ≈ ~255 s (~4.25 min)
+#
+#      (defaults: REQUEST_TIMEOUT=60 s, MAX_RETRIES=3, backoff capped 5 s/attempt)
+#      The sync calls therefore CANNOT hang indefinitely; they are bounded by the
+#      HTTP client's timeout × retries.  abandon_on_cancel is NOT used to avoid
+#      detached worker threads.
+#
+# INVARIANT: BOTH bounds must remain strictly less than the sweep cutoff
+# (older_than_minutes * 60 = 1800 s by default):
+#
+#   GENERATION_TIMEOUT_SECONDS (600 s)               << sweep cutoff (1800 s)
+#   REQUEST_TIMEOUT × (MAX_RETRIES + 1) (~255 s)     << sweep cutoff (1800 s)
+#
+# OPERATIONAL CONSTRAINT: if REQUEST_TIMEOUT or MAX_RETRIES are raised in
+# config, verify that REQUEST_TIMEOUT × (MAX_RETRIES + 1) remains well below
+# the sweep cutoff.  The 30-min (1800 s) default gives generous headroom over
+# the 60 s / 3-retry defaults.
+#
+# With both bounds in place the sweep can ONLY ever reap a generation that has
 # ALREADY been force-ended and whose lock has ALREADY been released.  A still-
 # running generation can therefore never be reaped by the sweep — the one-at-a-
 # time invariant holds by construction.
-#
-# Typical LLM per-turn timeout is ~60 s (request_timeout on the LLM client);
-# 600 s (10 min) is far above any real stream and far below the 1800 s sweep.
 GENERATION_TIMEOUT_SECONDS: float = 600
 
 
@@ -53,11 +80,15 @@ async def sweep_stale_generating(session, *, older_than_minutes: int = 30, now=N
     sse-starlette first iterating the generator — are swept.
 
     INVARIANT (matches GENERATION_TIMEOUT_SECONDS above):
-    Every generation is force-ended by move_on_after(GENERATION_TIMEOUT_SECONDS)
-    (600 s) and its lock is released before the sweep cutoff (older_than_minutes*60
-    = 1800 s) would ever fire.  This sweep therefore only ever acts on rows whose
-    generation has ALREADY been ended and whose lock has ALREADY been released — it
-    can NEVER interrupt an active generation.
+    Every generation is bounded by TWO independent limits (both << sweep cutoff):
+      - Async parts (token streaming): move_on_after(GENERATION_TIMEOUT_SECONDS=600 s)
+      - Sync offloads (rewrite/retrieve via anyio.to_thread.run_sync, abandon_on_cancel=False):
+        bounded by LlmClient's httpx timeout × max_retries
+        (~REQUEST_TIMEOUT × (MAX_RETRIES+1) ≈ 60×4 = 240 s + backoff ≈ 255 s worst case)
+    Both are far below the sweep cutoff (older_than_minutes*60 = 1800 s).
+    This sweep therefore only ever acts on rows whose generation has ALREADY been
+    ended and whose lock has ALREADY been released — it can NEVER interrupt an
+    active generation.
 
     Does NOT commit; the caller is responsible for committing (mirrors the
     contract used by sessions_mod.purge_expired in _purge_once).

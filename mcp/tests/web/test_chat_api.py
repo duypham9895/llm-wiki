@@ -421,6 +421,89 @@ async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
     assert swept == 0, f"expected rowcount 0, got {swept}"
 
 
+# ---------------------------------------------------------------------------
+# Sync-call bound tests (Codex partial-blocker fix — abandon_on_cancel=False)
+# ---------------------------------------------------------------------------
+#
+# anyio.to_thread.run_sync defaults to abandon_on_cancel=False, so move_on_after
+# does NOT abort in-flight sync calls (rewrite_query / retrieve).  Those calls are
+# bounded instead by LlmClient's httpx timeout × max_retries (~255 s worst case).
+#
+# NUMERIC INVARIANT pinned here so a future config change that inverts the
+# relationship fails CI:
+#
+#   GENERATION_TIMEOUT_SECONDS (600 s)  < sweep cutoff (30 min = 1800 s)
+#   REQUEST_TIMEOUT × (MAX_RETRIES+1)  must also remain < sweep cutoff
+#   (defaults: 60 × 4 = 240 s + backoff ~ 255 s — far below 1800 s)
+#
+def test_generation_timeout_below_sweep_cutoff():
+    """Pin the numeric invariant: GENERATION_TIMEOUT_SECONDS < sweep cutoff (1800 s).
+    Fails if someone raises GENERATION_TIMEOUT_SECONDS past the sweep window."""
+    from prd_mcp.web.chat import GENERATION_TIMEOUT_SECONDS
+    sweep_cutoff_seconds = 30 * 60  # older_than_minutes=30, the default passed everywhere
+    assert GENERATION_TIMEOUT_SECONDS < sweep_cutoff_seconds, (
+        f"GENERATION_TIMEOUT_SECONDS ({GENERATION_TIMEOUT_SECONDS} s) must be strictly less "
+        f"than sweep cutoff ({sweep_cutoff_seconds} s). "
+        "Raising it past the sweep window breaks the one-at-a-time invariant."
+    )
+    # Document the sync-call bound requirement (not runtime-enforceable here because
+    # REQUEST_TIMEOUT/MAX_RETRIES are env-config, but the formula is:
+    #   REQUEST_TIMEOUT × (MAX_RETRIES + 1) must also < sweep_cutoff_seconds
+    # Defaults: 60 × 4 = 240 s + ~15 s backoff ≈ 255 s << 1800 s — fine.
+
+
+@pytest.mark.asyncio
+async def test_slow_but_bounded_sync_call_completes_and_releases_lock(
+    client_prd_ask, conv_id, monkeypatch
+):
+    """A sync call that takes longer than normal (simulating a slow-but-bounded LLM
+    request) must still complete, emit events, and release the lock so a second
+    message succeeds.
+
+    This documents that bounded-but-slow sync calls work correctly without
+    abandon_on_cancel=True: the call finishes in its worker thread; the async
+    generator resumes; the finally block runs; the lock is released.
+
+    The 0.3 s sleep is synthetic — in production the bound comes from httpx's
+    timeout × max_retries (~255 s worst case), not from move_on_after.
+    """
+    import time
+    import prd_mcp.web.chat as chatmod
+
+    def slow_rewrite(history, last_message, fn):
+        time.sleep(0.3)   # simulate bounded-but-slow sync LLM call
+        return last_message
+
+    monkeypatch.setattr(chatmod, "rewrite_query", slow_rewrite)
+    monkeypatch.setattr(chatmod, "retrieve", lambda q, store, embed, k, th: ([_FakeR()], "match"))
+
+    async def _fake_stream(question, retrieved, verdict, fn):
+        for t in ["P", "Q"]:
+            yield t
+
+    monkeypatch.setattr(chatmod, "answer_stream", _fake_stream)
+
+    # 1. Request must complete successfully despite the slow sync call.
+    r = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "slow sync test"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r.status_code == 200, f"POST failed: {r.status_code} {r.text}"
+    assert "event: done" in r.text, "done event missing after slow-sync-call stream"
+
+    # 2. Lock released — second message must succeed (not 409).
+    r2 = await client_prd_ask.post(
+        f"/api/chat/conversations/{conv_id}/messages",
+        json={"content": "after slow sync"},
+        headers={"x-requested-with": "prd-app"},
+    )
+    assert r2.status_code == 200, (
+        f"Second POST returned {r2.status_code} — lock NOT released after slow sync call. "
+        f"Body: {r2.text}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_claim_refreshes_updated_at_so_sweep_spares_active_lock(db, ask_user):
     """Regression (Codex): the stale-sweep keys off updated_at, so the lock CLAIM must
