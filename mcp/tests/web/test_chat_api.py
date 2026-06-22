@@ -432,24 +432,29 @@ async def test_sweep_does_not_clear_recent_generating_lock(db, ask_user):
 # NUMERIC INVARIANT pinned here so a future config change that inverts the
 # relationship fails CI:
 #
-#   GENERATION_TIMEOUT_SECONDS (600 s)  < sweep cutoff (30 min = 1800 s)
+#   GENERATION_TIMEOUT_SECONDS (600 s)  < sweep cutoff (DEFAULT_SWEEP_CUTOFF_MINUTES×60 = 6 h)
 #   REQUEST_TIMEOUT × (MAX_RETRIES+1)  must also remain < sweep cutoff
-#   (defaults: 60 × 4 = 240 s + backoff ~ 255 s — far below 1800 s)
+#   (defaults: 60 × 4 = 240 s + backoff ~ 255 s — far below 21600 s)
+#
+# The 6 h cutoff (raised from 30 min per Codex's whole-branch review) gives huge
+# headroom over both bounds, so even the residual byte-dribble edge on httpx's
+# per-operation timeout can't realistically coincide with a sweep.
 #
 def test_generation_timeout_below_sweep_cutoff():
-    """Pin the numeric invariant: GENERATION_TIMEOUT_SECONDS < sweep cutoff (1800 s).
-    Fails if someone raises GENERATION_TIMEOUT_SECONDS past the sweep window."""
-    from prd_mcp.web.chat import GENERATION_TIMEOUT_SECONDS
-    sweep_cutoff_seconds = 30 * 60  # older_than_minutes=30, the default passed everywhere
+    """Pin the numeric invariant: GENERATION_TIMEOUT_SECONDS < the actual sweep cutoff.
+    References DEFAULT_SWEEP_CUTOFF_MINUTES (not a hardcoded literal) so the test stays
+    truthful if the cutoff is retuned. Fails if someone raises GENERATION_TIMEOUT_SECONDS
+    past the sweep window."""
+    from prd_mcp.web.chat import GENERATION_TIMEOUT_SECONDS, DEFAULT_SWEEP_CUTOFF_MINUTES
+    sweep_cutoff_seconds = DEFAULT_SWEEP_CUTOFF_MINUTES * 60
     assert GENERATION_TIMEOUT_SECONDS < sweep_cutoff_seconds, (
         f"GENERATION_TIMEOUT_SECONDS ({GENERATION_TIMEOUT_SECONDS} s) must be strictly less "
         f"than sweep cutoff ({sweep_cutoff_seconds} s). "
         "Raising it past the sweep window breaks the one-at-a-time invariant."
     )
-    # Document the sync-call bound requirement (not runtime-enforceable here because
-    # REQUEST_TIMEOUT/MAX_RETRIES are env-config, but the formula is:
-    #   REQUEST_TIMEOUT × (MAX_RETRIES + 1) must also < sweep_cutoff_seconds
-    # Defaults: 60 × 4 = 240 s + ~15 s backoff ≈ 255 s << 1800 s — fine.
+    # Sync-call common-case bound REQUEST_TIMEOUT × (MAX_RETRIES+1) ≈ 255 s must also
+    # stay below the cutoff (env-config, so documented not runtime-asserted here):
+    assert 60 * 4 < sweep_cutoff_seconds  # default REQUEST_TIMEOUT×(MAX_RETRIES+1)
 
 
 @pytest.mark.asyncio

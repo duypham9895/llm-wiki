@@ -31,64 +31,68 @@ router = APIRouter(prefix="/api/chat")
 # move_on_after() below.  The shielded finally then persists a partial assistant
 # row (finish_reason="timeout") and releases the generating lock as normal.
 #
-# TWO INDEPENDENT BOUNDS protect against a hung generation outliving the sweep:
+# Two bounds protect against a hung generation outliving the stale-lock sweep:
 #
-#   1. ASYNC parts (answer_stream token loop): bounded by move_on_after()
+#   1. ASYNC parts (answer_stream token loop): HARD-bounded by move_on_after()
 #      at GENERATION_TIMEOUT_SECONDS (600 s).  move_on_after uses anyio's
 #      cancel scope — no CancelledError, no detached threads.
 #
 #   2. SYNC offloads (rewrite_query → llm.chat, retrieve → llm.embed):
-#      anyio.to_thread.run_sync defaults to abandon_on_cancel=False, so a
-#      cancelled timeout scope WAITS for the worker thread to finish rather
-#      than abandoning it.  These calls are therefore NOT bounded by
-#      move_on_after — they are bounded instead by the LlmClient's per-request
-#      httpx timeout × max_retries:
+#      anyio.to_thread.run_sync defaults to abandon_on_cancel=False, so the
+#      timeout scope WAITS for the worker thread rather than abandoning it.
+#      These are therefore NOT bounded by move_on_after; they are bounded by
+#      the LlmClient's httpx timeout × max_retries, COMMON-case:
 #
-#        worst-case sync duration ≈ request_timeout × (max_retries + 1) + backoff
-#                                 ≈ 60 × 4 + 15 ≈ ~255 s (~4.25 min)
+#        common-case sync duration ≈ request_timeout × (max_retries + 1) + backoff
+#                                  ≈ 60 × 4 + 15 ≈ ~255 s   (defaults)
 #
-#      (defaults: REQUEST_TIMEOUT=60 s, MAX_RETRIES=3, backoff capped 5 s/attempt)
-#      The sync calls therefore CANNOT hang indefinitely; they are bounded by the
-#      HTTP client's timeout × retries.  abandon_on_cancel is NOT used to avoid
-#      detached worker threads.
+#      RESIDUAL EDGE (Codex whole-branch review): httpx's `timeout` is
+#      PER-OPERATION (connect/read/write/pool), NOT a total wall-clock deadline.
+#      A degraded/adversarial server that dribbles bytes — resetting the read
+#      timer before each read elapses — can in theory keep one httpx call alive
+#      far longer than request_timeout.  So the sync bound is the realistic
+#      common case, not a provable hard ceiling.  abandon_on_cancel is NOT used
+#      (it would leave detached worker threads with no correctness gain), and
+#      making the LLM client fully-async with a total fail_after deadline is a
+#      deferred follow-up (it would rewrite the shared sync HTTP path used by the
+#      MCP door too).
 #
-# INVARIANT: BOTH bounds must remain strictly less than the sweep cutoff
-# (older_than_minutes * 60 = 1800 s by default):
+# MITIGATION: the sweep cutoff is set FAR above any plausible generation lifetime
+# (DEFAULT_SWEEP_CUTOFF_MINUTES = 360 = 6 h), so even the byte-dribble edge is
+# astronomically unlikely to coincide with a sweep.  And the blast radius if it
+# ever did: a SECOND generation could start on one conversation after 6 h — a
+# benign UX glitch (possibly interleaved messages), NOT data loss or a security
+# issue, and the next sweep cleans it up.  This is documented as a known
+# limitation in the Phase-3 spec.
 #
-#   GENERATION_TIMEOUT_SECONDS (600 s)               << sweep cutoff (1800 s)
-#   REQUEST_TIMEOUT × (MAX_RETRIES + 1) (~255 s)     << sweep cutoff (1800 s)
-#
-# OPERATIONAL CONSTRAINT: if REQUEST_TIMEOUT or MAX_RETRIES are raised in
-# config, verify that REQUEST_TIMEOUT × (MAX_RETRIES + 1) remains well below
-# the sweep cutoff.  The 30-min (1800 s) default gives generous headroom over
-# the 60 s / 3-retry defaults.
-#
-# With both bounds in place the sweep can ONLY ever reap a generation that has
-# ALREADY been force-ended and whose lock has ALREADY been released.  A still-
-# running generation can therefore never be reaped by the sweep — the one-at-a-
-# time invariant holds by construction.
+# INVARIANT (pinned by test_generation_timeout_below_sweep_cutoff):
+#   GENERATION_TIMEOUT_SECONDS (600 s) << sweep cutoff (DEFAULT_SWEEP_CUTOFF_MINUTES×60).
+# OPERATIONAL CONSTRAINT: keep REQUEST_TIMEOUT × (MAX_RETRIES+1) well below the
+# sweep cutoff if you raise them in config.
 GENERATION_TIMEOUT_SECONDS: float = 600
+DEFAULT_SWEEP_CUTOFF_MINUTES: int = 360  # 6 h — far above any plausible stream
 
 
-async def sweep_stale_generating(session, *, older_than_minutes: int = 30, now=None) -> int:
+async def sweep_stale_generating(
+    session, *, older_than_minutes: int = DEFAULT_SWEEP_CUTOFF_MINUTES, now=None
+) -> int:
     """Clear generating=True on conversations whose updated_at is stale.
 
-    A healthy SSE stream bumps updated_at when it persists the user row and again
-    when it releases the lock in the finally block.  30 minutes (default) is far
-    longer than any real stream, so only genuinely-wedged locks — caused by a
-    rare client disconnect in the gap between the lock-claim commit and
-    sse-starlette first iterating the generator — are swept.
+    A healthy SSE stream bumps updated_at on claim and again on release. The
+    cutoff (DEFAULT_SWEEP_CUTOFF_MINUTES = 360 = 6 h) is far longer than any real
+    stream, so only genuinely-wedged locks are swept — primarily the rare client
+    disconnect in the gap between the lock-claim commit and sse-starlette first
+    iterating the generator.
 
-    INVARIANT (matches GENERATION_TIMEOUT_SECONDS above):
-    Every generation is bounded by TWO independent limits (both << sweep cutoff):
-      - Async parts (token streaming): move_on_after(GENERATION_TIMEOUT_SECONDS=600 s)
-      - Sync offloads (rewrite/retrieve via anyio.to_thread.run_sync, abandon_on_cancel=False):
-        bounded by LlmClient's httpx timeout × max_retries
-        (~REQUEST_TIMEOUT × (MAX_RETRIES+1) ≈ 60×4 = 240 s + backoff ≈ 255 s worst case)
-    Both are far below the sweep cutoff (older_than_minutes*60 = 1800 s).
-    This sweep therefore only ever acts on rows whose generation has ALREADY been
-    ended and whose lock has ALREADY been released — it can NEVER interrupt an
-    active generation.
+    BOUNDS (see GENERATION_TIMEOUT_SECONDS above): the async token loop is HARD-
+    bounded by move_on_after(600 s); the sync offloads (rewrite/retrieve) are
+    bounded in the COMMON case by the LlmClient httpx timeout × retries (~255 s).
+    The known residual edge — httpx's per-operation timeout is not a total
+    wall-clock deadline, so a byte-dribbling server could in theory exceed that —
+    is why the cutoff is 6 h, not minutes: even the edge is astronomically
+    unlikely to coincide with a sweep, and if it ever did the only effect is a
+    second generation starting on one conversation (benign, self-healing). See
+    the Phase-3 spec's known-limitations.
 
     Does NOT commit; the caller is responsible for committing (mirrors the
     contract used by sessions_mod.purge_expired in _purge_once).
