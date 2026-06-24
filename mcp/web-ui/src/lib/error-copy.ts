@@ -1,8 +1,13 @@
 import { ApiError } from './api';
 
 export const ERROR_COPY: Record<string, string> = {
+  admin_pair: 'A role must grant the admin capability fully or not at all (it pairs user and role management).',
   conversation_busy: 'A response is already being generated in this conversation.',
   default: 'Something went wrong. Please try again.',
+  invalid_credentials: 'Email or password is incorrect.',
+  last_admin: 'This would leave the system with no active admin. Add another admin first.',
+  role_in_use: 'This role is still assigned to users. Reassign them before deleting it.',
+  system_role_immutable: "Built-in roles (admin, member) can't be edited or deleted.",
 };
 
 export function copyForError(err: unknown): string {

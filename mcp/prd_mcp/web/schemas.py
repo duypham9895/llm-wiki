@@ -39,6 +39,7 @@ class RoleOut(BaseModel):
 
 
 class PermissionOut(BaseModel):
+    id: uuid.UUID
     name: str
     description: str
 

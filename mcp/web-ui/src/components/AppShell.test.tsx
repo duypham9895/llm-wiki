@@ -21,7 +21,8 @@ describe('AppShell nav', () => {
     expect(libraryLink).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('link', { name: 'Ask' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Status' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: 'Users' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Approvals' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Directory' })).not.toBeInTheDocument();
   });
 
   it('shows admin sections for an admin', async () => {
@@ -31,7 +32,9 @@ describe('AppShell nav', () => {
       },
     });
 
-    expect(await screen.findByRole('link', { name: 'Users' })).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: 'Approvals' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Directory' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Roles' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Settings' })).toBeInTheDocument();
   });
 
@@ -40,19 +43,19 @@ describe('AppShell nav', () => {
       <Routes>
         <Route element={<AppShell />}>
           <Route
-            path="/admin/users"
+            path="/admin/directory"
             element={
               <RequirePermission perm="users.manage">
-                <h1>User management</h1>
+                <h1>Directory</h1>
               </RequirePermission>
             }
           />
         </Route>
       </Routes>,
-      { me: { permissions: ['prd.read'] }, route: '/admin/users' },
+      { me: { permissions: ['prd.read'] }, route: '/admin/directory' },
     );
 
     expect(await screen.findByText('Not authorized.')).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'User management' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Directory' })).not.toBeInTheDocument();
   });
 });

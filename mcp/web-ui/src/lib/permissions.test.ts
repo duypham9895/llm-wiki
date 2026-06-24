@@ -19,6 +19,27 @@ describe('visibleSections', () => {
     ]);
   });
 
+  it('shows the admin Manage entries for full admins', () => {
+    const manage = visibleSections(['users.manage', 'roles.manage']).find((section) => section.group === 'Manage');
+
+    expect(manage?.items.map((item) => item.label)).toEqual(['Approvals', 'Directory', 'Roles', 'Settings']);
+    expect(manage?.items.map((item) => item.path)).toEqual([
+      '/admin/approvals',
+      '/admin/directory',
+      '/admin/roles',
+      '/admin/settings',
+    ]);
+  });
+
+  it('hides every Manage entry from members', () => {
+    const groups = visibleSections(['prd.read', 'prd.ask']);
+
+    expect(groups.find((section) => section.group === 'Manage')).toBeUndefined();
+    expect(groups.flatMap((section) => section.items.map((item) => item.label))).not.toEqual(
+      expect.arrayContaining(['Approvals', 'Directory', 'Roles', 'Settings', 'Users']),
+    );
+  });
+
   it('drops empty groups', () => {
     expect(groupNames(['status.view'])).toEqual(['Operate']);
   });

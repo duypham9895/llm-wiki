@@ -12,9 +12,10 @@ import { AskPage } from './pages/AskPage';
 import { LibraryPage } from './pages/LibraryPage';
 import { SearchPage } from './pages/SearchPage';
 import { StatusPage } from './pages/StatusPage';
+import { ApprovalsPage } from './pages/admin/ApprovalsPage';
+import { DirectoryPage } from './pages/admin/DirectoryPage';
 import { RolesPage } from './pages/admin/RolesPage';
 import { SettingsPage } from './pages/admin/SettingsPage';
-import { UsersPage } from './pages/admin/UsersPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -69,13 +70,22 @@ createRoot(document.getElementById('root')!).render(
                 }
               />
               <Route
-                path="admin/users"
+                path="admin/approvals"
                 element={
                   <RequirePermission perm="users.manage">
-                    <UsersPage />
+                    <ApprovalsPage />
                   </RequirePermission>
                 }
               />
+              <Route
+                path="admin/directory"
+                element={
+                  <RequirePermission perm="users.manage">
+                    <DirectoryPage />
+                  </RequirePermission>
+                }
+              />
+              <Route path="admin/users" element={<Navigate to="/admin/directory" replace />} />
               <Route
                 path="admin/roles"
                 element={
