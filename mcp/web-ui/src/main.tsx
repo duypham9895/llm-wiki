@@ -19,6 +19,7 @@ import { UsersPage } from './pages/admin/UsersPage';
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
+      refetchOnWindowFocus: false,
       retry: (failureCount, err) => {
         if (err instanceof ApiError && err.status < 500) return false;
         return failureCount < 2;
