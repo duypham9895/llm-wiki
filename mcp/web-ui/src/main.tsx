@@ -1,11 +1,100 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 
-import App from './App';
+import { AppShell } from './components/AppShell';
+import { RequirePermission } from './components/RequirePermission';
 import './index.css';
+import { ApiError } from './lib/api';
+import { AuthProvider } from './lib/auth';
+import { AskPage } from './pages/AskPage';
+import { LibraryPage } from './pages/LibraryPage';
+import { SearchPage } from './pages/SearchPage';
+import { StatusPage } from './pages/StatusPage';
+import { RolesPage } from './pages/admin/RolesPage';
+import { SettingsPage } from './pages/admin/SettingsPage';
+import { UsersPage } from './pages/admin/UsersPage';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, err) => {
+        if (err instanceof ApiError && err.status < 500) return false;
+        return failureCount < 2;
+      },
+    },
+  },
+});
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <AuthProvider fallback={<p>Loading</p>} onUnauthenticated={<p>Please sign in</p>}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<Navigate to="/library" replace />} />
+              <Route
+                path="library"
+                element={
+                  <RequirePermission perm="prd.read">
+                    <LibraryPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="search"
+                element={
+                  <RequirePermission perm="prd.read">
+                    <SearchPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="ask"
+                element={
+                  <RequirePermission perm="prd.ask">
+                    <AskPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="status"
+                element={
+                  <RequirePermission perm="status.view">
+                    <StatusPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="admin/users"
+                element={
+                  <RequirePermission perm="users.manage">
+                    <UsersPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="admin/roles"
+                element={
+                  <RequirePermission perm="roles.manage">
+                    <RolesPage />
+                  </RequirePermission>
+                }
+              />
+              <Route
+                path="admin/settings"
+                element={
+                  <RequirePermission perm="roles.manage">
+                    <SettingsPage />
+                  </RequirePermission>
+                }
+              />
+            </Route>
+          </Routes>
+        </AuthProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
   </StrictMode>,
 );
