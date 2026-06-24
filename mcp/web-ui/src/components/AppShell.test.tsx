@@ -55,7 +55,7 @@ describe('AppShell nav', () => {
       { me: { permissions: ['prd.read'] }, route: '/admin/directory' },
     );
 
-    expect(await screen.findByText('Not authorized.')).toBeInTheDocument();
+    expect(await screen.findByText(/access to this page/i)).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Directory' })).not.toBeInTheDocument();
   });
 });

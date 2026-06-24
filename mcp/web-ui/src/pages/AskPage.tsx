@@ -307,14 +307,14 @@ export function AskPage() {
             <div className="grid min-h-[28rem] place-items-center rounded-md border border-dashed p-8 text-center">
               <div>
                 <h2 className="text-lg font-semibold">Select or create a conversation.</h2>
-                <p className="mt-2 text-sm text-muted-foreground">Ask questions after choosing a thread.</p>
+                <p className="mt-2 text-sm text-muted-foreground">Ask questions after choosing a conversation.</p>
               </div>
             </div>
           ) : (
             <div className="flex min-h-[28rem] flex-col gap-4">
               <div className="flex items-start justify-between gap-4 border-b pb-4">
                 <div>
-                  <p className="text-sm font-medium text-muted-foreground">Thread</p>
+                  <p className="text-sm font-medium text-muted-foreground">Conversation</p>
                   <h2 className="text-lg font-semibold">{detailQuery.data?.title ?? 'Conversation'}</h2>
                 </div>
                 {detailQuery.isFetching ? <Loader2 className="mt-1 size-4 animate-spin text-muted-foreground" /> : null}
@@ -325,7 +325,7 @@ export function AskPage() {
               <div className="flex-1 space-y-4">
                 {renderedMessages.length === 0 && !detailQuery.isLoading ? (
                   <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                    No messages yet. Send a question to start the thread.
+                    No messages yet. Send a question to start the conversation.
                   </div>
                 ) : null}
                 {renderedMessages.map((message) => (

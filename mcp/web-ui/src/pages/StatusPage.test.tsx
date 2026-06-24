@@ -137,6 +137,6 @@ describe('StatusPage', () => {
     renderWithProviders(<StatusPage />, { me: { permissions: ['status.view'] } });
 
     expect(await screen.findByText(/200 \/ 287 enriched/i)).toBeInTheDocument();
-    expect(screen.getByText(/87 unenriched/i)).toBeInTheDocument();
+    expect(screen.getByText(/87 not yet processed/i)).toBeInTheDocument();
   });
 });

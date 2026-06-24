@@ -126,7 +126,7 @@ export function StatusPage() {
           <h2 className="mt-1 text-xl font-semibold">
             {coverage.enriched} / {coverage.total} enriched
           </h2>
-          <p className="mt-2 text-sm text-muted-foreground">{coverage.unenriched} unenriched.</p>
+          <p className="mt-2 text-sm text-muted-foreground">{coverage.unenriched} not yet processed.</p>
         </article>
       ) : null}
 

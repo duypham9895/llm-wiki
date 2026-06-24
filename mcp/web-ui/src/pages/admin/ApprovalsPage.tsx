@@ -100,7 +100,7 @@ export function ApprovalsPage() {
 
       {pendingUsers.isSuccess && users.length === 0 ? (
         <div className="rounded-lg border border-dashed p-8 text-center">
-          <h2 className="text-lg font-semibold">No pending users</h2>
+          <h2 className="text-lg font-semibold">No pending approvals</h2>
           <p className="mt-2 text-sm text-muted-foreground">New registration requests appear here.</p>
         </div>
       ) : null}

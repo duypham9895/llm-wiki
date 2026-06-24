@@ -130,7 +130,10 @@ export function SettingsPage() {
               ))}
             </ul>
           ) : (
-            <p className="text-sm text-muted-foreground">No domains restricted.</p>
+            <p className="text-sm text-muted-foreground">
+              No allowed domains added. With registration on, no email can match — add at least one domain to allow
+              sign-ups.
+            </p>
           )}
         </div>
 

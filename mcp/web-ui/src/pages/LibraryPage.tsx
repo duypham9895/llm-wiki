@@ -197,7 +197,7 @@ export function LibraryPage() {
             <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="text-sm font-medium text-muted-foreground">PRD reader</p>
-                <h2 id="prd-reader-title" className="text-xl font-semibold">{detailQuery.data?.title ?? 'Loading PRD'}</h2>
+                <h2 id="prd-reader-title" className="text-xl font-semibold">{detailQuery.data?.title ?? 'Loading…'}</h2>
               </div>
               <button
                 aria-label="Close PRD reader"

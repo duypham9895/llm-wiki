@@ -6,7 +6,7 @@ export function RequirePermission({ perm, children }: { perm: string; children: 
   const permitted = useHasPermission(perm);
 
   if (!permitted) {
-    return <p>Not authorized.</p>;
+    return <p>You don't have access to this page.</p>;
   }
 
   return children;
