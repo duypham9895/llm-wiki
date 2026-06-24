@@ -63,6 +63,7 @@ export function ApprovalsPage() {
     onSuccess: () => {
       setMessage(null);
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users', 'pending'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });

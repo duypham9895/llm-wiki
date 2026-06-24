@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 
 import { ApiError, apiFetch } from '../lib/api';
+import { type Me } from '../lib/auth';
 import { ERROR_COPY } from '../lib/error-copy';
 
 export function Login() {
@@ -19,7 +20,8 @@ export function Login() {
     setIsSubmitting(true);
 
     try {
-      await apiFetch('/auth/login', { method: 'POST', body: { email, password } });
+      const data = await apiFetch<{ user: Me }>('/auth/login', { method: 'POST', body: { email, password } });
+      queryClient.setQueryData(['me'], data.user);
       await queryClient.invalidateQueries({ queryKey: ['me'] });
       navigate('/');
     } catch (err) {

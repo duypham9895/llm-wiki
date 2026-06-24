@@ -76,7 +76,11 @@ export function SearchPage() {
   const canShowSemanticEmpty = isSemanticNoMatch;
 
   if (import.meta.env.DEV && searchQuery.data?.verdict === 'no_match' && (searchQuery.data?.results?.length ?? 0) > 0) {
-    console.warn('[SearchPage] suppressed non-empty results due to no_match verdict', searchQuery.data);
+    const data = searchQuery.data;
+    console.warn('[SearchPage] suppressed non-empty results on no_match', {
+      count: data.count,
+      ids: data.results.map((r) => r.id),
+    });
   }
 
   return (

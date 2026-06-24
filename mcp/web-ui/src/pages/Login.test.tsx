@@ -62,7 +62,16 @@ describe('Login', () => {
   it('invalidates the current user query after successful login', async () => {
     server.use(
       http.post('/api/auth/login', () =>
-        HttpResponse.json({ user: { id: 1, email: 'a@b.com', name: 'A', role: 'viewer' } }),
+        HttpResponse.json({
+          user: {
+            id: 'u1',
+            email: 'a@b.co',
+            status: 'active',
+            roles: [],
+            permissions: ['prd.read'],
+            created_at: '2026-06-24T00:00:00Z',
+          },
+        }),
       ),
     );
     const { queryClient } = renderLogin(<Login />);

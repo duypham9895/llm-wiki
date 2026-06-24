@@ -236,7 +236,7 @@ export function AskPage() {
 
   const conversations = conversationsQuery.data ?? [];
   const hasNoConversations = conversationsQuery.isSuccess && conversations.length === 0;
-  const canSend = selectedId !== null && !isStreaming;
+  const canSend = selectedId !== null && !isStreaming && input.trim().length > 0;
 
   return (
     <section className="space-y-6">

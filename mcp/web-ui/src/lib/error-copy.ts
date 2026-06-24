@@ -6,6 +6,7 @@ export const ERROR_COPY: Record<string, string> = {
   default: 'Something went wrong. Please try again.',
   invalid_credentials: 'Email or password is incorrect.',
   last_admin: 'This would leave the system with no active admin. Add another admin first.',
+  role_exists: 'A role with that name already exists. Choose a different name.',
   role_in_use: 'This role is still assigned to users. Reassign them before deleting it.',
   system_role_immutable: "Built-in roles (admin, member) can't be edited or deleted.",
 };

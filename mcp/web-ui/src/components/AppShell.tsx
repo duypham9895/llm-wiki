@@ -22,6 +22,7 @@ export function AppShell() {
       // Local auth state is refreshed below even if the logout request fails.
     } finally {
       try {
+        queryClient.setQueryData(['me'], null);
         await queryClient.invalidateQueries({ queryKey: ['me'] });
       } finally {
         setIsSigningOut(false);

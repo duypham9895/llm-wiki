@@ -62,7 +62,7 @@ describe('AskPage', () => {
     expect(screen.getByText('EP-457')).toBeInTheDocument();
   });
 
-  it('disables Send while streaming, re-enables after', async () => {
+  it('disables Send while streaming and requires a new message after', async () => {
     let resolveStream: (() => void) | undefined;
     vi.spyOn(sse, 'streamChat').mockImplementation(
       (_convId, _content, handlers) =>
@@ -84,6 +84,8 @@ describe('AskPage', () => {
       resolveStream?.();
     });
     expect(await screen.findByText(/done/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: /send/i })).toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox', { name: /message/i }), { target: { value: 'next question' } });
     await waitFor(() => expect(screen.getByRole('button', { name: /send/i })).not.toBeDisabled());
   });
 
@@ -100,7 +102,7 @@ describe('AskPage', () => {
     expect(screen.queryByText('conversation_busy')).not.toBeInTheDocument();
   });
 
-  it('shows friendly busy message from stream onError and re-enables Send', async () => {
+  it('shows friendly busy message from stream onError and requires a new message', async () => {
     vi.spyOn(sse, 'streamChat').mockImplementation(async (_convId, _content, handlers) => {
       handlers.onError?.('conversation_busy');
     });
@@ -112,6 +114,8 @@ describe('AskPage', () => {
     expect(
       await screen.findByText('A response is already being generated in this conversation.'),
     ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: /send/i })).toBeDisabled());
+    fireEvent.change(screen.getByRole('textbox', { name: /message/i }), { target: { value: 'retry' } });
     await waitFor(() => expect(screen.getByRole('button', { name: /send/i })).not.toBeDisabled());
   });
 

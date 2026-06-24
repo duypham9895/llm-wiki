@@ -81,6 +81,7 @@ export function DirectoryPage() {
       setMessage(null);
       setSuccess(null);
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });
@@ -95,6 +96,7 @@ export function DirectoryPage() {
       setMessage(null);
       setSuccess('Roles updated.');
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });

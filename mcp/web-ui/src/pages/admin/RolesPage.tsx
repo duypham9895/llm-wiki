@@ -92,6 +92,7 @@ export function RolesPage() {
       setCreateName('');
       setCreatePermissions([]);
       void queryClient.invalidateQueries({ queryKey: ['admin', 'roles'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });
@@ -106,6 +107,7 @@ export function RolesPage() {
       setMessage(null);
       setEditingRole(null);
       void queryClient.invalidateQueries({ queryKey: ['admin', 'roles'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });
@@ -115,6 +117,7 @@ export function RolesPage() {
     onSuccess: () => {
       setMessage(null);
       void queryClient.invalidateQueries({ queryKey: ['admin', 'roles'] });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
     onError: (err) => setMessage(copyForError(err)),
   });

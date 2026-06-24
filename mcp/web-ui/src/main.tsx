@@ -103,6 +103,7 @@ createRoot(document.getElementById('root')!).render(
                   </RequirePermission>
                 }
               />
+              <Route path="*" element={<Navigate to="/library" replace />} />
             </Route>
           </Routes>
         </AuthProvider>
