@@ -6,10 +6,14 @@
 :80 {
     encode zstd gzip
 
-    # API + healthcheck are reverse-proxied to the backend. We MUST use explicit
-    # handle blocks here so they match BEFORE try_files/file_server can rewrite
-    # the path to /index.html (which would otherwise swallow /api/* requests
-    # into the SPA shell, causing 405 on POST /api/auth/login etc.).
+    # All paths flow through handle blocks. Explicit handles win first; the
+    # catch-all `handle` at the bottom serves the SPA with try_files fallback
+    # for client-side routes (/library, /ask, etc.).
+    #
+    # Why handle blocks? Without them, `try_files` at the site level runs
+    # BEFORE any reverse_proxy matcher and rewrites unknown paths to
+    # /index.html, swallowing /api/* requests (returning 405 on POST because
+    # the rewritten path doesn't match any API matcher).
 
     # SSE/streaming — disable buffering so chat tokens flush as they arrive.
     # Real path is POST /api/chat/conversations/{cid}/messages (sse_starlette.EventSourceResponse).
@@ -28,9 +32,10 @@
         reverse_proxy prd-app:8300
     }
 
-    # Everything else: static SPA (volume-mounted at /srv). try_files makes
-    # client-side routes like /library resolve to index.html.
-    root * /srv
-    try_files {path} /index.html
-    file_server
+    # Catch-all: SPA static files with try_files fallback for client-side routes.
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
 }
