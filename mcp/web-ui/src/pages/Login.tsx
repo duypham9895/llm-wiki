@@ -1,10 +1,16 @@
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { BookOpen, KeyRound, Mail } from 'lucide-react';
 
-import { ApiError, apiFetch } from '../lib/api';
-import { type Me } from '../lib/auth';
-import { ERROR_COPY } from '../lib/error-copy';
+import { ApiError, apiFetch } from '@/lib/api';
+import { type Me } from '@/lib/auth';
+import { ERROR_COPY } from '@/lib/error-copy';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 
 export function Login() {
   const queryClient = useQueryClient();
@@ -36,63 +42,83 @@ export function Login() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-4 py-10 text-foreground">
-      <form
-        aria-label="Sign in"
-        className="w-full max-w-sm space-y-5 rounded-lg border bg-card p-6 shadow-sm"
-        onSubmit={onSubmit}
-      >
-        <div className="space-y-1">
-          <h1 className="text-xl font-semibold">Sign in</h1>
-          <p className="text-sm text-muted-foreground">Use your LLM Wiki account.</p>
-        </div>
+    <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground">
+      {/* Subtle radial accent — gives the page some life without being loud. */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(ellipse_at_top,color-mix(in_oklch,var(--primary)_18%,transparent),transparent_60%)]"
+      />
 
-        <div className="space-y-2">
-          <label className="text-sm font-medium" htmlFor="login-email">
-            Email
-          </label>
-          <input
-            autoComplete="email"
-            className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none focus:border-ring"
-            id="login-email"
-            name="email"
-            onChange={(event) => setEmail(event.target.value)}
-            required
-            type="email"
-            value={email}
-          />
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-sm font-medium" htmlFor="login-password">
-            Password
-          </label>
-          <input
-            autoComplete="current-password"
-            className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none focus:border-ring"
-            id="login-password"
-            name="password"
-            onChange={(event) => setPassword(event.target.value)}
-            required
-            type="password"
-            value={password}
-          />
-        </div>
-
-        {error ? (
-          <p className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            {error}
-          </p>
-        ) : null}
-
-        <button
-          className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
-          disabled={isSubmitting}
-          type="submit"
+      <div className="w-full max-w-sm space-y-6">
+        <Link
+          to="/library"
+          className="mx-auto flex w-fit items-center gap-2 text-sm font-semibold tracking-tight text-foreground"
         >
-          {isSubmitting ? 'Signing in...' : 'Sign in'}
-        </button>
-      </form>
+          <span className="rounded-md bg-primary/15 p-1.5 text-primary">
+            <BookOpen className="h-4 w-4" />
+          </span>
+          LLM Wiki
+        </Link>
+
+        <Card className="shadow-md">
+          <CardHeader className="space-y-1">
+            <CardTitle className="text-xl">Sign in</CardTitle>
+            <CardDescription>Use your LLM Wiki account.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form className="space-y-4" onSubmit={onSubmit}>
+              <div className="space-y-1.5">
+                <Label htmlFor="login-email">Email</Label>
+                <div className="relative">
+                  <Mail className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    autoComplete="email"
+                    className="pl-8"
+                    id="login-email"
+                    name="email"
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="you@company.com"
+                    required
+                    type="email"
+                    value={email}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="login-password">Password</Label>
+                <div className="relative">
+                  <KeyRound className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    autoComplete="current-password"
+                    className="pl-8"
+                    id="login-password"
+                    name="password"
+                    onChange={(event) => setPassword(event.target.value)}
+                    required
+                    type="password"
+                    value={password}
+                  />
+                </div>
+              </div>
+
+              {error && (
+                <Alert variant="destructive">
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+
+              <Button className="w-full" disabled={isSubmitting} type="submit">
+                {isSubmitting ? 'Signing in…' : 'Sign in'}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+
+        <p className="text-center text-xs text-muted-foreground">
+          New here? Ask your admin to invite you.
+        </p>
+      </div>
     </main>
   );
 }
