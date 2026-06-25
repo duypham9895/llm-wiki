@@ -3,7 +3,7 @@
     auto_https off
 }
 
-{$HOSTNAME} {
+:80 {
     encode zstd gzip
 
     # SSE/streaming — disable buffering so chat tokens flush as they arrive.
