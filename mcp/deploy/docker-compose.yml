@@ -8,21 +8,89 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - prd_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prd_app -d prd_auth"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     networks: [prd_net]
 
   prd-app:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ghcr.io/duypham9895/llm-wiki/app:${IMAGE_TAG}
     restart: unless-stopped
     env_file: .env
-    depends_on: [prd-postgres]
+    depends_on:
+      prd-postgres: { condition: service_healthy }
     ports:
-      - "127.0.0.1:8300:8300"   # host loopback only; Caddy reverse-proxies here
+      - "127.0.0.1:8300:8300"
+    volumes:
+      - prd_vault:/data/vault
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [prd_net]
+
+  prd-ui-build:
+    image: ghcr.io/duypham9895/llm-wiki/webui:${IMAGE_TAG}
+    command: ["sh", "-c", "cp -r /srv/. /srv_out/ && echo built"]
+    volumes:
+      - prd_ui_dist:/srv_out
+    restart: "no"
+    networks: [prd_net]
+
+  prd-caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: .env
+    environment:
+      HOSTNAME: ${HOSTNAME}
+      CADDY_EMAIL: ${CADDY_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - prd_ui_dist:/srv:ro
+      - prd_caddy_data:/data
+      - prd_caddy_config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      prd-app: { condition: service_healthy }
+    networks: [prd_net]
+
+  prd-backup:
+    image: alpine:3.20
+    restart: unless-stopped
+    env_file: .env
+    command: ["sh", "/usr/local/bin/entrypoint.sh"]
+    volumes:
+      - ./backup/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      - ./backup/backup.sh:/usr/local/bin/backup.sh:ro
+      - prd_backups:/backups
+    networks: [prd_net]
+
+  prd-deployer:
+    build: ./deployer
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./.env:/app/.env:rw
+      - prd_deployer_state:/state
+      - /var/run/docker.sock:/var/run/docker.sock
     networks: [prd_net]
 
 volumes:
   prd_pgdata:
+  prd_vault:
+  prd_ui_dist:
+  prd_backups:
+  prd_caddy_data:
+  prd_caddy_config:
+  prd_deployer_state:
 
 networks:
   prd_net:

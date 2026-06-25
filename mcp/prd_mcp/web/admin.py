@@ -209,7 +209,7 @@ async def list_roles(db=Depends(get_db)):
 @router.get("/permissions", dependencies=[Depends(require_permission("roles.manage"))])
 async def list_permissions(db=Depends(get_db)):
     perms = (await db.execute(select(Permission))).scalars().all()
-    return {"permissions": [PermissionOut(name=p.name, description=p.description).model_dump() for p in perms]}
+    return {"permissions": [PermissionOut(id=p.id, name=p.name, description=p.description).model_dump(mode="json") for p in perms]}
 
 
 @router.post("/roles", status_code=201, dependencies=[Depends(require_permission("roles.manage"))])
