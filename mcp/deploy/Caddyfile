@@ -17,14 +17,17 @@
 
     # SSE/streaming — disable buffering so chat tokens flush as they arrive.
     # Real path is POST /api/chat/conversations/{cid}/messages (sse_starlette.EventSourceResponse).
-    handle /api/chat/conversations/**/messages {
+    handle /api/chat/conversations/*/messages {
         reverse_proxy prd-app:8300 {
             flush_interval -1
         }
     }
 
-    # All other API paths.
-    handle /api/** {
+    # All other API paths. We use a path matcher with a regex to match any depth
+    # — Caddy's /api/** glob surprisingly only matches single-segment paths in
+    # v2.11 (likely a bug; the docs say it should match across segments).
+    @api path_regexp ^/api(/|$)
+    handle @api {
         reverse_proxy prd-app:8300
     }
 
