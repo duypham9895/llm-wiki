@@ -44,9 +44,11 @@ services:
   prd-caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    # NOTE: host port 8080 (not 80) — hostinger's system Caddy already owns :80.
+    # See mcp/deploy/README.md for the workaround. VPS URL becomes
+    # http://76.13.220.113:8080/ for IP-only deploys.
     ports:
-      - "80:80"
-      - "443:443"
+      - "8080:80"
     env_file: .env
     environment:
       HOSTNAME: ${HOSTNAME}
