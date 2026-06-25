@@ -5,11 +5,9 @@ COPY package.json package-lock.json ./
 # npm has a bug (npm/cli#4828) where optionalDependencies are not
 # reliably installed for rolldown's native binding on linux-musl platforms.
 # Workaround: explicit install of the matching binding after `npm i`.
-# TARGETOS is auto-set by docker buildx (linux).
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# Rolldown's package name uses `x64` while docker's TARGETARCH uses `amd64`.
 RUN npm i --no-audit --no-fund && \
-    npm i --no-audit --no-fund @rolldown/binding-${TARGETOS}-${TARGETARCH}-musl
+    npm i --no-audit --no-fund @rolldown/binding-linux-x64-musl
 COPY . .
 RUN npm run build
 
