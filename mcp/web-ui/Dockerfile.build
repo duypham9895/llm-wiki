@@ -1,12 +1,15 @@
 # stage 1: build
-FROM node:22-alpine AS build
+FROM --platform=linux/amd64 node:22-alpine AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
-# Use `npm i` (not `npm ci`) because rolldown ships its native binding
-# (linux-x64-musl, linux-arm64-musl, etc.) as an optionalDependency, and
-# npm ci has a known bug (npm/cli#4828) where it sometimes fails to install
-# optional deps. `npm i` re-resolves and reliably installs the binding.
-RUN npm i --no-audit --no-fund
+# npm has a bug (npm/cli#4828) where optionalDependencies are not
+# reliably installed for rolldown's native binding on linux-musl platforms.
+# Workaround: explicit install of the matching binding after `npm i`.
+# TARGETOS is auto-set by docker buildx (linux).
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN npm i --no-audit --no-fund && \
+    npm i --no-audit --no-fund @rolldown/binding-${TARGETOS}-${TARGETARCH}-musl
 COPY . .
 RUN npm run build
 
