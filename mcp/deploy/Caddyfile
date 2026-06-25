@@ -6,20 +6,30 @@
 :80 {
     encode zstd gzip
 
+    # API + healthcheck are reverse-proxied to the backend. We MUST use explicit
+    # handle blocks here so they match BEFORE try_files/file_server can rewrite
+    # the path to /index.html (which would otherwise swallow /api/* requests
+    # into the SPA shell, causing 405 on POST /api/auth/login etc.).
+
     # SSE/streaming — disable buffering so chat tokens flush as they arrive.
     # Real path is POST /api/chat/conversations/{cid}/messages (sse_starlette.EventSourceResponse).
-    @sse path /api/chat/conversations/**/messages
-    reverse_proxy @sse prd-app:8300 {
-        flush_interval -1
+    handle /api/chat/conversations/**/messages {
+        reverse_proxy prd-app:8300 {
+            flush_interval -1
+        }
     }
 
-    # other API paths
-    # IMPORTANT: `/**` matches multiple path segments; `/*` matches only one.
-    # /api/auth/login is 2 segments deep and would NOT match /api/*.
-    reverse_proxy /api/** prd-app:8300
-    reverse_proxy /healthz prd-app:8300
+    # All other API paths.
+    handle /api/** {
+        reverse_proxy prd-app:8300
+    }
 
-    # static UI (volume-mounted at /srv)
+    handle /healthz {
+        reverse_proxy prd-app:8300
+    }
+
+    # Everything else: static SPA (volume-mounted at /srv). try_files makes
+    # client-side routes like /library resolve to index.html.
     root * /srv
     try_files {path} /index.html
     file_server
