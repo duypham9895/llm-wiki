@@ -2,11 +2,13 @@
 FROM --platform=linux/amd64 node:22-alpine AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
-# npm 10.9 (ships with node:22-alpine) has bug #4828 — optionalDependencies
+# npm 10.9 (in node:22-alpine) has bug #4828 — optionalDependencies
 # are not reliably installed for native bindings (rolldown, lightningcss, etc.)
-# Upgrade to npm 11 first as the actual root-cause fix.
+# Upgrade to npm 11 to fix the root cause, then `npm i` (not `npm ci`) because
+# npm 11's lockfile format is stricter than what npm 10 generated, and
+# `npm ci` rejects any drift.
 RUN npm install -g npm@11 --no-audit --no-fund && \
-    npm ci --no-audit --no-fund
+    npm i --no-audit --no-fund
 COPY . .
 RUN npm run build
 
