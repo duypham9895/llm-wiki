@@ -35,7 +35,10 @@ jobs:
         if: matrix.target == 'app'
         uses: docker/build-push-action@v6
         with:
-          context: ./mcp
+          # Build context is repo root because the app image now also ships
+          # the Node sync CLI (src/, package.json, package-lock.json at the
+          # repo root). The Dockerfile COPY paths are relative to the root.
+          context: .
           file: ./mcp/deploy/Dockerfile
           push: true
           tags: ghcr.io/duypham9895/llm-wiki/app:${{ steps.tag.outputs.tag }}

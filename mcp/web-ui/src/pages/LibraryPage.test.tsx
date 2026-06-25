@@ -65,7 +65,7 @@ describe('LibraryPage', () => {
     expect(await screen.findByText(/could not load prds/i)).toBeInTheDocument();
   });
 
-  it('T-4 opens a fresh PRD drawer after switching selections', async () => {
+  it('T-4 renders each card as a link to its detail page', async () => {
     server.use(
       http.get('/api/prd/library', () =>
         HttpResponse.json({
@@ -90,43 +90,16 @@ describe('LibraryPage', () => {
           next_cursor: null,
         }),
       ),
-      http.get('/api/prd/EP-A', () =>
-        HttpResponse.json({
-          found: true,
-          id: 'EP-A',
-          title: 'Alpha',
-          status: 'active',
-          tags: [],
-          source_url: '',
-          obsidian_link: '',
-          body: 'alpha body',
-        }),
-      ),
-      http.get('/api/prd/EP-B', () =>
-        HttpResponse.json({
-          found: true,
-          id: 'EP-B',
-          title: 'Beta',
-          status: 'active',
-          tags: [],
-          source_url: '',
-          obsidian_link: '',
-          body: 'beta body',
-        }),
-      ),
     );
 
     renderWithProviders(<LibraryPage />, { me: { permissions: ['prd.read'] } });
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Alpha' }));
-    expect(await screen.findByText('alpha body')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: /close prd reader/i }));
-    fireEvent.click(screen.getByRole('button', { name: 'Beta' }));
-
-    expect(await screen.findByRole('heading', { name: 'Beta' })).toBeInTheDocument();
-    expect(await screen.findByText('beta body')).toBeInTheDocument();
-    expect(screen.queryByText('alpha body')).not.toBeInTheDocument();
+    // Each PRD title is now a link to /library/:id (no modal drawer).
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toHaveAttribute('href', '/library/EP-A');
+    expect(screen.getByRole('link', { name: /Beta/ })).toHaveAttribute('href', '/library/EP-B');
+    // No modal drawer anywhere.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /close prd reader/i })).not.toBeInTheDocument();
   });
 
   it('T-5 appends paginated PRDs and hides Load more at the end', async () => {
@@ -168,13 +141,14 @@ describe('LibraryPage', () => {
 
     renderWithProviders(<LibraryPage />, { me: { permissions: ['prd.read'] } });
 
-    expect(await screen.findByText('P1')).toBeInTheDocument();
+    // Card title is now an h3; mock uses title: 'P1' / summary: 'First page'.
+    expect(await screen.findByRole('heading', { name: 'P1' })).toBeInTheDocument();
     const loadMore = screen.getByRole('button', { name: /load more/i });
     expect(loadMore).toBeInTheDocument();
 
     fireEvent.click(loadMore);
 
-    expect(await screen.findByText('P2')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'P2' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /load more/i })).not.toBeInTheDocument();
   });
 });

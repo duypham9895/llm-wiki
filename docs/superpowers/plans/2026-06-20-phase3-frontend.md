@@ -6,7 +6,7 @@
 
 **Architecture:** A standalone Vite app in `mcp/web-ui/`. react-query owns server state for JSON endpoints; a custom `fetch`-based SSE reader (NOT `EventSource` — the chat stream is a POST with a CSRF header) drives the Ask tab. The nav renders only the sections the user's permissions (`GET /api/auth/me`) allow. Builds to static files Caddy serves; all `/api/*` calls are same-origin so Phase 2's `SameSite` cookie + `X-Requested-With: prd-app` CSRF header work unchanged. All user-facing copy reviewed by the Senior Content Writer agent.
 
-**Tech Stack:** TypeScript, React 18, Vite, Tailwind, shadcn/ui, @tanstack/react-query, a tiny router (react-router-dom), Vitest + @testing-library/react + MSW (Mock Service Worker) for API mocking. No live backend in tests.
+**Tech Stack:** TypeScript, React 19, Vite, Tailwind v4, shadcn/ui, @tanstack/react-query, a tiny router (react-router-dom), Vitest + @testing-library/react + MSW (Mock Service Worker) for API mocking. No live backend in tests.
 
 ## Global Constraints
 

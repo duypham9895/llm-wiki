@@ -124,6 +124,72 @@ body,
 
   body {
     margin: 0;
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
   }
+
+  /* Skip-to-content link (only visible on focus) */
+  .skip-link {
+    @apply absolute left-2 top-2 -translate-y-16 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground shadow-md transition-transform focus:translate-y-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring;
+  }
+
+  /* Reduced motion: kill all transitions/animations */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* prose tweaks layered on top of Tailwind Typography.
+   We don't ship @tailwindcss/typography; these styles are enough for PRD bodies. */
+.prose {
+  color: var(--foreground);
+}
+.prose p {
+  margin: 0.75em 0;
+}
+.prose ul,
+.prose ol {
+  margin: 0.75em 0;
+  padding-left: 1.5em;
+}
+.prose li {
+  margin: 0.25em 0;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: 0.875em;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+}
+.prose th {
+  background: var(--muted);
+  font-weight: 600;
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+.prose blockquote {
+  border-left: 3px solid var(--primary);
+  padding-left: 1em;
+  color: var(--muted-foreground);
+  margin: 1em 0;
+}
+.prose img {
+  max-width: 100%;
+  height: auto;
 }

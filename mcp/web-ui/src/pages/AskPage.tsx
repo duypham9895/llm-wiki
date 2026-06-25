@@ -1,17 +1,20 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Loader2, MessageSquarePlus, Send, Trash2 } from 'lucide-react';
+import { Loader2, Send, Sparkles } from 'lucide-react';
+import { toast } from 'sonner';
 
-import { ApiError, apiFetch } from '../lib/api';
-import { copyForError } from '../lib/error-copy';
-import { cn } from '../lib/utils';
-import { streamChat } from '../lib/sse';
-
-type ConversationSummary = {
-  id: string;
-  title: string;
-  updated_at: string;
-};
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { EmptyState } from '@/components/EmptyState';
+import { PageHeader } from '@/components/PageHeader';
+import {
+  ConversationList,
+  type ConversationSummary,
+} from '@/components/ConversationList';
+import { ApiError, apiFetch } from '@/lib/api';
+import { copyForError } from '@/lib/error-copy';
+import { cn } from '@/lib/utils';
+import { streamChat } from '@/lib/sse';
 
 type PersistedMessage = {
   seq: number;
@@ -50,9 +53,33 @@ type LocalMessage = {
   sources?: SourcesPayload;
 };
 
-type RenderMessage = { id: string; role: 'user' | 'assistant'; content: string; rewrite?: string; sources?: SourcesPayload };
+type RenderMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  rewrite?: string;
+  sources?: SourcesPayload;
+};
 
 const CONVERSATIONS_KEY = ['chat-conversations'] as const;
+
+const EXAMPLE_PROMPTS = [
+  "What's our onboarding flow for new PMs?",
+  'Summarize EP-468 (Onboarding Redesign).',
+  'Which PRDs mention referral risk this quarter?',
+];
+
+function parseCidFromHash(hash: string): string | null {
+  if (!hash || hash === '#') return null;
+  const trimmed = hash.startsWith('#') ? hash.slice(1) : hash;
+  const params = new URLSearchParams(trimmed);
+  const cid = params.get('c');
+  return cid && cid.length > 0 ? cid : null;
+}
+
+function buildHashForCid(cid: string | null): string {
+  return cid ? `#c=${encodeURIComponent(cid)}` : '';
+}
 
 export function AskPage() {
   const queryClient = useQueryClient();
@@ -61,8 +88,35 @@ export function AskPage() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [localMessages, setLocalMessages] = useState<LocalMessage[]>([]);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const turnCounterRef = useRef(0);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Read initial cid from URL hash on mount.
+  useEffect(() => {
+    const initial = parseCidFromHash(window.location.hash);
+    if (initial) setSelectedId(initial);
+  }, []);
+
+  // Sync the URL hash whenever the active cid changes.
+  useEffect(() => {
+    const nextHash = buildHashForCid(selectedId);
+    const currentHash = window.location.hash;
+    if (nextHash !== currentHash) {
+      window.history.replaceState(null, '', nextHash ? `/ask${nextHash}` : '/ask');
+    }
+  }, [selectedId]);
+
+  // Cross-tab hash sync: if the user navigates via browser back/forward.
+  useEffect(() => {
+    function handleHashChange() {
+      const next = parseCidFromHash(window.location.hash);
+      setSelectedId(next);
+    }
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
 
   const conversationsQuery = useQuery({
     queryKey: CONVERSATIONS_KEY,
@@ -71,7 +125,10 @@ export function AskPage() {
 
   const detailQuery = useQuery({
     queryKey: ['chat-conversation', selectedId],
-    queryFn: ({ signal }) => apiFetch<ConversationDetail>(`/chat/conversations/${encodeURIComponent(selectedId ?? '')}`, { signal }),
+    queryFn: ({ signal }) =>
+      apiFetch<ConversationDetail>(`/chat/conversations/${encodeURIComponent(selectedId ?? '')}`, {
+        signal,
+      }),
     enabled: selectedId !== null,
   });
 
@@ -79,28 +136,59 @@ export function AskPage() {
     mutationFn: () => apiFetch<{ id: string }>('/chat/conversations', { method: 'POST' }),
     onSuccess: async (data) => {
       setSelectedId(data.id);
+      setInput('');
+      setError(null);
+      queueMicrotask(() => composerRef.current?.focus());
       await queryClient.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+    },
+    onError: (err) => {
+      toast.error(copyForError(err));
     },
   });
 
   const deleteConversation = useMutation({
     mutationFn: (conversationId: string) =>
-      apiFetch<void>(`/chat/conversations/${encodeURIComponent(conversationId)}`, { method: 'DELETE' }),
+      apiFetch<void>(`/chat/conversations/${encodeURIComponent(conversationId)}`, {
+        method: 'DELETE',
+      }),
+    onMutate: async (conversationId: string) => {
+      // Optimistic remove from the list cache.
+      await queryClient.cancelQueries({ queryKey: CONVERSATIONS_KEY });
+      const previous = queryClient.getQueryData<ConversationSummary[]>(CONVERSATIONS_KEY);
+      if (previous) {
+        queryClient.setQueryData<ConversationSummary[]>(
+          CONVERSATIONS_KEY,
+          previous.filter((c) => c.id !== conversationId),
+        );
+      }
+      return { previous };
+    },
+    onError: (err, _conversationId, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(CONVERSATIONS_KEY, context.previous);
+      }
+      if (err instanceof ApiError && err.status === 404) {
+        toast.success('Conversation already removed.');
+      } else {
+        toast.error(copyForError(err));
+      }
+    },
     onSuccess: async (_data, conversationId) => {
       if (selectedId === conversationId) {
         setSelectedId(null);
       }
-      await queryClient.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      setPendingDeleteId(null);
+      // Optimistic cache update already removed the row; skip the refetch so the
+      // server mock (and stale state) doesn't bring it back. invalidate only on error.
     },
-    onError: (err) => {
-      if (err instanceof ApiError && err.status === 404) {
-        void queryClient.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
-        return;
-      }
-      setError(copyForError(err));
+    onSettled: () => {
+      // Always clear the pending state so the dialog closes, even when the
+      // server returns an error (the rollback path in onError restores the cache).
+      setPendingDeleteId(null);
     },
   });
 
+  // Reset transient state when conversation changes.
   useEffect(() => {
     abortRef.current?.abort();
     abortRef.current = null;
@@ -108,14 +196,17 @@ export function AskPage() {
     setError(null);
     setInput('');
     setLocalMessages([]);
+    queueMicrotask(() => composerRef.current?.focus());
   }, [selectedId]);
 
+  // Cleanup any in-flight stream on unmount.
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
     };
   }, []);
 
+  // Drop local streamed assistant messages once they're persisted server-side.
   useEffect(() => {
     const persistedAssistantSeqs = new Set(
       detailQuery.data?.messages
@@ -152,6 +243,44 @@ export function AskPage() {
 
     return [...persisted, ...local];
   }, [detailQuery.data?.messages, localMessages]);
+
+  const conversations = conversationsQuery.data ?? [];
+
+  function handleNewChat() {
+    if (createConversation.isPending) return;
+    createConversation.mutate();
+  }
+
+  function handleSelect(cid: string) {
+    setSelectedId(cid);
+  }
+
+  function handleRequestDelete(cid: string) {
+    setPendingDeleteId(cid);
+  }
+
+  function handleCancelDelete() {
+    setPendingDeleteId(null);
+  }
+
+  function handleConfirmDelete() {
+    if (!pendingDeleteId) return;
+    deleteConversation.mutate(pendingDeleteId);
+  }
+
+  function handleExamplePrompt(prompt: string) {
+    if (!selectedId) {
+      // No active conversation yet — create one first, then pre-fill on success.
+      createConversation.mutate(undefined, {
+        onSuccess: () => {
+          setInput(prompt);
+        },
+      });
+      return;
+    }
+    setInput(prompt);
+    queueMicrotask(() => composerRef.current?.focus());
+  }
 
   function finishGeneration(controller: AbortController) {
     if (abortRef.current !== controller) return;
@@ -196,7 +325,9 @@ export function AskPage() {
             if (abortRef.current !== controller) return;
             setLocalMessages((current) =>
               current.map((message) =>
-                message.id === assistantId ? { ...message, sources: normalizeSourcesPayload(payload) ?? undefined } : message,
+                message.id === assistantId
+                  ? { ...message, sources: normalizeSourcesPayload(payload) ?? undefined }
+                  : message,
               ),
             );
           },
@@ -234,139 +365,194 @@ export function AskPage() {
     }
   }
 
-  const conversations = conversationsQuery.data ?? [];
-  const hasNoConversations = conversationsQuery.isSuccess && conversations.length === 0;
   const canSend = selectedId !== null && !isStreaming && input.trim().length > 0;
 
   return (
-    <section className="space-y-6">
-      <div>
-        <p className="text-sm font-medium text-muted-foreground">PRD assistant</p>
-        <h1 className="text-2xl font-semibold tracking-normal">Ask</h1>
-      </div>
+    <div className="flex h-full min-h-0 flex-col gap-6">
+      <PageHeader
+        title="Ask"
+        description="Search across your PRD vault in plain English."
+      />
 
-      <div className="grid gap-6 lg:grid-cols-[18rem_1fr]">
-        <aside className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm">
-          <div className="flex items-center justify-between gap-3">
-            <h2 className="text-sm font-semibold">Conversations</h2>
-            <button
-              className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-60"
-              disabled={createConversation.isPending || isStreaming}
-              type="button"
-              onClick={() => createConversation.mutate()}
-            >
-              {createConversation.isPending ? <Loader2 className="size-4 animate-spin" /> : <MessageSquarePlus className="size-4" />}
-              New conversation
-            </button>
-          </div>
-
-          {conversationsQuery.isLoading ? (
-            <p className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" /> Loading conversations.
-            </p>
-          ) : null}
-          {conversationsQuery.isError ? <p className="mt-4 text-sm text-destructive">Could not load conversations.</p> : null}
-          {hasNoConversations ? (
-            <p className="mt-4 rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-              No conversations yet. Create one to start asking.
-            </p>
-          ) : null}
-
-          {conversations.length > 0 ? (
-            <div className="mt-4 space-y-2">
-              {conversations.map((conversation) => (
-                <div key={conversation.id} className="flex items-center gap-2">
-                  <button
-                    className={cn(
-                      'min-w-0 flex-1 rounded-md px-3 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground',
-                      selectedId === conversation.id && 'bg-accent text-accent-foreground',
-                    )}
-                    type="button"
-                    onClick={() => setSelectedId(conversation.id)}
-                  >
-                    <span className="block truncate font-medium">{conversation.title}</span>
-                    <span className="block truncate text-xs text-muted-foreground">{formatDate(conversation.updated_at)}</span>
-                  </button>
-                  <button
-                    aria-label={`Delete ${conversation.title}`}
-                    className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-destructive disabled:opacity-60"
-                    disabled={deleteConversation.isPending || isStreaming}
-                    type="button"
-                    onClick={() => deleteConversation.mutate(conversation.id)}
-                  >
-                    <Trash2 className="size-4" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          ) : null}
+      <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[16rem_1fr]">
+        <aside className="flex min-h-0 flex-col rounded-lg border bg-card p-3 text-card-foreground">
+          <ConversationList
+            conversations={conversations}
+            isLoading={conversationsQuery.isLoading}
+            isError={conversationsQuery.isError}
+            activeId={selectedId}
+            isBusy={isStreaming}
+            createMutation={createConversation}
+            deleteMutation={deleteConversation}
+            pendingDeleteId={pendingDeleteId}
+            onSelect={handleSelect}
+            onRequestDelete={handleRequestDelete}
+            onCancelDelete={handleCancelDelete}
+            onConfirmDelete={handleConfirmDelete}
+          />
         </aside>
 
-        <div className="min-h-[32rem] rounded-lg border bg-card p-4 text-card-foreground shadow-sm">
+        <section className="flex min-h-0 flex-col rounded-lg border bg-card text-card-foreground">
           {selectedId === null ? (
-            <div className="grid min-h-[28rem] place-items-center rounded-md border border-dashed p-8 text-center">
-              <div>
-                <h2 className="text-lg font-semibold">Select or create a conversation.</h2>
-                <p className="mt-2 text-sm text-muted-foreground">Ask questions after choosing a conversation.</p>
-              </div>
-            </div>
+            <EmptyAskState
+              isCreating={createConversation.isPending}
+              onNewChat={handleNewChat}
+              onPickPrompt={handleExamplePrompt}
+            />
           ) : (
-            <div className="flex min-h-[28rem] flex-col gap-4">
-              <div className="flex items-start justify-between gap-4 border-b pb-4">
-                <div>
-                  <p className="text-sm font-medium text-muted-foreground">Conversation</p>
-                  <h2 className="text-lg font-semibold">{detailQuery.data?.title ?? 'Conversation'}</h2>
-                </div>
-                {detailQuery.isFetching ? <Loader2 className="mt-1 size-4 animate-spin text-muted-foreground" /> : null}
-              </div>
-
-              {detailQuery.isError ? <p className="text-sm text-destructive">Could not load this conversation.</p> : null}
-
-              <div className="flex-1 space-y-4">
-                {renderedMessages.length === 0 && !detailQuery.isLoading ? (
-                  <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                    No messages yet. Send a question to start the conversation.
-                  </div>
-                ) : null}
-                {renderedMessages.map((message) => (
-                  <MessageBubble key={message.id} message={message} />
-                ))}
-              </div>
-
-              {error ? (
-                <p className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-                  {error}
-                </p>
-              ) : null}
-
-              <form className="grid gap-3 border-t pt-4" onSubmit={handleSubmit}>
-                <label className="grid gap-1 text-sm font-medium">
-                  Message
-                  <textarea
-                    aria-label="Message"
-                    className="min-h-24 resize-y rounded-md border border-input bg-background p-3 text-sm disabled:opacity-60"
-                    disabled={isStreaming}
-                    placeholder="Ask about a PRD"
-                    value={input}
-                    onChange={(event) => setInput(event.target.value)}
-                  />
-                </label>
-                <div className="flex justify-end">
-                  <button
-                    className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-60"
-                    disabled={!canSend}
-                    type="submit"
-                  >
-                    {isStreaming ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-                    Send
-                  </button>
-                </div>
-              </form>
-            </div>
+            <ConversationView
+              detailQuery={detailQuery}
+              renderedMessages={renderedMessages}
+              error={error}
+              input={input}
+              isStreaming={isStreaming}
+              canSend={canSend}
+              composerRef={composerRef}
+              onInputChange={setInput}
+              onSubmit={handleSubmit}
+            />
           )}
-        </div>
+        </section>
       </div>
-    </section>
+    </div>
+  );
+}
+
+function EmptyAskState({
+  isCreating,
+  onNewChat,
+  onPickPrompt,
+}: {
+  isCreating: boolean;
+  onNewChat: () => void;
+  onPickPrompt: (prompt: string) => void;
+}) {
+  return (
+    <div className="flex flex-1 items-center justify-center p-6">
+      <EmptyState
+        icon={Sparkles}
+        title="Start by asking about any PRD"
+        description="Try a question like “What's our onboarding flow for new PMs?”"
+        action={
+          <div className="flex w-full max-w-md flex-col gap-2">
+            <Button
+              className="w-full"
+              disabled={isCreating}
+              type="button"
+              onClick={onNewChat}
+            >
+              {isCreating ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+              New chat
+            </Button>
+            <div className="grid gap-2">
+              {EXAMPLE_PROMPTS.map((prompt) => (
+                <Button
+                  key={prompt}
+                  variant="outline"
+                  className="h-auto justify-start whitespace-normal py-2 text-left text-sm font-normal"
+                  type="button"
+                  onClick={() => onPickPrompt(prompt)}
+                >
+                  {prompt}
+                </Button>
+              ))}
+            </div>
+          </div>
+        }
+      />
+    </div>
+  );
+}
+
+function ConversationView({
+  detailQuery,
+  renderedMessages,
+  error,
+  input,
+  isStreaming,
+  canSend,
+  composerRef,
+  onInputChange,
+  onSubmit,
+}: {
+  detailQuery: ReturnType<typeof useQuery<ConversationDetail>>;
+  renderedMessages: RenderMessage[];
+  error: string | null;
+  input: string;
+  isStreaming: boolean;
+  canSend: boolean;
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  onInputChange: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+      <div className="flex items-start justify-between gap-4 border-b pb-3">
+        <div className="min-w-0">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Conversation
+          </p>
+          <h2 className="truncate text-lg font-semibold tracking-tight">
+            {detailQuery.data?.title ?? 'Conversation'}
+          </h2>
+        </div>
+        {detailQuery.isFetching ? (
+          <Loader2 className="mt-1 size-4 animate-spin text-muted-foreground" />
+        ) : null}
+      </div>
+
+      {detailQuery.isError ? (
+        <p className="text-sm text-destructive">Could not load this conversation.</p>
+      ) : null}
+
+      <div className="flex-1 space-y-4 overflow-y-auto pr-1">
+        {renderedMessages.length === 0 && !detailQuery.isLoading ? (
+          <div className="flex h-full items-center justify-center">
+            <p className="rounded-md border border-dashed px-4 py-6 text-sm text-muted-foreground">
+              No messages yet. Send a question to start the conversation.
+            </p>
+          </div>
+        ) : null}
+        {renderedMessages.map((message) => (
+          <MessageBubble key={message.id} message={message} />
+        ))}
+      </div>
+
+      {error ? (
+        <p className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
+
+      <form className="grid gap-2 border-t pt-3" onSubmit={onSubmit}>
+        <Textarea
+          ref={composerRef}
+          aria-label="Message"
+          className="min-h-24 resize-y"
+          disabled={isStreaming}
+          placeholder="Ask about a PRD"
+          value={input}
+          onChange={(event) => onInputChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              if (canSend) {
+                event.currentTarget.form?.requestSubmit();
+              }
+            }
+          }}
+        />
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-muted-foreground">
+            Enter to send · Shift+Enter for newline
+          </p>
+          <Button disabled={!canSend} type="submit">
+            {isStreaming ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+            Send
+          </Button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -374,11 +560,18 @@ function MessageBubble({ message }: { message: RenderMessage }) {
   const isAssistant = message.role === 'assistant';
 
   return (
-    <article className={cn('rounded-lg border p-4', isAssistant ? 'bg-background' : 'bg-secondary/60')}>
-      <p className="text-xs font-semibold uppercase tracking-normal text-muted-foreground">
+    <article
+      className={cn(
+        'rounded-lg border p-4',
+        isAssistant ? 'bg-background' : 'bg-secondary/60',
+      )}
+    >
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {isAssistant ? 'Assistant' : 'You'}
       </p>
-      {message.rewrite ? <p className="mt-2 text-xs text-muted-foreground">Rewritten question: {message.rewrite}</p> : null}
+      {message.rewrite ? (
+        <p className="mt-2 text-xs text-muted-foreground">Rewritten question: {message.rewrite}</p>
+      ) : null}
       <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{message.content}</p>
       {isAssistant && message.sources && message.sources.sources.length > 0 ? (
         <SourcesPanel payload={message.sources} />
@@ -463,11 +656,4 @@ function readString(value: unknown): string {
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
-}
-
-function formatDate(value: string): string {
-  if (!value) return 'Updated recently';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return 'Updated recently';
-  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }

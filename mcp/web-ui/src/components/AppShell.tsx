@@ -1,25 +1,45 @@
-import { useState } from 'react';
+import * as React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { NavLink, Outlet } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+import { Bell, ChevronDown, LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen } from 'lucide-react';
 
-import { apiFetch } from '../lib/api';
-import { useAuth } from '../lib/auth';
-import { visibleSections } from '../lib/permissions';
-import { cn } from '../lib/utils';
+import { apiFetch } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
+import { visibleSections } from '@/lib/permissions';
+import { cn } from '@/lib/utils';
+import { useTheme } from '@/lib/theme';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
+import { KbdHint } from '@/components/KbdHint';
+import { ChangePasswordDialog } from '@/components/ChangePasswordDialog';
 
 export function AppShell() {
   const me = useAuth();
-  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { resolvedTheme, toggle } = useTheme();
   const sections = visibleSections(me.permissions);
-  const [isSigningOut, setIsSigningOut] = useState(false);
+  const [isSigningOut, setIsSigningOut] = React.useState(false);
+  const [passwordOpen, setPasswordOpen] = React.useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = React.useState(false);
 
+  const queryClient = useQueryClient();
   async function signOut() {
     setIsSigningOut(true);
-
     try {
       await apiFetch('/auth/logout', { method: 'POST' });
     } catch {
-      // Local auth state is refreshed below even if the logout request fails.
+      /* fall through */
     } finally {
       try {
         queryClient.setQueryData(['me'], null);
@@ -30,55 +50,199 @@ export function AppShell() {
     }
   }
 
-  return (
-    <div className="min-h-screen bg-background text-foreground md:grid md:grid-cols-[16rem_1fr]">
-      <aside className="border-b bg-card px-4 py-5 md:min-h-screen md:border-b-0 md:border-r">
-        <div className="mb-6 space-y-3">
-          <div>
-            <p className="text-sm font-semibold">LLM Wiki</p>
-            <p className="text-xs text-muted-foreground">{me.email}</p>
-          </div>
-          <button
-            className="rounded-md border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={isSigningOut}
-            onClick={signOut}
-            type="button"
+  const initials = (me.email ?? '?')
+    .split('@')[0]
+    .split(/[._-]/)
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase() ?? '')
+    .join('');
+
+  // Close mobile nav on route change.
+  React.useEffect(() => {
+    setMobileNavOpen(false);
+  }, [location.pathname]);
+
+  // Global "g X" navigation shortcuts.
+  React.useEffect(() => {
+    let buffer: string[] = [];
+    let bufferTimer: number | undefined;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+      const key = e.key.toLowerCase();
+      buffer.push(key);
+      if (bufferTimer) window.clearTimeout(bufferTimer);
+      bufferTimer = window.setTimeout(() => (buffer = []), 800);
+      const combo = buffer.join('');
+      if (combo === 'gl' || combo === 'gs' || combo === 'ga' || combo === 'gt') {
+        const map: Record<string, string> = {
+          gl: '/library',
+          gs: '/search',
+          ga: '/ask',
+          gt: '/status',
+        };
+        navigate(map[combo]);
+        buffer = [];
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [navigate]);
+
+  const NavList = (
+    <nav aria-label="Primary" className="space-y-6 p-3">
+      {sections.map((section) => (
+        <section key={section.group} aria-labelledby={`nav-${section.group}`}>
+          <h2
+            id={`nav-${section.group}`}
+            className="mb-1 px-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground"
           >
-            Sign out
-          </button>
-        </div>
-        <nav aria-label="Primary" className="space-y-6">
-          {sections.map((section) => (
-            <section key={section.group} aria-labelledby={`nav-${section.group}`}>
-              <h2
-                id={`nav-${section.group}`}
-                className="mb-2 text-xs font-medium uppercase tracking-normal text-muted-foreground"
+            {section.group}
+          </h2>
+          <div className="space-y-0.5">
+            {section.items.map((item) => (
+              <NavLink
+                key={item.path}
+                to={item.path}
+                className={({ isActive }) =>
+                  cn(
+                    'flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground',
+                    isActive && 'bg-accent text-accent-foreground',
+                  )
+                }
               >
-                {section.group}
-              </h2>
-              <div className="space-y-1">
-                {section.items.map((item) => (
-                  <NavLink
-                    key={item.path}
-                    to={item.path}
-                    className={({ isActive }) =>
-                      cn(
-                        'block rounded-md px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-                        isActive && 'bg-accent text-accent-foreground',
-                      )
-                    }
-                  >
-                    {item.label}
-                  </NavLink>
-                ))}
+                {item.label}
+              </NavLink>
+            ))}
+          </div>
+        </section>
+      ))}
+    </nav>
+  );
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      <a href="#main" className="skip-link">
+        Skip to content
+      </a>
+
+      {/* Top bar */}
+      <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+        <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+          <SheetTrigger asChild>
+            <Button variant="ghost" size="icon" className="md:hidden" aria-label="Open navigation">
+              <Menu />
+            </Button>
+          </SheetTrigger>
+          <SheetContent side="left" className="w-72 p-0">
+            <SheetHeader className="border-b px-4 py-3">
+              <SheetTitle className="flex items-center gap-2 text-base">
+                <BookOpen className="h-4 w-4" /> LLM Wiki
+              </SheetTitle>
+            </SheetHeader>
+            {NavList}
+          </SheetContent>
+        </Sheet>
+
+        <Link to="/library" className="flex items-center gap-2 font-semibold tracking-tight">
+          <BookOpen className="h-4 w-4" />
+          <span>LLM Wiki</span>
+        </Link>
+
+        <div className="ml-2 hidden text-xs text-muted-foreground md:block">{me.email}</div>
+
+        <div className="flex-1" />
+
+        <button
+          type="button"
+          // The CommandPalette listens for ⌘K globally; this button is a hint affordance.
+          onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))}
+          className="inline-flex h-8 items-center gap-2 rounded-md border bg-muted/40 px-3 text-xs text-muted-foreground transition-colors hover:bg-muted md:w-72 md:justify-between"
+        >
+          <span className="flex items-center gap-2">
+            <Search className="h-3.5 w-3.5" /> Search…
+          </span>
+          <span className="hidden items-center gap-1 md:inline-flex">
+            <KbdHint>⌘</KbdHint>
+            <KbdHint>K</KbdHint>
+          </span>
+        </button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={toggle}
+          aria-label={resolvedTheme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {resolvedTheme === 'dark' ? <Sun /> : <Moon />}
+        </Button>
+
+        <Button variant="ghost" size="icon" aria-label="Notifications" disabled>
+          <Bell />
+        </Button>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" className="flex h-9 items-center gap-2 px-2">
+              <Avatar className="h-7 w-7">
+                <AvatarFallback>{initials || '?'}</AvatarFallback>
+              </Avatar>
+              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
+            <DropdownMenuLabel className="truncate font-normal">
+              <div className="text-sm font-medium text-foreground">{me.email}</div>
+              <div className="text-xs text-muted-foreground">
+                {me.roles.map((r) => r.name).join(', ') || 'no role'}
               </div>
-            </section>
-          ))}
-        </nav>
-      </aside>
-      <main className="p-6">
-        <Outlet />
-      </main>
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => setPasswordOpen(true)}>
+              <KeyRound /> Change password
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={signOut} disabled={isSigningOut}>
+              <LogOut /> {isSigningOut ? 'Signing out…' : 'Sign out'}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </header>
+
+      {/* Body */}
+      <div className="md:grid md:grid-cols-[14rem_1fr]">
+        <aside className="hidden border-r bg-card/30 md:block">
+          <div className="sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-y-auto">{NavList}</div>
+        </aside>
+        <main id="main" className="min-h-[calc(100vh-3.5rem)] p-4 md:p-6">
+          <PageTransition pathname={location.pathname}>
+            <Outlet />
+          </PageTransition>
+        </main>
+      </div>
+
+      <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
     </div>
+  );
+}
+
+/** Fade + small slide-up on route change. Honors prefers-reduced-motion. */
+function PageTransition({ pathname, children }: { pathname: string; children: React.ReactNode }) {
+  const reduced = useReducedMotion();
+  return (
+    <AnimatePresence mode="wait" initial={false}>
+      <motion.div
+        key={pathname}
+        initial={reduced ? { opacity: 0 } : { opacity: 0, y: 4 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={reduced ? { opacity: 0 } : { opacity: 0, y: -4 }}
+        transition={{ duration: reduced ? 0 : 0.15, ease: 'easeOut' }}
+      >
+        {children}
+      </motion.div>
+    </AnimatePresence>
   );
 }

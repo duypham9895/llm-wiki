@@ -1,312 +1,486 @@
-import { useState } from 'react';
+import * as React from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Loader2 } from 'lucide-react';
+import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
+import {
+  ArrowUpDown,
+  KeyRound,
+  Loader2,
+  Lock,
+  MoreHorizontal,
+  Search,
+  Shield,
+  Trash2,
+  UserCheck,
+  UserPlus,
+} from 'lucide-react';
+import { toast } from 'sonner';
 
-import { apiFetch } from '../../lib/api';
-import { copyForError } from '../../lib/error-copy';
+import { DataTable } from '@/components/DataTable';
+import { ResetPasswordDialog, type ResetPasswordDialogUser } from '@/components/ResetPasswordDialog';
+import { UserDetailDrawer, type UserDetailUser } from '@/components/UserDetailDrawer';
+import { ApiError, apiFetch } from '@/lib/api';
+import { copyForError } from '@/lib/error-copy';
+import { RelativeTime } from '@/components/RelativeTime';
+import { RoleChip } from '@/components/RoleChip';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { EmptyState } from '@/components/EmptyState';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { PageHeader } from '@/components/PageHeader';
 
-type UserStatus = 'active' | 'disabled';
-
-type AdminRole = {
-  id: string;
-  name: string;
-  is_system?: boolean;
-  permissions: string[];
-};
-
-type AdminRolesResponse = {
-  roles: AdminRole[];
-};
-
-type AdminUser = {
+interface AdminUser {
   id: string;
   email: string;
   status: string;
   roles: Array<{ id: string; name: string }>;
-  created_at?: string;
-};
+  created_at: string;
+  last_login_at?: string | null;
+  last_password_change_at?: string | null;
+}
 
-type AdminUsersResponse = {
+interface AdminUsersResponse {
   users: AdminUser[];
   total: number;
   limit: number;
   offset: number;
-};
+}
 
-type UserAction = {
-  userId: string;
-  action: 'disable' | 'enable' | 'delete';
-};
+interface AdminRole {
+  id: string;
+  name: string;
+  is_system?: boolean;
+  permissions: string[];
+}
+interface AdminRolesResponse {
+  roles: AdminRole[];
+}
 
-type RoleAction = {
-  userId: string;
-  roleIds: string[];
-};
+function statusToBadgeVariant(status: string): 'success' | 'warning' | 'secondary' | 'destructive' | 'outline' {
+  switch (status) {
+    case 'active':
+      return 'success';
+    case 'pending':
+      return 'warning';
+    case 'disabled':
+      return 'secondary';
+    case 'deleted':
+      return 'destructive';
+    default:
+      return 'outline';
+  }
+}
 
-type PasswordAction = {
-  userId: string;
-  password: string;
-};
+function initialsFromEmail(email: string): string {
+  const local = email.split('@')[0] ?? '';
+  return (
+    local
+      .split(/[._-]/)
+      .slice(0, 2)
+      .map((p) => p[0]?.toUpperCase() ?? '')
+      .join('') || '?'
+  );
+}
 
 export function DirectoryPage() {
   const queryClient = useQueryClient();
-  const [status, setStatus] = useState<UserStatus>('active');
-  const [message, setMessage] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-  const [roleDrafts, setRoleDrafts] = useState<Record<string, string[]>>({});
-  const [resetUser, setResetUser] = useState<AdminUser | null>(null);
-  const [password, setPassword] = useState('');
+  const [search, setSearch] = React.useState('');
+  const [detailUser, setDetailUser] = React.useState<UserDetailUser | null>(null);
+  const [detailOpen, setDetailOpen] = React.useState(false);
+  const [resetUser, setResetUser] = React.useState<ResetPasswordDialogUser | null>(null);
+  const [resetOpen, setResetOpen] = React.useState(false);
+  const [deleteUser, setDeleteUser] = React.useState<AdminUser | null>(null);
+  const [deleteConfirmEmail, setDeleteConfirmEmail] = React.useState('');
 
-  const users = useQuery({
-    queryKey: ['admin', 'users', status],
-    queryFn: ({ signal }) => apiFetch<AdminUsersResponse>(`/admin/users?status=${status}`, { signal }),
+  const usersQuery = useQuery({
+    queryKey: ['admin', 'users'],
+    queryFn: ({ signal }) => apiFetch<AdminUsersResponse>('/admin/users', { signal }),
   });
-  const roles = useQuery({
+
+  const rolesQuery = useQuery({
     queryKey: ['admin', 'roles'],
     queryFn: ({ signal }) => apiFetch<AdminRolesResponse>('/admin/roles', { signal }),
   });
 
-  const userRows = users.data?.users ?? [];
-  const roleOptions = roles.data?.roles ?? [];
+  const users = usersQuery.data?.users ?? [];
+  const filtered = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return users;
+    return users.filter((u) => u.email.toLowerCase().includes(q));
+  }, [users, search]);
 
-  const userMutation = useMutation({
-    mutationFn: ({ userId, action }: UserAction) => {
-      if (action === 'delete') {
-        return apiFetch(`/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+  const setStatusMutation = useMutation({
+    mutationFn: ({ userId, status }: { userId: string; status: 'disable' | 'enable' }) =>
+      apiFetch(`/admin/users/${encodeURIComponent(userId)}/${status}`, { method: 'POST' }),
+    // Optimistic: update the status badge in the cached list before the request resolves.
+    onMutate: async ({ userId, status }) => {
+      await queryClient.cancelQueries({ queryKey: ['admin', 'users'] });
+      const previous = queryClient.getQueryData<AdminUsersResponse>(['admin', 'users']);
+      if (previous) {
+        const nextUserStatus = status === 'disable' ? 'disabled' : 'active';
+        const optimistic = {
+          ...previous,
+          users: previous.users.map((u) => (u.id === userId ? { ...u, status: nextUserStatus } : u)),
+        };
+        queryClient.setQueryData(['admin', 'users'], optimistic);
       }
-
-      return apiFetch(`/admin/users/${encodeURIComponent(userId)}/${action}`, { method: 'POST' });
+      return { previous };
     },
-    onSuccess: () => {
-      setMessage(null);
-      setSuccess(null);
+    onError: (err, _vars, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(['admin', 'users'], context.previous);
+      }
+      if (err instanceof ApiError) {
+        toast.error(copyForError(err));
+      } else {
+        toast.error('Could not update user status');
+      }
+    },
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
       void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
-    onError: (err) => setMessage(copyForError(err)),
+    onSuccess: (_data, vars) => {
+      toast.success(vars.status === 'disable' ? 'User disabled' : 'User enabled');
+    },
   });
 
-  const roleMutation = useMutation({
-    mutationFn: ({ userId, roleIds }: RoleAction) =>
-      apiFetch(`/admin/users/${encodeURIComponent(userId)}/roles`, {
-        method: 'PUT',
-        body: { role_ids: roleIds },
-      }),
-    onSuccess: () => {
-      setMessage(null);
-      setSuccess('Roles updated.');
+  const deleteMutation = useMutation({
+    mutationFn: (userId: string) =>
+      apiFetch(`/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE' }),
+    onMutate: async (userId) => {
+      await queryClient.cancelQueries({ queryKey: ['admin', 'users'] });
+      const previous = queryClient.getQueryData<AdminUsersResponse>(['admin', 'users']);
+      if (previous) {
+        queryClient.setQueryData(['admin', 'users'], {
+          ...previous,
+          users: previous.users.filter((u) => u.id !== userId),
+          total: Math.max(0, previous.total - 1),
+        });
+      }
+      return { previous };
+    },
+    onError: (err, _vars, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(['admin', 'users'], context.previous);
+      }
+      if (err instanceof ApiError) {
+        toast.error(copyForError(err));
+      } else {
+        toast.error('Could not delete user');
+      }
+      // Only refetch on error so the server-truth matches the cache again.
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+    },
+    onSuccess: () => {
+      toast.success('User deleted');
+      setDeleteUser(null);
+      setDeleteConfirmEmail('');
+      // Trust the optimistic state; skip refetch so a stale mock handler
+      // can't accidentally re-introduce a row we just removed.
       void queryClient.invalidateQueries({ queryKey: ['me'] });
     },
-    onError: (err) => setMessage(copyForError(err)),
   });
 
-  const passwordMutation = useMutation({
-    mutationFn: ({ userId, password: nextPassword }: PasswordAction) =>
-      apiFetch(`/admin/users/${encodeURIComponent(userId)}/reset-password`, {
-        method: 'POST',
-        body: { password: nextPassword },
+  function openDetail(user: AdminUser) {
+    setDetailUser(user);
+    setDetailOpen(true);
+  }
+
+  function openReset(user: AdminUser) {
+    setResetUser({ id: user.id, email: user.email });
+    setResetOpen(true);
+  }
+
+  function startDelete(user: AdminUser) {
+    setDeleteUser(user);
+    setDeleteConfirmEmail('');
+  }
+
+  function confirmDelete() {
+    if (!deleteUser) return;
+    if (deleteConfirmEmail.trim().toLowerCase() !== deleteUser.email.toLowerCase()) {
+      toast.error('Type the user email exactly to confirm');
+      return;
+    }
+    deleteMutation.mutate(deleteUser.id);
+  }
+
+  const columnHelper = createColumnHelper<AdminUser>();
+  const columns = React.useMemo<ColumnDef<AdminUser, unknown>[]>(
+    () => [
+      columnHelper.accessor('email', {
+        id: 'name',
+        header: () => (
+          <span className="inline-flex items-center gap-1">
+            Name <ArrowUpDown className="h-3.5 w-3.5 opacity-50" />
+          </span>
+        ),
+        cell: (info) => {
+          const email = info.getValue();
+          const display = email.split('@')[0];
+          return (
+            <div className="flex items-center gap-3">
+              <Avatar className="h-8 w-8">
+                <AvatarFallback>{initialsFromEmail(email)}</AvatarFallback>
+              </Avatar>
+              <div className="min-w-0">
+                <div className="truncate font-medium" title={display}>
+                  {display}
+                </div>
+                <div className="truncate text-xs text-muted-foreground" title={email}>
+                  {email}
+                </div>
+              </div>
+            </div>
+          );
+        },
       }),
-    onSuccess: () => {
-      setMessage(null);
-      setSuccess('Password reset.');
-      setResetUser(null);
-      setPassword('');
-      void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
-    },
-    onError: (err) => setMessage(copyForError(err)),
-  });
+      columnHelper.accessor((row) => row.roles.map((r) => r.name).join(','), {
+        id: 'roles',
+        header: 'Roles',
+        enableSorting: false,
+        cell: (info) => {
+          const user = info.row.original;
+          if (user.roles.length === 0) {
+            return <span className="text-xs text-muted-foreground">—</span>;
+          }
+          return (
+            <div className="flex max-w-[220px] flex-wrap gap-1">
+              {user.roles.map((role) => (
+                <RoleChip key={role.id} role={role.name} />
+              ))}
+            </div>
+          );
+        },
+      }),
+      columnHelper.accessor('status', {
+        id: 'status',
+        header: 'Status',
+        cell: (info) => {
+          const status = info.getValue();
+          return (
+            <Badge variant={statusToBadgeVariant(status)} className="capitalize">
+              {status}
+            </Badge>
+          );
+        },
+      }),
+      columnHelper.accessor((row) => row.last_login_at ?? '', {
+        id: 'last_login',
+        header: 'Last login',
+        cell: (info) => {
+          const v = info.getValue();
+          if (!v) return <span className="text-xs text-muted-foreground">Never</span>;
+          return <RelativeTime date={v} />;
+        },
+      }),
+      columnHelper.display({
+        id: 'actions',
+        header: '',
+        enableSorting: false,
+        cell: (info) => {
+          const user = info.row.original;
+          const isActive = user.status === 'active';
+          return (
+            <div
+              className="flex justify-end"
+              // Stop row click bubbling to the row's onRowClick handler.
+              onClick={(e) => e.stopPropagation()}
+            >
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Open actions for ${user.email}`}
+                    data-testid={`actions-${user.id}`}
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-48">
+                  <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => openReset(user)}>
+                    <KeyRound /> Reset password
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      setStatusMutation.mutate({ userId: user.id, status: isActive ? 'disable' : 'enable' })
+                    }
+                    disabled={setStatusMutation.isPending}
+                  >
+                    {isActive ? (
+                      <>
+                        <Lock /> Disable
+                      </>
+                    ) : (
+                      <>
+                        <UserCheck /> Enable
+                      </>
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => openDetail(user)}>
+                    <Shield /> Manage roles
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => startDelete(user)}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    <Trash2 /> Delete
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          );
+        },
+      }),
+    ],
+    // Recompute when status mutation goes pending so disabled state stays in sync.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [columnHelper, setStatusMutation.isPending, deleteMutation.isPending],
+  );
 
-  function roleIdsFor(user: AdminUser) {
-    return roleDrafts[user.id] ?? user.roles.map((role) => role.id);
-  }
-
-  function toggleRole(user: AdminUser, roleId: string, checked: boolean) {
-    const currentIds = roleIdsFor(user);
-    setRoleDrafts((current) => ({
-      ...current,
-      [user.id]: checked ? [...currentIds, roleId] : currentIds.filter((id) => id !== roleId),
-    }));
-  }
+  const isLoading = usersQuery.isLoading || rolesQuery.isLoading;
+  const isError = usersQuery.isError || rolesQuery.isError;
+  const hasUsers = !isLoading && !isError && users.length > 0;
 
   return (
     <section className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-sm font-medium text-muted-foreground">Admin</p>
-          <h1 className="text-2xl font-semibold tracking-normal">Directory</h1>
-        </div>
-        <div className="inline-flex w-fit rounded-md border p-1">
-          {(['active', 'disabled'] as const).map((nextStatus) => (
-            <button
-              key={nextStatus}
-              className={`h-8 rounded px-3 text-sm font-medium capitalize ${status === nextStatus ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}`}
-              type="button"
-              onClick={() => setStatus(nextStatus)}
-            >
-              {nextStatus}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {message ? <p className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{message}</p> : null}
-      {success ? <p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm text-emerald-700">{success}</p> : null}
-
-      {users.isLoading || roles.isLoading ? (
-        <p className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="size-4 animate-spin" /> Loading users.
-        </p>
-      ) : null}
-
-      {users.isError || roles.isError ? (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-          Could not load users.
-        </p>
-      ) : null}
-
-      <div className="overflow-x-auto rounded-lg border">
-        <table className="w-full min-w-[760px] text-left text-sm">
-          <thead className="border-b bg-muted/50 text-muted-foreground">
-            <tr>
-              <th className="px-4 py-3 font-medium">User</th>
-              <th className="px-4 py-3 font-medium">Status</th>
-              <th className="px-4 py-3 font-medium">Roles</th>
-              <th className="px-4 py-3 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {userRows.map((user) => {
-              const selectedRoleIds = roleIdsFor(user);
-              return (
-                <tr key={user.id} className="border-b last:border-0" data-testid={`user-${user.id}`}>
-                  <td className="px-4 py-3 align-top">
-                    <div className="font-medium">{user.email}</div>
-                    <div className="text-xs text-muted-foreground">Created {user.created_at ?? 'unknown'}</div>
-                  </td>
-                  <td className="px-4 py-3 align-top">
-                    <span className="rounded-full border px-2 py-0.5 text-xs font-medium capitalize text-muted-foreground">
-                      {user.status}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 align-top">
-                    <fieldset className="grid gap-2">
-                      <legend className="sr-only">Roles for {user.email}</legend>
-                      <div className="flex flex-wrap gap-3">
-                        {roleOptions.map((role) => (
-                          <label key={role.id} className="inline-flex items-center gap-2 text-xs">
-                            <input
-                              checked={selectedRoleIds.includes(role.id)}
-                              className="size-4 rounded border-input"
-                              type="checkbox"
-                              onChange={(event) => toggleRole(user, role.id, event.currentTarget.checked)}
-                            />
-                            {role.name}
-                          </label>
-                        ))}
-                      </div>
-                      <button
-                        className="w-fit rounded-md border px-2 py-1 text-xs font-medium hover:bg-accent disabled:opacity-60"
-                        disabled={roleMutation.isPending}
-                        type="button"
-                        onClick={() => roleMutation.mutate({ userId: user.id, roleIds: selectedRoleIds })}
-                      >
-                        Save roles for {user.email}
-                      </button>
-                    </fieldset>
-                  </td>
-                  <td className="px-4 py-3 align-top">
-                    <div className="flex flex-wrap gap-2">
-                      {user.status === 'active' ? (
-                        <button
-                          className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-accent disabled:opacity-60"
-                          disabled={userMutation.isPending}
-                          type="button"
-                          onClick={() => userMutation.mutate({ userId: user.id, action: 'disable' })}
-                        >
-                          Disable {user.email}
-                        </button>
-                      ) : (
-                        <button
-                          className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-accent disabled:opacity-60"
-                          disabled={userMutation.isPending}
-                          type="button"
-                          onClick={() => userMutation.mutate({ userId: user.id, action: 'enable' })}
-                        >
-                          Enable {user.email}
-                        </button>
-                      )}
-                      <button
-                        className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-accent"
-                        type="button"
-                        onClick={() => {
-                          setResetUser(user);
-                          setPassword('');
-                        }}
-                      >
-                        Reset password for {user.email}
-                      </button>
-                      <button
-                        className="rounded-md border border-destructive/50 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:opacity-60"
-                        disabled={userMutation.isPending}
-                        type="button"
-                        onClick={() => userMutation.mutate({ userId: user.id, action: 'delete' })}
-                      >
-                        Delete {user.email}
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {users.isSuccess && userRows.length === 0 ? <p className="text-sm text-muted-foreground">No {status} users.</p> : null}
-
-      {resetUser ? (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-background/80 p-4" role="presentation">
-          <form
-            aria-labelledby="reset-password-title"
-            aria-modal="true"
-            className="w-full max-w-md rounded-lg border bg-background p-6 shadow-lg"
-            role="dialog"
-            onSubmit={(event) => {
-              event.preventDefault();
-              passwordMutation.mutate({ userId: resetUser.id, password });
-            }}
-          >
-            <h2 id="reset-password-title" className="text-lg font-semibold">Reset password</h2>
-            <p className="mt-1 text-sm text-muted-foreground">Set a new password for {resetUser.email}.</p>
-            <label className="mt-4 grid gap-1 text-sm font-medium">
-              New password
-              <input
-                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.currentTarget.value)}
+      <PageHeader
+        title="Users"
+        description="Manage team members, roles, and access."
+        actions={
+          <>
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.currentTarget.value)}
+                placeholder="Search name or email…"
+                className="w-56 pl-8"
+                aria-label="Search users"
+                data-testid="users-search"
               />
-            </label>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                className="rounded-md border px-3 py-2 text-sm font-medium hover:bg-accent"
-                type="button"
-                onClick={() => setResetUser(null)}
-              >
-                Cancel
-              </button>
-              <button
-                className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-60"
-                disabled={!password || passwordMutation.isPending}
-                type="submit"
-              >
-                Set password
-              </button>
             </div>
-          </form>
+            <Button
+              type="button"
+              variant="default"
+              onClick={() => toast.info('Invite flow coming soon')}
+              data-testid="invite-button"
+            >
+              <UserPlus className="h-4 w-4" /> Invite
+            </Button>
+          </>
+        }
+      />
+
+      {isError ? (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          Could not load users.
         </div>
       ) : null}
+
+      {hasUsers || isLoading ? (
+        <DataTable
+          columns={columns}
+          data={filtered}
+          isLoading={isLoading}
+          onRowClick={openDetail}
+          ariaLabel="Users directory"
+          emptyState={
+            users.length > 0 && filtered.length === 0 ? (
+              <div className="p-6 text-sm text-muted-foreground">No users match "{search}".</div>
+            ) : (
+              <EmptyState title="No users yet" description="Invite a teammate to get started." />
+            )
+          }
+        />
+      ) : !isError ? (
+        <EmptyState title="No users yet" description="Invite a teammate to get started." />
+      ) : null}
+
+      {isLoading ? (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading users…
+        </p>
+      ) : null}
+
+      <UserDetailDrawer user={detailUser} open={detailOpen} onOpenChange={setDetailOpen} />
+      <ResetPasswordDialog user={resetUser} open={resetOpen} onOpenChange={setResetOpen} />
+
+      <Dialog
+        open={!!deleteUser}
+        onOpenChange={(next) => {
+          if (!next) {
+            setDeleteUser(null);
+            setDeleteConfirmEmail('');
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete {deleteUser?.email}?</DialogTitle>
+            <DialogDescription>
+              This permanently removes the user and revokes all active sessions. To confirm, type the user's email
+              address below.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="delete-confirm">Email address</Label>
+            <Input
+              id="delete-confirm"
+              autoComplete="off"
+              value={deleteConfirmEmail}
+              onChange={(e) => setDeleteConfirmEmail(e.currentTarget.value)}
+              placeholder={deleteUser?.email}
+              data-testid="delete-confirm-input"
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setDeleteUser(null);
+                setDeleteConfirmEmail('');
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={confirmDelete}
+              disabled={
+                deleteMutation.isPending ||
+                !deleteUser ||
+                deleteConfirmEmail.trim().toLowerCase() !== deleteUser.email.toLowerCase()
+              }
+              data-testid="delete-confirm-submit"
+            >
+              {deleteMutation.isPending ? 'Deleting…' : 'Delete user'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

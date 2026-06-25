@@ -4,6 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Wiki</title>
+    <script>
+      // Apply theme class BEFORE React mounts to avoid dark-mode flash.
+      (function () {
+        try {
+          var stored = localStorage.getItem('llm-wiki-theme');
+          var prefersDark =
+            window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var dark =
+            stored === 'dark' ||
+            (stored === null && prefersDark) ||
+            (stored === 'system' && prefersDark);
+          if (dark) document.documentElement.classList.add('dark');
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (e) {
+          /* localStorage may be blocked; default to light */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

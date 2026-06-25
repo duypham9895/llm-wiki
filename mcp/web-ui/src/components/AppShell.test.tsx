@@ -36,6 +36,7 @@ describe('AppShell nav', () => {
     expect(screen.getByRole('link', { name: 'Directory' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Roles' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Settings' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Sources' })).toBeInTheDocument();
   });
 
   it('renders not authorized for a direct guarded route without permission', async () => {

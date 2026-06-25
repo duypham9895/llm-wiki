@@ -28,6 +28,7 @@ export const NAV: NavGroup[] = [
       { label: 'Approvals', path: '/admin/approvals', perm: 'users.manage' },
       { label: 'Directory', path: '/admin/directory', perm: 'users.manage' },
       { label: 'Roles', path: '/admin/roles', perm: 'roles.manage' },
+      { label: 'Sources', path: '/admin/sources', perm: 'users.manage' },
       { label: 'Settings', path: '/admin/settings', perm: 'roles.manage' },
     ],
   },

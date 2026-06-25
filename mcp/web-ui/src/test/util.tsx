@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import type { ReactElement, ReactNode } from 'react';
 
 import { AuthProvider, type Me } from '../lib/auth';
+import { ThemeProvider } from '../lib/theme';
 
 type TestMe = Partial<Me> & Pick<Me, 'permissions'>;
 
@@ -33,13 +34,15 @@ export function renderWithProviders(
 
   function Wrapper({ children }: { children: ReactNode }) {
     return (
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[route]}>
-          <AuthProvider fallback={<p>Loading</p>} onUnauthenticated={<p>Please sign in</p>}>
-            {children}
-          </AuthProvider>
-        </MemoryRouter>
-      </QueryClientProvider>
+      <ThemeProvider>
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[route]}>
+            <AuthProvider fallback={<p>Loading</p>} onUnauthenticated={<p>Please sign in</p>}>
+              {children}
+            </AuthProvider>
+          </MemoryRouter>
+        </QueryClientProvider>
+      </ThemeProvider>
     );
   }
 

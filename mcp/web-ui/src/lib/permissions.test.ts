@@ -22,11 +22,18 @@ describe('visibleSections', () => {
   it('shows the admin Manage entries for full admins', () => {
     const manage = visibleSections(['users.manage', 'roles.manage']).find((section) => section.group === 'Manage');
 
-    expect(manage?.items.map((item) => item.label)).toEqual(['Approvals', 'Directory', 'Roles', 'Settings']);
+    expect(manage?.items.map((item) => item.label)).toEqual([
+      'Approvals',
+      'Directory',
+      'Roles',
+      'Sources',
+      'Settings',
+    ]);
     expect(manage?.items.map((item) => item.path)).toEqual([
       '/admin/approvals',
       '/admin/directory',
       '/admin/roles',
+      '/admin/sources',
       '/admin/settings',
     ]);
   });
