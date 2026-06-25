@@ -2,12 +2,11 @@
 FROM --platform=linux/amd64 node:22-alpine AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
-# npm has a bug (npm/cli#4828) where optionalDependencies are not
-# reliably installed for rolldown's native binding on linux-musl platforms.
-# Workaround: explicit install of the matching binding after `npm i`.
-# Rolldown's package name uses `x64` while docker's TARGETARCH uses `amd64`.
-RUN npm i --no-audit --no-fund && \
-    npm i --no-audit --no-fund @rolldown/binding-linux-x64-musl
+# npm 10.9 (ships with node:22-alpine) has bug #4828 — optionalDependencies
+# are not reliably installed for native bindings (rolldown, lightningcss, etc.)
+# Upgrade to npm 11 first as the actual root-cause fix.
+RUN npm install -g npm@11 --no-audit --no-fund && \
+    npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
