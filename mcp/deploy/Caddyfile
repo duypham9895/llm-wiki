@@ -8,13 +8,15 @@
 
     # SSE/streaming — disable buffering so chat tokens flush as they arrive.
     # Real path is POST /api/chat/conversations/{cid}/messages (sse_starlette.EventSourceResponse).
-    @sse path /api/chat/conversations/*/messages
+    @sse path /api/chat/conversations/**/messages
     reverse_proxy @sse prd-app:8300 {
         flush_interval -1
     }
 
     # other API paths
-    reverse_proxy /api/* prd-app:8300
+    # IMPORTANT: `/**` matches multiple path segments; `/*` matches only one.
+    # /api/auth/login is 2 segments deep and would NOT match /api/*.
+    reverse_proxy /api/** prd-app:8300
     reverse_proxy /healthz prd-app:8300
 
     # static UI (volume-mounted at /srv)
