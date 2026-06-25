@@ -20,10 +20,6 @@ export default defineConfig({
         target: 'http://localhost:8300',
         changeOrigin: false,
       },
-      '/prd': {
-        target: 'http://localhost:8300',
-        changeOrigin: false,
-      },
       '/healthz': 'http://localhost:8300',
     },
   },
