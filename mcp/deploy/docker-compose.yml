@@ -85,6 +85,24 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [prd_net]
 
+  # Nightly PRD pipeline (sync → enrich → index) + force-reindex safety net.
+  # Independent of prd-app health — cron must run even if the app is down.
+  # Uses node:22-alpine so `npm run orchestrate` (tsx) works; repo mounted :ro.
+  prd-cron:
+    image: node:22-alpine
+    restart: unless-stopped
+    env_file: .env
+    user: "0:0"  # busybox crond reads /etc/crontabs/root; needs root
+    command: ["sh", "/usr/local/bin/entrypoint.sh"]
+    volumes:
+      - ./cron/crontab.txt:/etc/crontabs/root:ro
+      - ./cron/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      - ./cron/cron-pipeline.sh:/usr/local/bin/cron-pipeline.sh:ro
+      - ./cron/cron-reindex.sh:/usr/local/bin/cron-reindex.sh:ro
+      - ../:/app:ro          # repo root: src/ + package.json + mcp/.venv
+      - prd_vault:/data/vault:rw  # writes new PRD .md files (sync + enrich)
+    networks: [prd_net]
+
 volumes:
   prd_pgdata:
   prd_vault:

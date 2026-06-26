@@ -1,0 +1,5 @@
+# /etc/crontabs/root — busybox crond format (min hr dom mon dow command)
+# Daily full PRD pipeline (sync Notion → enrich → re-index).
+0 2 * * * /usr/local/bin/cron-pipeline.sh >> /var/log/cron.log 2>&1
+# Daily force re-index — catch any drift from the morning pipeline.
+0 3 * * * /usr/local/bin/cron-reindex.sh >> /var/log/cron.log 2>&1
