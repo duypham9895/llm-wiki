@@ -49,7 +49,22 @@ export async function withRetry<T>(
       return await fn();
     } catch (err: any) {
       const status = err?.status ?? err?.code;
-      const retriable = status === 429 || (typeof status === 'number' && status >= 500);
+      const code = err?.code;
+      // Retriable: rate limits (429), server errors (5xx), AND transient
+      // network/timeout failures. The Notion client throws these with a string
+      // `code` and no numeric status — without listing them here, a single slow
+      // response (>30s apiTimeoutMs) crashes the entire sync uncaught. These are
+      // the most common real-world flakes on a 700+ page backlog.
+      const transient =
+        code === 'notionhq_client_request_timeout' ||
+        code === 'notionhq_client_response_error' ||
+        code === 'ETIMEDOUT' ||
+        code === 'ECONNRESET' ||
+        code === 'ECONNREFUSED' ||
+        code === 'EAI_AGAIN' ||
+        code === 'service_unavailable' ||
+        code === 'internal_server_error';
+      const retriable = status === 429 || (typeof status === 'number' && status >= 500) || transient;
       if (!retriable || attempt >= retries) {
         // On 429, surface a typed error so callers (e.g. sources.py) can show
         // "rate limited, retry in N seconds" instead of a generic crash.
