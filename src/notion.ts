@@ -3,11 +3,28 @@ import type { DiscoveredItem } from './types.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Maximum time to wait between retries, regardless of what Notion says.
+ *  Notion's Retry-After header can be up to 60s for hard rate-limits — honoring
+ *  it literally can blow past the parent subprocess's 5-min timeout and turn
+ *  a transient 429 into a hard pipeline halt. We honor a small Retry-After,
+ *  then fall back to exponential backoff, capped at this ceiling. */
+const MAX_BACKOFF_MS = 15_000;
+
+export class NotionRateLimited extends Error {
+  /** Seconds until Notion expects the next request to succeed (from Retry-After). */
+  readonly retryAfterSec: number;
+  constructor(retryAfterSec: number) {
+    super(`Notion rate-limited. Try again in ${retryAfterSec}s.`);
+    this.name = 'NotionRateLimited';
+    this.retryAfterSec = retryAfterSec;
+  }
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   opts: { retries?: number; sleepFn?: (ms: number) => Promise<void> } = {},
 ): Promise<T> {
-  const retries = opts.retries ?? 4;
+  const retries = opts.retries ?? 3;
   const sleepFn = opts.sleepFn ?? sleep;
   let attempt = 0;
   for (;;) {
@@ -16,9 +33,20 @@ export async function withRetry<T>(
     } catch (err: any) {
       const status = err?.status ?? err?.code;
       const retriable = status === 429 || (typeof status === 'number' && status >= 500);
-      if (!retriable || attempt >= retries) throw err;
+      if (!retriable || attempt >= retries) {
+        // On 429, surface a typed error so callers (e.g. sources.py) can show
+        // "rate limited, retry in N seconds" instead of a generic crash.
+        if (status === 429) {
+          const ra = Number(err?.headers?.['retry-after']);
+          throw new NotionRateLimited(Number.isFinite(ra) ? ra : 60);
+        }
+        throw err;
+      }
       const retryAfter = Number(err?.headers?.['retry-after']);
-      const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : Math.min(2 ** attempt * 500, 8000);
+      // Honor Retry-After up to MAX_BACKOFF_MS, then exponential fallback.
+      const hinted = Number.isFinite(retryAfter) ? retryAfter * 1000 : Math.min(2 ** attempt * 500, MAX_BACKOFF_MS);
+      const waitMs = Math.min(hinted, MAX_BACKOFF_MS);
+      console.warn(`[notion] ${status} — retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${retries})`);
       await sleepFn(waitMs);
       attempt++;
     }

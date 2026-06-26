@@ -225,6 +225,9 @@ async def _spawn_sync_cli(core: Core, run_id: str) -> bool:
         return False
 
     try:
+        # 5-minute hard timeout — the sync CLI now has capped 15s backoffs (3 retries)
+        # + actual request time, so 5 min is enough margin to surface a rate-limit error
+        # cleanly instead of getting killed mid-retry.
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
     except asyncio.TimeoutError:
         proc.kill()
