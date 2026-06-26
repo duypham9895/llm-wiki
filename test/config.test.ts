@@ -14,6 +14,23 @@ test('loadConfig throws when vault path missing', () => {
   expect(() => loadConfig({} as NodeJS.ProcessEnv, () => 't')).toThrow(/VAULT_PATH/);
 });
 
+test('stateFile defaults INSIDE the vault (persistent), not cwd', () => {
+  const cfg = loadConfig(fakeEnv, () => 'secret-token');
+  expect(cfg.stateFile).toBe('/tmp/vault/.sync-state.json');
+});
+
+test('STATE_FILE relative env is resolved under the vault', () => {
+  const env = { ...fakeEnv, STATE_FILE: 'custom-state.json' } as NodeJS.ProcessEnv;
+  const cfg = loadConfig(env, () => 'secret-token');
+  expect(cfg.stateFile).toBe('/tmp/vault/custom-state.json');
+});
+
+test('STATE_FILE absolute env is used verbatim', () => {
+  const env = { ...fakeEnv, STATE_FILE: '/data/state.json' } as NodeJS.ProcessEnv;
+  const cfg = loadConfig(env, () => 'secret-token');
+  expect(cfg.stateFile).toBe('/data/state.json');
+});
+
 test('loadConfig throws when token empty', () => {
   expect(() => loadConfig(fakeEnv, () => '')).toThrow(/token/i);
 });
