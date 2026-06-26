@@ -1,12 +1,13 @@
 import * as React from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Database, Loader2, Plug, RefreshCw } from 'lucide-react';
+import { AlertTriangle, Database, ExternalLink, Loader2, Plug, RefreshCw, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { apiFetch, ApiError } from '@/lib/api';
 import { formatElapsed } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
   Dialog,
   DialogContent,
@@ -69,6 +70,17 @@ export function SourcesPage() {
     },
   });
 
+  // Notion token health — pings /v1/users/me to classify the configured token
+  // (ok / wrong_token / wrong_token_type / rate_limited / missing / unreachable).
+  // Surfaces the most common operator mistake: NOTION_TOKEN is a Personal Access
+  // Token instead of an Internal Integration Secret. Refetched every 5 min.
+  const notionHealth = useQuery({
+    queryKey: ['notion-health'],
+    queryFn: ({ signal }) => apiFetch<NotionHealth>('/prd/_health/notion', { signal }),
+    refetchInterval: 5 * 60_000,
+    retry: false,
+  });
+
   const runMutation = useMutation({
     mutationFn: (sourceId: string) =>
       apiFetch<RunOut>(`/admin/sources/${encodeURIComponent(sourceId)}/run`, {
@@ -94,6 +106,8 @@ export function SourcesPage() {
         title="Sources"
         description="Connect external systems that feed your PRD vault."
       />
+
+      <NotionHealthBanner health={notionHealth.data} loading={notionHealth.isLoading} />
 
       {sources.isLoading ? (
         <div className="space-y-3">
@@ -303,4 +317,81 @@ function useElapsedSeconds(startedAt: string | null): number {
   const start = new Date(startedAt).getTime();
   if (Number.isNaN(start)) return 0;
   return Math.max(0, Math.floor((Date.now() - start) / 1000));
+}
+
+interface NotionHealth {
+  status: 'ok' | 'wrong_token' | 'wrong_token_type' | 'rate_limited' | 'missing' | 'unreachable' | 'error';
+  token_prefix?: string;
+  bot_name?: string;
+  workspace_name?: string;
+  warning?: string;
+  message?: string;
+  fix_url?: string;
+  checked_at?: string;
+}
+
+function NotionHealthBanner({
+  health,
+  loading,
+}: {
+  health: NotionHealth | undefined;
+  loading: boolean;
+}) {
+  if (loading) return null;
+  if (!health) return null;
+  if (health.status === 'ok') {
+    return (
+      <Alert>
+        <ShieldCheck />
+        <AlertTitle>Notion connected</AlertTitle>
+        <AlertDescription>
+          {health.bot_name && health.workspace_name
+            ? `Bot ${health.bot_name} connected to workspace "${health.workspace_name}" (token ${health.token_prefix}).`
+            : `Notion API reachable (token ${health.token_prefix}).`}
+          {health.warning && (
+            <div className="mt-2 text-xs">{health.warning}</div>
+          )}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  const titleByStatus: Record<string, string> = {
+    missing: 'NOTION_TOKEN is not set',
+    wrong_token: 'Notion rejected the token',
+    wrong_token_type: 'Wrong Notion token type',
+    rate_limited: 'Notion rate-limited the health check',
+    unreachable: 'Notion API unreachable',
+    error: 'Notion health check failed',
+  };
+
+  return (
+    <Alert variant="destructive">
+      <AlertTriangle />
+      <AlertTitle>{titleByStatus[health.status] ?? 'Notion misconfigured'}</AlertTitle>
+      <AlertDescription>
+        <p>{health.message ?? 'Unknown error.'}</p>
+        {health.fix_url && (
+          <a
+            className="mt-2 inline-flex items-center gap-1 text-sm underline"
+            href={health.fix_url}
+            rel="noopener noreferrer"
+            target="_blank"
+          >
+            Open Notion integrations <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
+        <ol className="mt-3 list-decimal space-y-1 pl-5 text-xs">
+          <li>Notion → Settings → Connections → Develop integrations → New integration.</li>
+          <li>Name it anything (e.g. "PRD Sync"). Type: Internal.</li>
+          <li>Copy the <strong>Internal Integration Secret</strong> (starts with <code>secret_</code> or <code>ntn_I</code>).</li>
+          <li>Open the Product Backlog database → ••• → Connections → add this integration.</li>
+          <li>
+            Set <code>NOTION_TOKEN=…</code> in <code>mcp/deploy/.env</code> on the VPS, then{' '}
+            <code>docker compose restart prd-app prd-cron</code>.
+          </li>
+        </ol>
+      </AlertDescription>
+    </Alert>
+  );
 }

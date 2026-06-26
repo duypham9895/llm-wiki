@@ -111,3 +111,116 @@ async def enrich(prd_id: str, _=Depends(require_permission("prd.ask"))):
     can show optimistic feedback; the orchestrator will pick these up later.
     """
     return {"status": "queued", "id": str(uuid4()), "prd_id": prd_id}
+
+
+@router.get("/_health/notion")
+async def notion_health(
+    _=Depends(require_permission("users.manage")),
+    core: Core = Depends(get_core),
+):
+    """Pings Notion's /v1/users/me and classifies the response so the Sources page
+    can show a clear "configured correctly / wrong token type / rate-limited"
+    banner. No PII is returned — just the workspace name + bot user id.
+
+    Surfaces the most common operator mistake: NOTION_TOKEN is a personal
+    access token (starts with `ntn_`) instead of an internal integration
+    secret (starts with `secret_` or `ntn_I`). Personal tokens can't read
+    shared databases — every call returns `restricted_resource`.
+    """
+    import os
+    from urllib import request as urlrequest
+    from urllib.error import HTTPError, URLError
+
+    token = os.environ.get("NOTION_TOKEN", "").strip()
+    if not token:
+        return {
+            "status": "missing",
+            "message": "NOTION_TOKEN is not set in mcp/deploy/.env",
+            "fix_url": "https://www.notion.so/profile/integrations",
+        }
+
+    # Hint about token type from the prefix — Notion issues different prefixes
+    # for personal vs internal tokens. Surface this BEFORE the API call so
+    # operators don't need to wait for a 401 to know they're using the wrong
+    # kind.
+    prefix_hint = None
+    if token.startswith("ntn_") and not token.startswith("ntn_I"):
+        prefix_hint = (
+            "NOTION_TOKEN looks like a Personal Access Token. The Notion sync "
+            "needs an Internal Integration Secret (starts with `secret_` or "
+            "`ntn_I`). Create one at Settings → Connections → Develop integrations."
+        )
+
+    req = urlrequest.Request(
+        "https://api.notion.com/v1/users/me",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": "2022-06-28",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            import json as _json
+            data = _json.loads(body)
+            bot_id = data.get("id", "unknown")
+            bot_name = data.get("name", "unknown")
+            workspace_name = "unknown"
+            try:
+                workspace_name = data.get("bot", {}).get("workspace_name", "unknown")
+            except Exception:
+                pass
+            out = {
+                "status": "ok",
+                "token_prefix": token[:8] + "...",
+                "bot_id": bot_id,
+                "bot_name": bot_name,
+                "workspace_name": workspace_name,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if prefix_hint:
+                out["warning"] = prefix_hint
+            return out
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        if e.code == 401:
+            return {
+                "status": "wrong_token",
+                "token_prefix": token[:8] + "...",
+                "message": f"Notion rejected the token (HTTP 401). Body: {body[:200]}",
+                "fix_url": "https://www.notion.so/profile/integrations",
+            }
+        if e.code == 403:
+            return {
+                "status": "wrong_token_type",
+                "token_prefix": token[:8] + "...",
+                "message": (
+                    "Notion returned 403 — the token is valid but cannot read "
+                    "the configured database. Most common cause: NOTION_TOKEN "
+                    "is a Personal Access Token; the Notion sync needs an "
+                    "Internal Integration that has been shared with the "
+                    "Product Backlog database."
+                ),
+                "fix_url": "https://www.notion.so/profile/integrations",
+            }
+        if e.code == 429:
+            return {
+                "status": "rate_limited",
+                "token_prefix": token[:8] + "...",
+                "message": f"Notion rate-limited the check (HTTP 429). Body: {body[:200]}",
+            }
+        return {
+            "status": "error",
+            "token_prefix": token[:8] + "...",
+            "message": f"Notion returned HTTP {e.code}. Body: {body[:200]}",
+        }
+    except URLError as e:
+        return {
+            "status": "unreachable",
+            "message": f"Could not reach api.notion.com: {e.reason}",
+        }
+    except Exception as e:  # noqa: BLE001 — last-resort surface for unexpected errors
+        return {
+            "status": "error",
+            "message": f"Unexpected error: {type(e).__name__}: {e}",
+        }
