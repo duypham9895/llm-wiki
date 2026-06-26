@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { motion } from 'framer-motion';
 import { Library as LibraryIcon, Loader2, Search } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
@@ -19,7 +18,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { RelativeTime } from '@/components/RelativeTime';
 
 type LibraryItem = {
   id: string;
@@ -186,56 +184,40 @@ export function LibraryPage() {
 
       {items.length > 0 && (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {items.map((item, i) => (
-            <motion.div
+          {items.map((item) => (
+            <Link
               key={item.id}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.15, delay: Math.min(i, 12) * 0.02 }}
-              whileHover={{ y: -1 }}
+              to={`/library/${encodeURIComponent(item.id)}`}
+              className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-lg"
             >
-              <Link
-                to={`/library/${encodeURIComponent(item.id)}`}
-                className="block focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-lg"
-              >
-                <Card className="h-full transition-shadow hover:shadow-md">
-                  <CardContent className="flex h-full flex-col gap-3 p-5">
-                    <div className="flex items-start justify-between gap-3">
-                      <h3 className="line-clamp-2 text-base font-semibold leading-tight">
-                        {item.title}
-                      </h3>
-                      <Badge
-                        variant={STATUS_BADGE[item.status] ?? 'secondary'}
-                        className="shrink-0 capitalize"
-                      >
-                        {item.status}
-                      </Badge>
+              <Card className="h-full transition-colors hover:bg-accent/40">
+                <CardContent className="space-y-2 p-5">
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 className="line-clamp-2 text-base font-medium leading-tight">
+                      {item.title}
+                    </h3>
+                    <Badge
+                      variant={STATUS_BADGE[item.status] ?? 'secondary'}
+                      className="shrink-0 capitalize"
+                    >
+                      {item.status}
+                    </Badge>
+                  </div>
+                  {item.summary && (
+                    <p className="line-clamp-2 text-sm text-muted-foreground">{item.summary}</p>
+                  )}
+                  {item.tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {item.tags.slice(0, 3).map((t) => (
+                        <span key={t} className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                          {t}
+                        </span>
+                      ))}
                     </div>
-                    {item.summary && (
-                      <p className="line-clamp-3 text-sm text-muted-foreground">{item.summary}</p>
-                    )}
-                    {item.tags.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {item.tags.slice(0, 4).map((t) => (
-                          <Badge key={t} variant="outline" className="font-normal">
-                            {t}
-                          </Badge>
-                        ))}
-                        {item.tags.length > 4 && (
-                          <span className="text-xs text-muted-foreground">
-                            +{item.tags.length - 4} more
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    <div className="mt-auto flex items-center justify-between text-xs text-muted-foreground">
-                      <span className="font-mono">{item.id}</span>
-                      {item.last_edited && <RelativeTime date={item.last_edited} />}
-                    </div>
-                  </CardContent>
-                </Card>
-              </Link>
-            </motion.div>
+                  )}
+                </CardContent>
+              </Card>
+            </Link>
           ))}
         </div>
       )}

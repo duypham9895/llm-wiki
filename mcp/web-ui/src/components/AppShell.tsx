@@ -2,7 +2,7 @@ import * as React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { Bell, ChevronDown, LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen } from 'lucide-react';
+import { LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -149,27 +149,21 @@ export function AppShell() {
 
         <Link to="/library" className="flex items-center gap-2 font-semibold tracking-tight">
           <BookOpen className="h-4 w-4" />
-          <span>LLM Wiki</span>
+          <span className="hidden sm:inline">LLM Wiki</span>
         </Link>
-
-        <div className="ml-2 hidden text-xs text-muted-foreground md:block">{me.email}</div>
 
         <div className="flex-1" />
 
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           // The CommandPalette listens for ⌘K globally; this button is a hint affordance.
           onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))}
-          className="inline-flex h-8 items-center gap-2 rounded-md border bg-muted/40 px-3 text-xs text-muted-foreground transition-colors hover:bg-muted md:w-72 md:justify-between"
+          className="hidden md:inline-flex text-muted-foreground"
         >
-          <span className="flex items-center gap-2">
-            <Search className="h-3.5 w-3.5" /> Search…
-          </span>
-          <span className="hidden items-center gap-1 md:inline-flex">
-            <KbdHint>⌘</KbdHint>
-            <KbdHint>K</KbdHint>
-          </span>
-        </button>
+          <Search /> Search
+          <KbdHint className="ml-2">⌘K</KbdHint>
+        </Button>
 
         <Button
           variant="ghost"
@@ -180,25 +174,17 @@ export function AppShell() {
           {resolvedTheme === 'dark' ? <Sun /> : <Moon />}
         </Button>
 
-        <Button variant="ghost" size="icon" aria-label="Notifications" disabled>
-          <Bell />
-        </Button>
-
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" className="flex h-9 items-center gap-2 px-2">
-              <Avatar className="h-7 w-7">
+            <Button variant="ghost" size="icon" className="rounded-full p-0">
+              <Avatar className="h-8 w-8">
                 <AvatarFallback>{initials || '?'}</AvatarFallback>
               </Avatar>
-              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-56">
             <DropdownMenuLabel className="truncate font-normal">
-              <div className="text-sm font-medium text-foreground">{me.email}</div>
-              <div className="text-xs text-muted-foreground">
-                {me.roles.map((r) => r.name).join(', ') || 'no role'}
-              </div>
+              <div className="text-xs text-muted-foreground">{me.email}</div>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={() => setPasswordOpen(true)}>
