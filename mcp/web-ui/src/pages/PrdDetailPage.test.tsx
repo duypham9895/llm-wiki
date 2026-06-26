@@ -47,11 +47,18 @@ beforeEach(() => {
 
 function installPrdHandler(
   prd: Record<string, unknown>,
-  options: { enrichStatus?: number; enrichBody?: unknown } = {},
+  options: {
+    enrichStatus?: number;
+    enrichBody?: unknown;
+    enrichStatusSequence?: Array<'running' | 'ok' | 'error' | 'timeout'>;
+  } = {},
 ) {
   const enrichStatus = options.enrichStatus ?? 202;
   const enrichBody =
-    options.enrichBody ?? { status: 'queued', id: 'job-1', prd_id: (prd.id as string) ?? 'EP-1' };
+    options.enrichBody ?? { status: 'running', id: 'job-1', prd_id: (prd.id as string) ?? 'EP-1' };
+  // Build the per-poll response sequence (default: running -> ok).
+  const sequence = options.enrichStatusSequence ?? (['running', 'ok'] as const);
+  let pollIndex = 0;
   server.use(
     http.get('/api/prd/:id', ({ params }) =>
       HttpResponse.json({ ...prd, id: params.id as string }),
@@ -62,6 +69,18 @@ function installPrdHandler(
         { status: enrichStatus },
       ),
     ),
+    http.get('/api/prd/:id/enrich/:jobId', ({ params }) => {
+      const status = sequence[Math.min(pollIndex, sequence.length - 1)];
+      pollIndex += 1;
+      return HttpResponse.json({
+        id: params.jobId,
+        prd_id: params.id,
+        started_at: '2026-06-25T10:00:00Z',
+        finished_at: status === 'running' ? null : '2026-06-25T10:05:00Z',
+        status,
+        error: status === 'error' ? 'something broke' : null,
+      });
+    }),
   );
 }
 
@@ -209,7 +228,7 @@ describe('PrdDetailPage', () => {
     fireEvent.click(enrichItem);
 
     await waitFor(() => {
-      expect(toastMock.success).toHaveBeenCalledWith('Enrichment queued');
+      expect(toastMock.success).toHaveBeenCalledWith('Enrichment started');
     });
   });
 
@@ -278,6 +297,99 @@ describe('PrdDetailPage', () => {
 
     // Storage stays empty — only successful loads pollute recents.
     expect(window.localStorage.getItem('prd:recent-views')).toBeNull();
+  });
+
+  it('Re-enrich POST returns job_id, UI shows running state, GET poll resolves to ok -> toast', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installPrdHandler(
+        {
+          found: true,
+          id: 'EP-POLL',
+          title: 'Polling test',
+          body: '## Intro',
+        },
+        // First poll says running, second says ok — exercises the
+        // running->terminal transition that triggers the success toast.
+        { enrichStatusSequence: ['running', 'ok'] },
+      );
+
+      renderDetail({ me: { permissions: ['prd.read', 'prd.ask'] }, route: '/library/EP-POLL' });
+
+      expect(await screen.findByRole('heading', { name: 'Polling test' })).toBeInTheDocument();
+
+      const trigger = screen.getByRole('button', { name: /more actions/i });
+      fireEvent.pointerDown(trigger, { button: 0 });
+      fireEvent.click(trigger);
+      const enrichItem = await screen.findByTestId('action-reenrich');
+      fireEvent.pointerDown(enrichItem, { button: 0 });
+      fireEvent.click(enrichItem);
+
+      // Mutation resolves -> toast.success('Enrichment started') + job id captured.
+      await waitFor(() => {
+        expect(toastMock.success).toHaveBeenCalledWith('Enrichment started');
+      });
+
+      // Progress banner appears while the first poll returns running.
+      const banner = await screen.findByTestId('enrich-progress');
+      expect(banner).toBeInTheDocument();
+      expect(banner).toHaveTextContent(/enrichment running/i);
+
+      // Second poll (after the 2s refetch interval) returns ok, the polling
+      // query stops, and the success toast fires.
+      await waitFor(
+        () => {
+          expect(toastMock.success).toHaveBeenCalledWith('Enrichment finished');
+        },
+        { timeout: 4000 },
+      );
+
+      // Banner clears once the job leaves running.
+      await waitFor(() => {
+        expect(screen.queryByTestId('enrich-progress')).not.toBeInTheDocument();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('Re-enrich error poll surfaces a failure toast with the server error message', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installPrdHandler(
+        {
+          found: true,
+          id: 'EP-FAIL',
+          title: 'Fail test',
+          body: '## Intro',
+        },
+        { enrichStatusSequence: ['running', 'error'] },
+      );
+
+      renderDetail({ me: { permissions: ['prd.read', 'prd.ask'] }, route: '/library/EP-FAIL' });
+
+      expect(await screen.findByRole('heading', { name: 'Fail test' })).toBeInTheDocument();
+
+      const trigger = screen.getByRole('button', { name: /more actions/i });
+      fireEvent.pointerDown(trigger, { button: 0 });
+      fireEvent.click(trigger);
+      const enrichItem = await screen.findByTestId('action-reenrich');
+      fireEvent.pointerDown(enrichItem, { button: 0 });
+      fireEvent.click(enrichItem);
+
+      await waitFor(() => {
+        expect(toastMock.success).toHaveBeenCalledWith('Enrichment started');
+      });
+
+      await waitFor(
+        () => {
+          expect(toastMock.error).toHaveBeenCalledWith('Enrichment failed: something broke');
+        },
+        { timeout: 4000 },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

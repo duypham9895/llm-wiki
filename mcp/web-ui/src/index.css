@@ -146,6 +146,22 @@ body,
   }
 }
 
+/*
+ * Density tokens — driven by `data-density` on <html> from ThemeProvider. The picker at
+ * /admin/theme flips the attribute between "compact" and "comfortable"; consumers
+ * reference --spacing-tight / --spacing-loose in their own styles.
+ */
+:root,
+html[data-density='comfortable'] {
+  --spacing-tight: 0.5rem;
+  --spacing-loose: 1rem;
+}
+
+html[data-density='compact'] {
+  --spacing-tight: 0.25rem;
+  --spacing-loose: 0.5rem;
+}
+
 /* prose tweaks layered on top of Tailwind Typography.
    We don't ship @tailwindcss/typography; these styles are enough for PRD bodies. */
 .prose {

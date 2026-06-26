@@ -1,5 +1,5 @@
 from mcp.server.fastmcp import FastMCP
-from prd_mcp.retrieve import retrieve, keyword_retrieve, tokenize
+from prd_mcp.retrieve import retrieve, keyword_retrieve, tokenize, CardMetadata
 from prd_mcp.answer import answer as build_answer
 from prd_mcp.read import read_prd as _read_prd
 from prd_mcp.vault import read_doc, list_docs
@@ -14,26 +14,39 @@ def _blank(q: str) -> bool:
     return not q or not q.strip()
 
 
-def _result(r):
-    return {"id": r.doc_id, "title": r.title, "summary": r.summary, "tags": r.tags,
-            "status": r.status, "source_url": r.source_url,
-            "obsidian_link": f"[[{r.doc_stem}]]", "snippet": r.text, "score": r.score}
+def _card_dict(c):
+    """Thin card shape — metadata only, NO body/chunk text. Agents use this to
+    decide which PRDs to call read_prd() on. Evidence comes from the vault,
+    not from index chunks (Atlas pattern)."""
+    return {"id": c.id, "title": c.title, "summary": c.summary, "tags": list(c.tags),
+            "status": c.status, "source_url": c.source_url,
+            "obsidian_link": c.obsidian_link, "score": c.score}
 
 
 def search_prds_impl(cfg, store, llm, query: str, k: int) -> dict:
     if _blank(query):
-        return {"count": 0, "verdict": "no_match", "results": []}
+        return {"count": 0, "verdict": "no_match", "results": [], "related": []}
     _ensure_index(store)
     k = min(max(1, int(k)), 20)
-    results, verdict = retrieve(query, store, llm.embed, k, cfg.score_threshold)
-    return {"count": len(results), "verdict": verdict, "results": [_result(r) for r in results]}
+    # We need the chunk text for wikilink extraction, so call retrieve() directly
+    # and project to the thin card shape (no body/snippet in the response).
+    rows, verdict, related = retrieve(query, store, llm.embed, k, cfg.score_threshold)
+    cards = []
+    for r in rows:
+        cards.append(CardMetadata(
+            id=r.doc_id, title=r.title, summary=r.summary, tags=list(r.tags),
+            status=r.status, source_url=r.source_url,
+            obsidian_link=f"[[{r.doc_stem}]]", score=r.score,
+        ))
+    return {"count": len(cards), "verdict": verdict,
+            "results": [_card_dict(c) for c in cards], "related": related}
 
 
 def ask_prds_impl(cfg, store, llm, question: str) -> dict:
     if _blank(question):
         return {"answer": "No PRD covers this.", "sources": [], "grounded": False}
     _ensure_index(store)
-    results, verdict = retrieve(question, store, llm.embed, cfg.top_k, cfg.score_threshold)
+    results, verdict, _related = retrieve(question, store, llm.embed, cfg.top_k, cfg.score_threshold)
     return build_answer(question, results, verdict, llm.chat)
 
 
@@ -41,15 +54,19 @@ def keyword_search_impl(cfg, store, llm, query: str, k: int) -> dict:
     # Guard BEFORE _ensure_index: blank OR all-short-token queries (e.g. "a b" ->
     # zero usable tokens) must return empty without touching the store (Codex N2).
     if _blank(query) or not tokenize(query):
-        return {"count": 0, "results": []}
+        return {"count": 0, "results": [], "related": []}
     _ensure_index(store)
     k = min(max(1, int(k)), 20)
-    results = keyword_retrieve(query, store, k, cfg.prds_dir)
+    results, related = keyword_retrieve(query, store, k, cfg.prds_dir)
+    # Thin card shape — same as search_prds: no snippet/body. read_prd() for
+    # the canonical body when the agent needs to ground an answer.
     return {"count": len(results),
-            "results": [{"id": r.doc_id, "title": r.title, "status": r.status,
-                         "tags": r.tags, "source_url": r.source_url,
-                         "obsidian_link": f"[[{r.doc_stem}]]", "snippet": r.text}
-                        for r in results]}
+            "results": [{"id": r.doc_id, "title": r.title, "summary": r.summary,
+                         "status": r.status, "tags": r.tags,
+                         "source_url": r.source_url,
+                         "obsidian_link": f"[[{r.doc_stem}]]", "score": 0.0}
+                        for r in results],
+            "related": related}
 
 
 def read_prd_impl(cfg, prd_id: str, read_doc_fn=read_doc, list_docs_fn=list_docs) -> dict:

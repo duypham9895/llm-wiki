@@ -114,10 +114,12 @@ def create_app(settings: WebSettings, sessionmaker, *, run_startup: bool = True,
 
     from prd_mcp.web.auth import router as auth_router
     from prd_mcp.web.admin import router as admin_router
+    from prd_mcp.web.notifications import router as notifications_router
     from prd_mcp.web.sources import router as sources_router
 
     app.include_router(auth_router)
     app.include_router(admin_router)
+    app.include_router(notifications_router)
     # sources router owns its own /api prefix; mount even when core is None
     # so the GET (which reads manifests via core) is registered early.
     app.include_router(sources_router)

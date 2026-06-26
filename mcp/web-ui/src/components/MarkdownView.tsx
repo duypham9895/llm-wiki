@@ -1,6 +1,9 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
+import { visit, SKIP } from 'unist-util-visit';
+import type { Plugin } from 'unified';
+import type { Root, Text, Link, PhrasingContent, Parent } from 'mdast';
 import { cn } from '@/lib/utils';
 
 export interface MarkdownViewProps {
@@ -10,10 +13,58 @@ export interface MarkdownViewProps {
   idPrefix?: string;
 }
 
+const WIKILINK_RE = /\[\[([^\]\n|]+)(?:\|([^\]\n]+))?\]\]/g;
+
+/**
+ * Remark plugin: transforms `[[EP-468]]` and `[[EP-468|Label]]` into markdown link nodes.
+ *   [[EP-468]]         -> [EP-468](/library/EP-468)
+ *   [[EP-468|Label]]   -> [Label](/library/EP-468)
+ * The id may contain any non-`]`/non-newline/non-`|` chars (handles `notion:uuid|page` and EP-style handles alike).
+ * Existence is NOT validated here — let the destination 404.
+ */
+export const remarkWikilinks: Plugin<[], Root> = () => {
+  return (tree) => {
+    visit(tree, 'text', (node: Text, index, parent: Parent | undefined) => {
+      if (!parent || typeof index !== 'number') return;
+      const value = node.value;
+      WIKILINK_RE.lastIndex = 0;
+      if (!WIKILINK_RE.test(value)) return;
+      WIKILINK_RE.lastIndex = 0;
+
+      const newChildren: PhrasingContent[] = [];
+      let lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = WIKILINK_RE.exec(value)) !== null) {
+        const [full, rawId, rawLabel] = match;
+        const id = rawId.trim();
+        if (!id) continue;
+        const label = (rawLabel ?? rawId).trim();
+        if (match.index > lastIndex) {
+          newChildren.push({ type: 'text', value: value.slice(lastIndex, match.index) });
+        }
+        const link: Link = {
+          type: 'link',
+          url: `/library/${encodeURIComponent(id)}`,
+          title: null,
+          children: [{ type: 'text', value: label }],
+        };
+        newChildren.push(link);
+        lastIndex = match.index + full.length;
+      }
+      if (lastIndex < value.length) {
+        newChildren.push({ type: 'text', value: value.slice(lastIndex) });
+      }
+      parent.children.splice(index, 1, ...newChildren);
+      return [SKIP, index + newChildren.length];
+    });
+  };
+};
+
 /**
  * Renders PRD body markdown with shadcn prose styles.
  * GFM: tables, task lists, strikethrough, autolinks.
  * rehype-raw: pass-through inline HTML (used sparingly by the sync CLI).
+ * remarkWikilinks: [[EP-468]] / [[EP-468|Label]] -> library links.
  */
 export function MarkdownView({ body, className, idPrefix }: MarkdownViewProps) {
   return (
@@ -35,7 +86,7 @@ export function MarkdownView({ body, className, idPrefix }: MarkdownViewProps) {
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkWikilinks]}
         rehypePlugins={[rehypeRaw]}
         components={{
           h1: ({ id, ...rest }) => <h1 id={prefixId(id, idPrefix)} {...rest} />,

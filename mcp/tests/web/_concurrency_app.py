@@ -137,7 +137,7 @@ _fake_core = Core(cfg=_FakeCfg(), store=_FakeStore(), llm=_BlockingLlm())
 # the name in chat's namespace after importing the module above.
 
 def _fast_retrieve(q, store, embed, k, th):
-    return ([_FakeR()], "match")
+    return ([_FakeR()], "match", [])
 
 
 _chatmod.retrieve = _fast_retrieve  # type: ignore[attr-defined]

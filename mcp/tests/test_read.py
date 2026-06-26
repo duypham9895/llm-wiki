@@ -27,6 +27,7 @@ def make_docs():
             summary="s",
             body_hash="h",
             body="full long body text",
+            _llm_related=["[[EP-43-short]]", "[[EP-9-noenrich]]"],
         ),
         "/v/EP-9-noenrich.md": Doc(
             stem="EP-9-noenrich",
@@ -54,6 +55,21 @@ def test_read_prd_returns_full_body_by_exact_id():
     assert out["body"] == "full long body text"
     assert out["obsidian_link"] == "[[EP-437-long]]"
     assert out["tags"] == ["b", "c"] and out["source_url"] == "u437"
+    # Wikilink graph: llm.related is surfaced as `related` (Atlas pattern).
+    assert out["related"] == ["[[EP-43-short]]", "[[EP-9-noenrich]]"]
+
+
+def test_read_prd_unenriched_doc_has_empty_related():
+    # No llm block enrichment -> related is an empty list (not None).
+    list_fn, read_fn = make_docs()
+    out = read_prd("EP-9", "/v", read_doc_fn=read_fn, list_docs_fn=list_fn)
+    assert out["related"] == []
+
+
+def test_read_prd_unknown_id_has_empty_related():
+    list_fn, read_fn = make_docs()
+    out = read_prd("EP-999", "/v", read_doc_fn=read_fn, list_docs_fn=list_fn)
+    assert out["related"] == []  # not None — agent-friendly
 
 
 def test_read_prd_exact_id_no_prefix_collision():

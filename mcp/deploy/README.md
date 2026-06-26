@@ -105,14 +105,17 @@ push. To stop auto-deploys temporarily: `ssh openclaw 'cd /opt/llm-wiki/mcp/depl
 
 ## Cron schedule (`prd-cron`)
 
-The `prd-cron` service runs nightly maintenance on the PRD vault — no human in the loop.
+The `prd-cron` service runs scheduled maintenance on the PRD vault — no human in the loop.
 
-| Time (UTC) | Job                          | Command                                                                   |
-| ---------- | ---------------------------- | ------------------------------------------------------------------------- |
-| `02:00`    | Full pipeline                | `cd /app && npm run orchestrate` (sync → enrich → index)                  |
-| `03:00`    | Force re-index (drift catch) | `cd /app/mcp && .venv/bin/python -m prd_mcp.cli index --force`           |
+| Time (UTC)        | Job                            | Command                                                                   |
+| ----------------- | ------------------------------ | ------------------------------------------------------------------------- |
+| `02:00` daily     | Full pipeline                  | `cd /app && npm run orchestrate` (sync → enrich → index)                  |
+| `03:00` daily     | Force re-index (drift catch)   | `cd /app/mcp && .venv/bin/python -m prd_mcp.cli index --force`           |
+| `06/10/14/18/22`  | Drift catch (5x/day, every 4h) | `cron-drift.sh` (sync → reindex; skip enrich)                            |
 
-**Why two jobs?** The 02:00 job may bump into Notion rate limits or transient LLM failures; the 03:00 force re-index guarantees the Chroma store is coherent with the vault even if the morning pipeline skipped/errored on a doc.
+**Cadence decision:** the nightly 02:00 run is the only job that calls `enrich` — that's the slow + LLM-costly stage. The 4-hourly drift catches (`06, 10, 14, 18, 22 UTC`) do `sync + reindex` only, so daytime Notion edits surface in Library within ~4h instead of waiting for the nightly full pipeline. The 03:00 force-reindex remains as a safety net for the nightly run (in case 02:00 hit a Notion rate limit or transient LLM failure).
+
+To change the cadence, edit `mcp/deploy/cron/crontab.txt` and `docker compose restart prd-cron`.
 
 ### Implementation
 
@@ -147,3 +150,62 @@ ssh openclaw 'cd /opt/llm-wiki/mcp/deploy && docker compose restart prd-cron'
 - **CLI image**: the cron container needs `tsx` to run TypeScript and the Python venv at `mcp/.venv/` for `prd-mcp`. The mounted repo provides both — no separate image build required.
 - **Env**: cron reads the same `.env` (via `env_file`) so `NOTION_TOKEN`, `LLM_API_KEY`, `PRD_SECRETS=env`, `VAULT_PATH`, etc. are all available. `HEALTHCHECK_URL` is optional (orchestrator pings on pipeline success).
 - **No host cron**: keep host crontab clean — all scheduled work lives in the container, so `docker compose down/up` keeps the schedule intact.
+
+### Failure handling — auto-retry + dead-man alert
+
+Both cron scripts wrap their commands in a retry + alert loop so a single
+transient failure (Notion rate-limit, OpenAI 429, vault flake) doesn't
+silently halt the nightly pipeline.
+
+| Script            | Command                                            | Retries | Sleep between |
+| ----------------- | -------------------------------------------------- | ------- | ------------- |
+| `cron-pipeline.sh`  | `npm run orchestrate`                              | 1 (2 attempts total) | 10 min |
+| `cron-reindex.sh`   | `python -m prd_mcp.cli index --force`              | 2 (3 attempts total) | 5 min  |
+
+On every attempt, stdout + stderr are captured to
+`/var/log/cron/<job>-<UTC-timestamp>.log` (these dirs are created at
+container start by `cron/entrypoint.sh` with `chmod 777` so any user can
+write).
+
+**When every attempt fails**, the script:
+
+1. Writes a structured failure summary to
+   `/data/vault/.cron-failures/<UTC-timestamp>.json` with fields:
+   ```json
+   {
+     "started_at": "...",
+     "finished_at": "...",
+     "attempt_1_exit": 1,
+     "attempt_2_exit": 1,
+     "last_50_lines_of_stderr": "..."
+   }
+   ```
+   `cron-reindex.sh` also writes `attempt_3_exit`. The file lives inside
+   the `prd_vault` volume, so it survives container restarts and can be
+   inspected from the host or from `prd-app`.
+2. POSTs to `${BACKUP_HEALTHCHECK_URL}/fail` (creating the suffix if it
+   isn't already there). Healthchecks.io treats a hit on `/fail` as an
+   explicit failure ping, paging the configured alert channel.
+3. Exits non-zero so the cron daemon logs the failure visibly in
+   `docker logs deploy-prd-cron-1`.
+
+**Where to find failure summaries on the VPS:**
+
+```bash
+ssh openclaw 'docker exec deploy-prd-cron-1 ls -la /data/vault/.cron-failures/'
+ssh openclaw 'docker exec deploy-prd-cron-1 cat /data/vault/.cron-failures/<timestamp>.json'
+```
+
+**Manually test the dead-man ping:**
+
+```bash
+ssh openclaw 'docker exec deploy-prd-cron-1 curl -X POST "${BACKUP_HEALTHCHECK_URL}"'
+# should return "OK" and re-arm the healthcheck schedule
+```
+
+**Behavior on persistent failure (operator flow):** 1 retry → healthcheck
+ping + failure JSON file → operator gets paged by healthchecks.io →
+operator inspects `/data/vault/.cron-failures/*.json` for the failing
+command's last 50 stderr lines and `/var/log/cron/*.log` for the full
+output, then fixes the root cause (or kicks the pipeline manually via
+`docker exec deploy-prd-app-1 bash -c "cd /app && npm run orchestrate"`).

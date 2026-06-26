@@ -269,7 +269,7 @@ async def post_message(
                 )
                 yield {"event": "rewrite", "data": standalone}
 
-                results, verdict = await anyio.to_thread.run_sync(
+                results, verdict, _related = await anyio.to_thread.run_sync(
                     retrieve, standalone, core.store, core.llm.embed, core.cfg.top_k, core.cfg.score_threshold
                 )
                 sources = format_sources(results)

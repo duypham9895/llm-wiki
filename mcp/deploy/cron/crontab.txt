@@ -5,3 +5,7 @@
 0 2 * * * /tmp/cron-pipeline.sh >> /var/log/cron.log 2>&1
 # Daily force re-index — catch any drift from the morning pipeline.
 0 3 * * * /tmp/cron-reindex.sh >> /var/log/cron.log 2>&1
+# Daytime drift-catch (sync + re-index, skip enrich) — runs 5x/day every 4h
+# starting at 06:00 UTC so Notion edits surface in Library within ~4h instead
+# of waiting for the nightly 02:00 full pipeline. Enrich stays nightly (LLM cost).
+0 6,10,14,18,22 * * * /tmp/cron-drift.sh >> /var/log/cron.log 2>&1

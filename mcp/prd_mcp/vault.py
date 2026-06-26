@@ -15,6 +15,10 @@ class Doc:
     summary: str | None = None
     body_hash: str | None = None
     body: str = ""
+    # Raw `llm.related` frontmatter (list of `[[EP-...-slug]]` strings or bare
+    # ids). read_prd projects this as the `related` field. Default empty for
+    # unenriched docs (llm block absent or related missing).
+    _llm_related: list = field(default_factory=list)
 
 
 def _split_frontmatter(content: str) -> tuple[dict, str]:
@@ -50,6 +54,7 @@ def read_doc(path: str) -> Doc:
         summary=(llm.get("summary") if llm.get("summary") not in ("", None) else None),
         body_hash=(llm.get("body_hash") if llm.get("body_hash") not in ("", None) else None),
         body=body,
+        _llm_related=list(llm.get("related") or []),
     )
 
 

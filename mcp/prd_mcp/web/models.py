@@ -124,3 +124,39 @@ class RecentView(Base):
     viewed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class Notification(Base):
+    """Per-user in-app notifications (the bell dropdown).
+
+    `kind` is a free-form discriminator the UI uses for icon/colour — current
+    values are 'sync_failed', 'prd_added', 'prd_edited', 'system'. The DB
+    allows new kinds without a migration (just append to the UI switch).
+
+    `link` is an optional in-app path (e.g. '/library', '/status') that the
+    dropdown renders as a clickable target. NULL means "no deep link".
+
+    `read_at` IS NULL means unread; the UI shows an unread dot + badge count
+    only when read_at IS NULL.
+    """
+    __tablename__ = "notifications"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('sync_failed','prd_added','prd_edited','system')",
+            name="ck_notifications_kind",
+        ),
+        Index("ix_notifications_user_read_created", "user_id", "read_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    body: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    link: Mapped[str | None] = mapped_column(String, nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

@@ -1,6 +1,25 @@
 from prd_mcp.vault import list_docs, read_doc
 
 
+def _related_links(raw) -> list:
+    """Normalize llm.related to a list of obsidian-link strings ("[[stem]]" or
+    bare ids). The vault's `llm.related` is written by B as `[[EP-...-slug]]`
+    strings (see src/enrich/relate.ts); coerce gracefully for raw ids too."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for r in raw:
+        if not isinstance(r, str):
+            continue
+        r = r.strip()
+        if not r:
+            continue
+        out.append(r)
+    return out
+
+
 def read_prd(prd_id: str, prds_dir: str, read_doc_fn=read_doc, list_docs_fn=list_docs) -> dict:
     target = (prd_id or "").strip()
     if target:
@@ -19,6 +38,7 @@ def read_prd(prd_id: str, prds_dir: str, read_doc_fn=read_doc, list_docs_fn=list
                     "source_url": doc.source_url,
                     "obsidian_link": f"[[{doc.stem}]]",
                     "body": doc.body,
+                    "related": _related_links(getattr(doc, "_llm_related", None)),
                 }
     return {
         "found": False,
@@ -29,6 +49,7 @@ def read_prd(prd_id: str, prds_dir: str, read_doc_fn=read_doc, list_docs_fn=list
         "source_url": "",
         "obsidian_link": "",
         "body": "",
+        "related": [],
     }
 
 

@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, ExternalLink, FileSearch, MoreHorizontal } from 'lucide-react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { ArrowLeft, ExternalLink, FileSearch, Loader2, MoreHorizontal } from 'lucide-react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import * as React from 'react';
 import { PageHeader } from '@/components/PageHeader';
@@ -36,6 +36,24 @@ interface PrdDetail {
   synced_at?: string;
 }
 
+interface EnrichJob {
+  id: string;
+  prd_id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: 'running' | 'ok' | 'error' | 'timeout';
+  error: string | null;
+}
+
+interface EnrichJob {
+  id: string;
+  prd_id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: 'running' | 'ok' | 'error' | 'timeout';
+  error: string | null;
+}
+
 const STATUS_INTENT: Record<string, 'default' | 'success' | 'warning' | 'info' | 'secondary'> = {
   'In Review': 'warning',
   'In Progress': 'info',
@@ -66,11 +84,50 @@ export function PrdDetailPage() {
   }, [id, query.data?.found, query.data?.title]);
 
   const enrichMutation = useMutation({
-    mutationFn: () => apiFetch<{ status: string; id: string; prd_id: string }>(
+    mutationFn: () => apiFetch<EnrichJob>(
       `/prd/${encodeURIComponent(id ?? '')}/enrich`,
       { method: 'POST' },
     ),
   });
+
+  // Track the active enrichment job in React state (not react-query) so the
+  // dropdown can disable "Re-enrich" while a run is in flight AND the status
+  // banner can show progress. We use a separate `useQuery` below to poll the
+  // server for status updates.
+  const [activeJobId, setActiveJobId] = React.useState<string | null>(null);
+  const queryClient = useQueryClient();
+
+  const enrichStatusQuery = useQuery<EnrichJob, ApiError>({
+    queryKey: ['enrich-job', id, activeJobId],
+    queryFn: () =>
+      apiFetch<EnrichJob>(
+        `/prd/${encodeURIComponent(id ?? '')}/enrich/${encodeURIComponent(activeJobId ?? '')}`,
+      ),
+    enabled: Boolean(activeJobId),
+    // Poll every 2s while the job is running; stop once it leaves "running".
+    refetchInterval: (q) => {
+      const status = q.state.data?.status;
+      return status === 'running' ? 2000 : false;
+    },
+    refetchIntervalInBackground: false,
+  });
+
+  // Toast on terminal status changes. We key off the status + job id so the
+  // effect only fires once per transition.
+  React.useEffect(() => {
+    const job = enrichStatusQuery.data;
+    if (!job || job.status === 'running') return;
+    if (job.status === 'ok') {
+      toast.success('Enrichment finished');
+      // Surface the fresh summary/tags/related without forcing a full reload.
+      void queryClient.invalidateQueries({ queryKey: ['prd', id] });
+    } else if (job.status === 'timeout') {
+      toast.error('Enrichment timed out after 10 minutes');
+    } else {
+      toast.error(`Enrichment failed: ${job.error ?? 'unknown error'}`);
+    }
+    setActiveJobId(null);
+  }, [enrichStatusQuery.data, queryClient, id]);
 
   if (query.isLoading) return <PrdDetailSkeleton />;
 
@@ -124,11 +181,16 @@ export function PrdDetailPage() {
 
   function triggerEnrich() {
     enrichMutation.mutate(undefined, {
-      onSuccess: () => toast.success('Enrichment queued'),
+      onSuccess: (job) => {
+        toast.success('Enrichment started');
+        setActiveJobId(job.id);
+      },
       onError: (err) =>
         toast.error(err instanceof ApiError ? err.message : 'Could not queue enrichment'),
     });
   }
+
+  const isEnriching = activeJobId !== null;
 
   return (
     <article className="mx-auto max-w-4xl space-y-6">
@@ -170,7 +232,7 @@ export function PrdDetailPage() {
                 )}
                 <DropdownMenuItem
                   onSelect={triggerEnrich}
-                  disabled={enrichMutation.isPending}
+                  disabled={enrichMutation.isPending || isEnriching}
                   data-testid="action-reenrich"
                 >
                   Re-enrich
@@ -197,6 +259,18 @@ export function PrdDetailPage() {
           </Badge>
         ))}
       </div>
+
+      {isEnriching && (
+        <div
+          data-testid="enrich-progress"
+          className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          <span>Enrichment running... (job {activeJobId.slice(0, 8)})</span>
+        </div>
+      )}
 
       <Separator />
 

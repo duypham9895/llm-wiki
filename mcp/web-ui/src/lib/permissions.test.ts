@@ -28,6 +28,7 @@ describe('visibleSections', () => {
       'Roles',
       'Sources',
       'Settings',
+      'Theme',
     ]);
     expect(manage?.items.map((item) => item.path)).toEqual([
       '/admin/approvals',
@@ -35,6 +36,7 @@ describe('visibleSections', () => {
       '/admin/roles',
       '/admin/sources',
       '/admin/settings',
+      '/admin/theme',
     ]);
   });
 

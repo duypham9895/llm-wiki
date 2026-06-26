@@ -19,6 +19,7 @@ import { ApprovalsPage } from './pages/admin/ApprovalsPage';
 import { DirectoryPage } from './pages/admin/DirectoryPage';
 import { RolesPage } from './pages/admin/RolesPage';
 import { SettingsPage } from './pages/admin/SettingsPage';
+import { ThemePage } from './pages/admin/ThemePage';
 
 // Phase 4 additions — lazy-loaded so initial bundle stays small.
 const PrdDetailPage = lazy(() =>
@@ -142,6 +143,14 @@ createRoot(document.getElementById('root')!).render(
                   element={
                     <RequirePermission perm="roles.manage">
                       <SettingsPage />
+                    </RequirePermission>
+                  }
+                />
+                <Route
+                  path="admin/theme"
+                  element={
+                    <RequirePermission perm="roles.manage">
+                      <ThemePage />
                     </RequirePermission>
                   }
                 />
