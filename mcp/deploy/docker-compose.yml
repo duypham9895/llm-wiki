@@ -97,8 +97,8 @@ services:
     volumes:
       - ./cron/crontab.txt:/etc/crontabs/root:ro
       - ./cron/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
-      - ./cron/cron-pipeline.sh:/usr/local/bin/cron-pipeline.sh:ro
-      - ./cron/cron-reindex.sh:/usr/local/bin/cron-reindex.sh:ro
+      - ./cron/cron-pipeline.sh:/etc/cron.d/cron-pipeline.sh:ro  # copied to /tmp + chmod +x by entrypoint
+      - ./cron/cron-reindex.sh:/etc/cron.d/cron-reindex.sh:ro
       - ../:/app:ro          # repo root: src/ + package.json + mcp/.venv
       - prd_vault:/data/vault:rw  # writes new PRD .md files (sync + enrich)
     networks: [prd_net]
