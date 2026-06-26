@@ -20,6 +20,23 @@ export class NotionRateLimited extends Error {
   }
 }
 
+/** Thrown when the integration token is the wrong type (e.g. personal access
+ *  token trying to read a shared database). The fix is on the Notion side, not
+ *  in code: create an Internal Integration at Notion → Settings → Connections,
+ *  share the Product Backlog DB with it, paste the new token into NOTION_TOKEN. */
+export class NotionWrongTokenType extends Error {
+  constructor(message: string) {
+    super(
+      `${message}\n` +
+        'FIX: Notion → Settings → Connections → Develop integrations → New integration.\n' +
+        '      Copy the Internal Integration Secret (starts with `secret_` or `ntn_I`).\n' +
+        '      Share the Product Backlog database with the integration.\n' +
+        '      Set NOTION_TOKEN=... in mcp/deploy/.env on the VPS.\n',
+    );
+    this.name = 'NotionWrongTokenType';
+  }
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   opts: { retries?: number; sleepFn?: (ms: number) => Promise<void> } = {},
@@ -39,6 +56,14 @@ export async function withRetry<T>(
         if (status === 429) {
           const ra = Number(err?.headers?.['retry-after']);
           throw new NotionRateLimited(Number.isFinite(ra) ? ra : 60);
+        }
+        // On restricted_resource, the token can't access this resource (almost
+        // always: personal access token used on a shared DB). Surface actionable
+        // instructions instead of a generic crash.
+        if (err?.code === 'restricted_resource' || status === 400 || status === 401) {
+          throw new NotionWrongTokenType(
+            `Notion API call failed: ${err?.code ?? status} — ${err?.message ?? 'unknown error'}.`,
+          );
         }
         throw err;
       }
