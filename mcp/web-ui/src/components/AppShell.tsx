@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen } from 'lucide-react';
+import { LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen, Bell } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -157,11 +157,24 @@ export function AppShell() {
           variant="outline"
           size="sm"
           // The CommandPalette listens for ⌘K globally; this button is a hint affordance.
-          onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))}
+          onClick={() =>
+            window.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'k', metaKey: true, ctrlKey: true }),
+            )
+          }
           className="hidden md:inline-flex text-muted-foreground"
         >
           <Search /> Search
           <KbdHint className="ml-2">⌘K</KbdHint>
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Notifications"
+          disabled
+        >
+          <Bell />
         </Button>
 
         <Button

@@ -173,7 +173,21 @@ def _running_for(source_id: str) -> dict | None:
 
 
 async def _run_subprocess(core: Core, run_id: str) -> None:
-    """Spawn the sync CLI. See module docstring for the container caveat."""
+    """Spawn the sync CLI, then rebuild the Chroma index from the freshly-synced vault.
+
+    The Sources page promises (in its confirm dialog) "This will write to the vault
+    AND re-index Chroma" — without the second step, Library/Search/Status stay empty
+    after every sync because the Notion CLI writes .md files but never tells Chroma
+    about them. We chain `python -m prd_mcp.cli index` after a successful sync.
+    """
+    sync_ok = await _spawn_sync_cli(core, run_id)
+    if not sync_ok:
+        return  # error already populated in _runs[run_id]
+    await _spawn_index_cli(core, run_id)
+
+
+async def _spawn_sync_cli(core: Core, run_id: str) -> bool:
+    """Spawn `npm run sync` (or RUN_CMD/RUN_ARGS override). Returns True on success."""
     cmd = os.environ.get("RUN_CMD", "npm")
     args_str = os.environ.get("RUN_ARGS", "run sync")
     args = args_str.split()
@@ -201,14 +215,14 @@ async def _run_subprocess(core: Core, run_id: str) -> None:
             status="error",
             error=f"sync CLI not found ({cmd} in {cwd}): {e}",
         )
-        return
+        return False
     except Exception as e:
         _runs[run_id].update(
             finished_at=_now_iso(),
             status="error",
             error=f"failed to spawn sync CLI: {e}",
         )
-        return
+        return False
 
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
@@ -220,17 +234,69 @@ async def _run_subprocess(core: Core, run_id: str) -> None:
             status="timeout",
             error="exceeded 5-minute timeout",
         )
-        return
+        return False
 
     if proc.returncode == 0:
-        _runs[run_id].update(finished_at=_now_iso(), status="ok")
-    else:
-        tail = (stderr or b"").decode(errors="replace")[-1000:]
-        _runs[run_id].update(
-            finished_at=_now_iso(),
-            status="error",
-            error=tail or f"sync CLI exited {proc.returncode}",
+        return True
+
+    tail = (stderr or b"").decode(errors="replace")[-1000:]
+    _runs[run_id].update(
+        finished_at=_now_iso(),
+        status="error",
+        error=tail or f"sync CLI exited {proc.returncode}",
+    )
+    return False
+
+
+async def _spawn_index_cli(core: Core, run_id: str) -> None:
+    """Spawn `python -m prd_mcp.cli index` to rebuild Chroma embeddings."""
+    cmd = ["python", "-m", "prd_mcp.cli", "index"]
+    env = os.environ.copy()
+    env["VAULT_PATH"] = _vault_path(core)
+    env["RUN_ID"] = run_id
+    env.setdefault("PRD_SECRETS", "env")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd="/app",
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+    except Exception as e:
+        # Index failure shouldn't downgrade a successful sync — annotate only.
+        _runs[run_id]["index_error"] = f"failed to spawn reindex: {e}"
+        return
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        _runs[run_id]["index_error"] = "reindex exceeded 5-minute timeout"
+        return
+
+    if proc.returncode != 0:
+        tail = (stderr or b"").decode(errors="replace")[-1000:]
+        _runs[run_id]["index_error"] = tail or f"reindex exited {proc.returncode}"
+        return
+
+    # Parse `indexed N · skipped M · removed R · errors E` from the indexer stdout.
+    summary = (stdout or b"").decode(errors="replace")
+    for line in summary.splitlines():
+        if line.startswith("indexed "):
+            counts: dict[str, int] = {}
+            for p in line.split("·"):
+                p = p.strip()
+                if " " in p:
+                    k, _, v = p.partition(" ")
+                    try:
+                        counts[k] = int(v)
+                    except ValueError:
+                        pass
+            _runs[run_id]["index_counts"] = counts
+            break
 
 
 # ---- permission dep (lazy import to keep rbac deps optional) ----

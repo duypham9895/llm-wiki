@@ -13,10 +13,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
     Column,
+    UniqueConstraint,
     func,
     text,
 )
@@ -99,4 +101,26 @@ class AppSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class RecentView(Base):
+    """One row per (user, prd) the user has opened. Re-viewing a PRD updates
+    `viewed_at` via upsert so the CommandPalette "Recent PRDs" list reflects
+    the user's most-recently-opened PRD first. PRD ids are free-form frontmatter
+    strings (e.g. "EP-101"), so we store as String, not UUID, and do NOT add a
+    FK to any PRD table — the PRD store is Chroma, not Postgres."""
+    __tablename__ = "recent_views"
+    __table_args__ = (
+        UniqueConstraint("user_id", "prd_id", name="uq_recent_views_user_prd"),
+        Index("ix_recent_views_user_viewed", "user_id", "viewed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    prd_id: Mapped[str] = mapped_column(String, nullable=False)
+    viewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -65,4 +65,20 @@ describe('ApprovalsPage', () => {
 
     await waitFor(() => expect(approveBody).toEqual({ role_ids: ['r1'] }));
   });
+
+  it('disables Reject when no roles are selected', async () => {
+    installApprovalsHandlers();
+    const rejectCalls: Array<unknown> = [];
+    server.use(
+      http.post('/api/admin/users/u1/reject', async ({ request }) => {
+        rejectCalls.push((await request.json().catch(() => null)) ?? null);
+        return HttpResponse.json({ status: 'rejected' });
+      }),
+    );
+
+    renderWithProviders(<ApprovalsPage />, { me: { permissions: ['users.manage'] }, route: '/admin/approvals' });
+
+    const rejectButton = await screen.findByRole('button', { name: /reject bob@x\.com/i });
+    expect(rejectButton).toBeDisabled();
+  });
 });

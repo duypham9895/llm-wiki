@@ -28,7 +28,7 @@ function renderLogin(ui: ReactElement) {
         <MemoryRouter initialEntries={['/login']}>
           <Routes>
             <Route path="/login" element={children} />
-            <Route path="/" element={<p>Dashboard route</p>} />
+            <Route path="/library" element={<p>Library route</p>} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>
@@ -84,6 +84,6 @@ describe('Login', () => {
     await waitFor(() => {
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
     });
-    expect(await screen.findByText('Dashboard route')).toBeInTheDocument();
+    expect(await screen.findByText('Library route')).toBeInTheDocument();
   });
 });

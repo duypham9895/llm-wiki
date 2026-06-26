@@ -49,4 +49,31 @@ describe('SettingsPage', () => {
     );
     expect(await screen.findByText(/settings saved/i)).toBeInTheDocument();
   });
+
+  it('blocks save and shows a warning when registration is on with zero allowed domains', async () => {
+    installSettingsHandlers();
+    server.use(
+      http.get('/api/admin/settings', () =>
+        HttpResponse.json({ registration_enabled: true, allowed_domains: [] }),
+      ),
+    );
+    const putCalls: Array<unknown> = [];
+    server.use(
+      http.put('/api/admin/settings', async ({ request }) => {
+        putCalls.push(await request.json());
+        return HttpResponse.json({ registration_enabled: true, allowed_domains: [] });
+      }),
+    );
+
+    renderWithProviders(<SettingsPage />, { me: { permissions: ['roles.manage'] }, route: '/admin/settings' });
+
+    const saveButton = await screen.findByRole('button', { name: /save settings/i });
+    await waitFor(() => expect(saveButton).toBeDisabled());
+    expect(await screen.findByText(/add at least one allowed email domain before enabling registration/i)).toBeInTheDocument();
+
+    // Force-click anyway: the onSubmit guard should still swallow it.
+    fireEvent.click(saveButton);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(putCalls).toHaveLength(0);
+  });
 });

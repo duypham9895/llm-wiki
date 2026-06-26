@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Library as LibraryIcon, Loader2, Search } from 'lucide-react';
+import { Library as LibraryIcon, Search } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
 import { PageHeader } from '@/components/PageHeader';
@@ -104,9 +104,16 @@ export function LibraryPage() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All statuses</SelectItem>
-              <SelectItem value="active">Active</SelectItem>
-              <SelectItem value="draft">Draft</SelectItem>
-              <SelectItem value="archived">Archived</SelectItem>
+              {/* Values mirror the STATUS_BADGE map below — the backend filters
+                  by exact frontmatter match (Store.list_cards), so case must
+                  match the vault frontmatter verbatim: 'Active' not 'active'. */}
+              <SelectItem value="Active">Active</SelectItem>
+              <SelectItem value="Draft">Draft</SelectItem>
+              <SelectItem value="Archived">Archived</SelectItem>
+              <SelectItem value="Done">Done</SelectItem>
+              <SelectItem value="In Review">In Review</SelectItem>
+              <SelectItem value="In Progress">In Progress</SelectItem>
+              <SelectItem value="Not Started">Not Started</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -220,12 +227,6 @@ export function LibraryPage() {
             </Link>
           ))}
         </div>
-      )}
-
-      {libraryQuery.isFetching && items.length > 0 && (
-        <p className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="size-4 animate-spin" /> Loading…
-        </p>
       )}
 
       {nextCursor && (

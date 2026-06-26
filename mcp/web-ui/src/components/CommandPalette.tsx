@@ -24,8 +24,15 @@ import {
   CommandShortcut,
 } from '@/components/ui/command';
 import { KbdHint } from '@/components/KbdHint';
-import { apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import {
+  fetchServerRecents,
+  fetchSuggested,
+  getLocalRecents,
+  hydrateLocalRecents,
+  recordLocalRecent,
+  type RecentPrd,
+} from '@/lib/recent';
 
 interface PageItem {
   kind: 'page';
@@ -64,10 +71,7 @@ const PAGES: PageItem[] = [
   { kind: 'page', label: 'Settings', path: '/admin/settings', icon: Settings, permission: 'roles.manage' },
 ];
 
-interface MiniPrd {
-  id: string;
-  title: string;
-}
+const RECENT_LIMIT = 8;
 
 export function CommandPalette() {
   const navigate = useNavigate();
@@ -86,16 +90,67 @@ export function CommandPalette() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // Recent PRDs (top 8 from library)
-  const recentPrds = useQuery<MiniPrd[]>({
+  // Recents: show localStorage FIRST so the palette paints instantly, then
+  // reconcile with the server's cross-device list. If both are empty, fall
+  // back to a "Suggested" group from the library endpoint.
+  const [localRecents, setLocalRecents] = React.useState<RecentPrd[]>([]);
+  React.useEffect(() => {
+    if (!open) return;
+    setLocalRecents(getLocalRecents());
+  }, [open]);
+
+  const serverRecentsQuery = useQuery<RecentPrd[]>({
     queryKey: ['recent-prds'],
-    queryFn: async () => {
-      const data = await apiFetch<{ results: MiniPrd[] }>('/prd/library?limit=8');
-      return data.results ?? [];
-    },
+    queryFn: async () => fetchServerRecents(RECENT_LIMIT),
     enabled: open,
     staleTime: 60_000,
   });
+
+  const suggestedQuery = useQuery<RecentPrd[]>({
+    queryKey: ['suggested-prds'],
+    queryFn: async () => fetchSuggested(RECENT_LIMIT),
+    enabled: open,
+    staleTime: 60_000,
+  });
+
+  // Merge: server recents are the source of truth for cross-device history;
+  // when the server returns 0 entries (new user / never opened a PRD), the
+  // palette renders "Suggested" from /library. Local entries are merged on
+  // top so the just-opened PRD shows up immediately, before the server
+  // round-trip resolves. When the SAME id appears in both, prefer whichever
+  // row carries a title — localStorage writes (from PrdDetailPage) include
+  // the title, server ids don't.
+  const mergedRecents: RecentPrd[] = React.useMemo(() => {
+    const server = serverRecentsQuery.data ?? [];
+    const local = localRecents;
+    const byId = new Map<string, RecentPrd>();
+    for (const e of server) byId.set(e.id, e);
+    for (const e of local) {
+      const existing = byId.get(e.id);
+      if (!existing) {
+        byId.set(e.id, e);
+      } else if (!existing.title && e.title) {
+        byId.set(e.id, e);
+      }
+      // else: existing has title, or both have it — keep existing.
+    }
+    return Array.from(byId.values()).slice(0, RECENT_LIMIT);
+  }, [serverRecentsQuery.data, localRecents]);
+
+  // Hydrate missing titles from the library endpoint (server recents don't
+  // carry titles — just ids — so the first paint would be "EP-101" alone).
+  React.useEffect(() => {
+    if (!open) return;
+    if (mergedRecents.some((e) => !e.title)) {
+      hydrateLocalRecents(mergedRecents).then((resolved) => {
+        if (resolved.some((e) => e.title)) setLocalRecents(resolved);
+      });
+    }
+  }, [open, mergedRecents]);
+
+  const showSuggested = mergedRecents.length === 0;
+  const suggestedItems: RecentPrd[] = suggestedQuery.data ?? [];
+  const heading = showSuggested ? 'Suggested' : 'Recent PRDs';
 
   const pages = React.useMemo<PageItem[]>(
     () => PAGES.filter((p) => !p.permission || me.permissions.includes(p.permission)),
@@ -115,6 +170,8 @@ export function CommandPalette() {
     icon: Plus,
     onSelect: () => navigate('/ask'),
   };
+
+  const prdItems: RecentPrd[] = showSuggested ? suggestedItems : mergedRecents;
 
   return (
     <CommandDialog open={open} onOpenChange={setOpen}>
@@ -143,16 +200,22 @@ export function CommandPalette() {
           </CommandItem>
         </CommandGroup>
 
-        {(recentPrds.data?.length ?? 0) > 0 && (
-          <CommandGroup heading="Recent PRDs">
-            {recentPrds.data!.map((p) => (
+        {prdItems.length > 0 && (
+          <CommandGroup heading={heading}>
+            {prdItems.map((p) => (
               <CommandItem
                 key={p.id}
                 value={`prd ${p.title} ${p.id}`}
-                onSelect={() => handleSelect({ kind: 'prd', label: p.title, id: p.id, icon: Library })}
+                onSelect={() => {
+                  // Make sure the click re-records (in case the user opened the
+                  // palette before the detail page's useEffect ran — e.g. via
+                  // a stale localStorage entry).
+                  recordLocalRecent(p.id, p.title);
+                  handleSelect({ kind: 'prd', label: p.title, id: p.id, icon: Library });
+                }}
               >
                 <Library className="text-muted-foreground" />
-                <span className="truncate">{p.title}</span>
+                <span className="truncate">{p.title || p.id}</span>
                 <span className="ml-auto font-mono text-xs text-muted-foreground">{p.id}</span>
               </CommandItem>
             ))}

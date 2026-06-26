@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Trash2 } from 'lucide-react';
+import { AlertTriangle, Loader2, Trash2 } from 'lucide-react';
 
 import { apiFetch } from '../../lib/api';
 import { copyForError } from '../../lib/error-copy';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 
 type AdminSettings = {
   registration_enabled: boolean;
@@ -54,6 +59,9 @@ export function SettingsPage() {
     setNextDomain('');
   }
 
+  const registrationGuardBlocked = registrationEnabled && domains.length === 0;
+  const saveDisabled = saveMutation.isPending || registrationGuardBlocked;
+
   return (
     <section className="space-y-6">
       <div>
@@ -80,52 +88,60 @@ export function SettingsPage() {
         className="space-y-6 rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
         onSubmit={(event) => {
           event.preventDefault();
+          if (saveDisabled) return;
           saveMutation.mutate({ registration_enabled: registrationEnabled, allowed_domains: domains });
         }}
       >
-        <label className="flex items-center justify-between gap-4 rounded-md border p-3 text-sm font-medium">
-          <span>Registration enabled</span>
-          <input
+        <div className="flex items-center justify-between gap-4 rounded-md border p-3 text-sm font-medium">
+          <Label htmlFor="registration-enabled">Registration enabled</Label>
+          <Checkbox
+            id="registration-enabled"
             checked={registrationEnabled}
-            className="size-5"
-            type="checkbox"
-            onChange={(event) => setRegistrationEnabled(event.currentTarget.checked)}
+            onCheckedChange={(checked) => setRegistrationEnabled(checked === true)}
+            aria-label="Registration enabled"
           />
-        </label>
+        </div>
 
         <div className="grid gap-3">
           <h2 className="text-lg font-semibold">Allowed domains</h2>
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <label className="sr-only" htmlFor="allowed-domain">Domain</label>
-            <input
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Label className="sr-only" htmlFor="allowed-domain">Domain</Label>
+            <Input
               id="allowed-domain"
-              className="h-10 rounded-md border border-input bg-background px-3 text-sm sm:w-80"
+              className="sm:w-80"
               placeholder="example.com"
               value={nextDomain}
               onChange={(event) => setNextDomain(event.currentTarget.value)}
             />
-            <button
-              className="h-10 rounded-md border px-4 text-sm font-medium hover:bg-accent"
-              type="button"
-              onClick={addDomain}
-            >
+            <Button type="button" variant="outline" onClick={addDomain}>
               Add domain
-            </button>
+            </Button>
           </div>
+
+          {registrationGuardBlocked ? (
+            <Alert variant="warning">
+              <AlertTriangle />
+              <AlertTitle>Registration is on but no domains are allowed</AlertTitle>
+              <AlertDescription>
+                Add at least one allowed email domain before enabling registration.
+              </AlertDescription>
+            </Alert>
+          ) : null}
 
           {domains.length > 0 ? (
             <ul className="grid gap-2">
               {domains.map((domain) => (
                 <li key={domain} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-sm">
                   <span>{domain}</span>
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     aria-label={`Remove ${domain}`}
-                    className="rounded-md p-2 hover:bg-accent"
-                    type="button"
                     onClick={() => setDomains((current) => current.filter((item) => item !== domain))}
+                    type="button"
                   >
-                    <Trash2 className="size-4" />
-                  </button>
+                    <Trash2 />
+                  </Button>
                 </li>
               ))}
             </ul>
@@ -137,13 +153,14 @@ export function SettingsPage() {
           )}
         </div>
 
-        <button
-          className="h-10 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-60"
-          disabled={saveMutation.isPending}
+        <Button
           type="submit"
+          disabled={saveDisabled}
+          aria-disabled={saveDisabled}
+          title={registrationGuardBlocked ? 'Add at least one allowed email domain before enabling registration' : undefined}
         >
           Save settings
-        </button>
+        </Button>
       </form>
     </section>
   );

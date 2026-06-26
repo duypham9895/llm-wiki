@@ -1,9 +1,12 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 import { apiFetch } from '../../lib/api';
 import { copyForError } from '../../lib/error-copy';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 
 type AdminRole = {
   id: string;
@@ -107,58 +110,70 @@ export function ApprovalsPage() {
       ) : null}
 
       <div className="grid gap-4">
-        {users.map((user) => {
-          const roleIds = selectedRoles[user.id] ?? [];
-          return (
-            <article key={user.id} className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm">
-              <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <h2 className="text-lg font-semibold">{user.email}</h2>
-                  <p className="text-sm text-muted-foreground">Requested at {user.created_at ?? 'unknown'}</p>
+        <TooltipProvider>
+          {users.map((user) => {
+            const roleIds = selectedRoles[user.id] ?? [];
+            const rejectDisabled = approvalMutation.isPending || roleIds.length === 0;
+            return (
+              <article key={user.id} className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h2 className="text-lg font-semibold">{user.email}</h2>
+                    <p className="text-sm text-muted-foreground">Requested at {user.created_at ?? 'unknown'}</p>
+                  </div>
+                  <span className="w-fit rounded-full border px-2 py-0.5 text-xs font-medium capitalize text-muted-foreground">
+                    {user.status}
+                  </span>
                 </div>
-                <span className="w-fit rounded-full border px-2 py-0.5 text-xs font-medium capitalize text-muted-foreground">
-                  {user.status}
-                </span>
-              </div>
 
-              <fieldset className="mt-4 grid gap-2">
-                <legend className="text-sm font-medium">Assign roles</legend>
-                <div className="flex flex-wrap gap-3">
-                  {roleOptions.map((role) => (
-                    <label key={role.id} className="inline-flex items-center gap-2 text-sm">
-                      <input
-                        checked={roleIds.includes(role.id)}
-                        className="size-4 rounded border-input"
-                        type="checkbox"
-                        onChange={(event) => toggleRole(user.id, role.id, event.currentTarget.checked)}
-                      />
-                      {role.name}
-                    </label>
-                  ))}
+                <fieldset className="mt-4 grid gap-2">
+                  <legend className="text-sm font-medium">Assign roles</legend>
+                  <div className="flex flex-wrap gap-3">
+                    {roleOptions.map((role) => (
+                      <label key={role.id} className="inline-flex items-center gap-2 text-sm">
+                        <Checkbox
+                          checked={roleIds.includes(role.id)}
+                          onCheckedChange={(checked) =>
+                            toggleRole(user.id, role.id, checked === true)
+                          }
+                          aria-label={role.name}
+                        />
+                        {role.name}
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    disabled={approvalMutation.isPending}
+                    onClick={() => approvalMutation.mutate({ userId: user.id, action: 'approve', roleIds })}
+                  >
+                    Approve {user.email}
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span tabIndex={0}>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={rejectDisabled}
+                          onClick={() => approvalMutation.mutate({ userId: user.id, action: 'reject', roleIds: [] })}
+                        >
+                          Reject {user.email}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {roleIds.length === 0 ? (
+                      <TooltipContent>Select roles first</TooltipContent>
+                    ) : null}
+                  </Tooltip>
                 </div>
-              </fieldset>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button
-                  className="inline-flex h-9 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-60"
-                  disabled={approvalMutation.isPending}
-                  type="button"
-                  onClick={() => approvalMutation.mutate({ userId: user.id, action: 'approve', roleIds })}
-                >
-                  Approve {user.email}
-                </button>
-                <button
-                  className="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium hover:bg-accent disabled:opacity-60"
-                  disabled={approvalMutation.isPending}
-                  type="button"
-                  onClick={() => approvalMutation.mutate({ userId: user.id, action: 'reject', roleIds: [] })}
-                >
-                  Reject {user.email}
-                </button>
-              </div>
-            </article>
-          );
-        })}
+              </article>
+            );
+          })}
+        </TooltipProvider>
       </div>
     </section>
   );

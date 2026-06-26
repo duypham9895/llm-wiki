@@ -151,6 +151,12 @@ export function SearchPage() {
         </p>
       ) : null}
 
+      {searchQuery.data && !searchQuery.isFetching ? (
+        <p className="text-sm text-muted-foreground">
+          Showing {results.length} of {searchQuery.data.count} {searchQuery.data.count === 1 ? 'result' : 'results'}
+        </p>
+      ) : null}
+
       {searchQuery.isError ? (
         <p className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
           Could not search PRDs.

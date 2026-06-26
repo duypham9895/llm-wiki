@@ -56,7 +56,8 @@ describe('AppShell nav', () => {
       { me: { permissions: ['prd.read'] }, route: '/admin/directory' },
     );
 
-    expect(await screen.findByText(/access to this page/i)).toBeInTheDocument();
+    expect(await screen.findByText(/access restricted/i)).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: /back to library/i })).toHaveAttribute('href', '/library');
     expect(screen.queryByRole('heading', { name: 'Directory' })).not.toBeInTheDocument();
   });
 });

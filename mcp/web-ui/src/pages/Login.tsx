@@ -27,7 +27,7 @@ export function Login() {
       const data = await apiFetch<{ user: Me }>('/auth/login', { method: 'POST', body: { email, password } });
       queryClient.setQueryData(['me'], data.user);
       await queryClient.invalidateQueries({ queryKey: ['me'] });
-      navigate('/');
+      navigate('/library', { replace: true });
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.code === 'invalid_credentials')) {
         setError(ERROR_COPY.invalid_credentials);
