@@ -76,6 +76,15 @@ SOURCES: list[dict] = [
 SOURCE_IDS = frozenset(s["id"] for s in SOURCES)
 
 
+# Subprocess drain timeouts (seconds). These cap the FINAL proc.wait() after the
+# stdout stream hits EOF — not the whole run (the readline loop is unbounded while
+# the process emits output). Sync gets 20 min because the FIRST full sync of a
+# 700+ item backlog is slow under Notion's rate limits; subsequent syncs are fast
+# (incremental — src/state.ts skips unchanged pages, checkpointed every 25 pages).
+# Index gets 5 min — embedding 150 docs is quick.
+_SYNC_DRAIN_TIMEOUT = 1200
+_INDEX_DRAIN_TIMEOUT = 300
+
 # Per-source run state. The app is single-process uvicorn (cli.py --workers 1),
 # so module-level state survives across requests in one container.
 _run_locks: dict[str, asyncio.Lock] = {}
@@ -335,14 +344,14 @@ async def _spawn_sync_cli(core: Core, run_id: str) -> bool:
         # Drain stderr tail (EOF marker).
         await stderr_task
         try:
-            await asyncio.wait_for(proc.wait(), timeout=300)
+            await asyncio.wait_for(proc.wait(), timeout=_SYNC_DRAIN_TIMEOUT)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
             _runs[run_id].update(
                 finished_at=_now_iso(),
                 status="timeout",
-                error="exceeded 5-minute timeout",
+                error=f"exceeded {_SYNC_DRAIN_TIMEOUT // 60}-minute timeout",
             )
             return False
     except asyncio.TimeoutError:
@@ -351,7 +360,7 @@ async def _spawn_sync_cli(core: Core, run_id: str) -> bool:
         _runs[run_id].update(
             finished_at=_now_iso(),
             status="timeout",
-            error="exceeded 5-minute timeout",
+            error=f"exceeded {_SYNC_DRAIN_TIMEOUT // 60}-minute timeout",
         )
         return False
     except Exception as e:
@@ -416,11 +425,11 @@ async def _spawn_index_cli(core: Core, run_id: str) -> None:
                 summary_tail.append(text)
         await stderr_task
         try:
-            await asyncio.wait_for(proc.wait(), timeout=300)
+            await asyncio.wait_for(proc.wait(), timeout=_INDEX_DRAIN_TIMEOUT)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            _runs[run_id]["index_error"] = "reindex exceeded 5-minute timeout"
+            _runs[run_id]["index_error"] = f"reindex exceeded {_INDEX_DRAIN_TIMEOUT // 60}-minute timeout"
             return
     except Exception as e:
         proc.kill()

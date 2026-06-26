@@ -105,6 +105,15 @@ async function main(): Promise<number> {
       }
       state.pages[item.uuid] = { id: sync.id, filename, last_edited: item.lastEdited, synced_at: syncedAt, kind };
       synced++;
+
+      // Checkpoint state every 25 synced pages. The first full sync of a large
+      // backlog (700+ items) can exceed the "Run now" subprocess timeout; without
+      // periodic checkpoints a kill mid-loop discards all progress and the next run
+      // restarts from zero. Flushing here makes incremental sync resilient to kills:
+      // each run resumes where the last left off (needsSync skips already-synced pages).
+      if (synced % 25 === 0) {
+        await saveState(cfg.stateFile, state);
+      }
     } catch (err) {
       errors.push(`${item.title} (${item.uuid}): ${(err as Error).message}`);
     }
