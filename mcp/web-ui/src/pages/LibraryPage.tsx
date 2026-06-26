@@ -4,8 +4,10 @@ import { useQuery } from '@tanstack/react-query';
 import { Library as LibraryIcon, Search } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
+import { useHasPermission } from '@/lib/auth';
 import { PageHeader } from '@/components/PageHeader';
 import { EmptyState } from '@/components/EmptyState';
+import { SetupChecklist } from '@/components/SetupChecklist';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -55,6 +57,7 @@ const STATUS_BADGE: Record<string, 'default' | 'success' | 'warning' | 'info' | 
 };
 
 export function LibraryPage() {
+  const canManageUsers = useHasPermission('users.manage');
   const [status, setStatus] = useState('');
   const [tag, setTag] = useState('');
   const [cursor, setCursor] = useState<string | null>(null);
@@ -83,6 +86,11 @@ export function LibraryPage() {
 
   const isFirstLoad = libraryQuery.isLoading && items.length === 0;
   const isEmpty = libraryQuery.isSuccess && !libraryQuery.isFetching && items.length === 0;
+  // A genuinely empty vault has no rows AND no active filters. With a filter set,
+  // an empty result is just a filtered-out view — keep the clear-filters affordance.
+  const hasFilters = Boolean(status || tag);
+  const isEmptyVault = isEmpty && !hasFilters;
+  const isFilteredEmpty = isEmpty && hasFilters;
   const nextCursor = libraryQuery.data?.next_cursor ?? null;
 
   return (
@@ -170,23 +178,44 @@ export function LibraryPage() {
         </div>
       )}
 
-      {isEmpty && (
+      {isFilteredEmpty && (
         <EmptyState
           icon={LibraryIcon}
           title="No PRDs found"
-          description="Try clearing filters or searching a broader tag."
+          description="No PRDs match your filters. Try clearing them or searching a broader tag."
+          action={{
+            label: 'Clear filters',
+            onClick: () => {
+              setStatus('');
+              setTag('');
+            },
+          }}
+        />
+      )}
+
+      {isEmptyVault && (
+        <EmptyState
+          icon={LibraryIcon}
+          title="No PRDs yet"
+          description={
+            canManageUsers
+              ? 'Sync your Notion workspace to fill the vault with PRDs.'
+              : 'Ask an admin to run a Notion sync.'
+          }
           action={
-            status || tag
-              ? {
-                  label: 'Clear filters',
-                  onClick: () => {
-                    setStatus('');
-                    setTag('');
-                  },
-                }
-              : undefined
+            canManageUsers ? (
+              <Button asChild>
+                <Link to="/admin/sources">Run your first sync</Link>
+              </Button>
+            ) : undefined
           }
         />
+      )}
+
+      {isEmptyVault && canManageUsers && (
+        <div className="flex justify-center">
+          <SetupChecklist />
+        </div>
       )}
 
       {items.length > 0 && (

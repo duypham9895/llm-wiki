@@ -1,4 +1,5 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, Send, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
@@ -6,6 +7,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { EmptyState } from '@/components/EmptyState';
+import { MarkdownView } from '@/components/MarkdownView';
 import { PageHeader } from '@/components/PageHeader';
 import {
   ConversationList,
@@ -13,7 +15,6 @@ import {
 } from '@/components/ConversationList';
 import { ApiError, apiFetch } from '@/lib/api';
 import { copyForError } from '@/lib/error-copy';
-import { cn } from '@/lib/utils';
 import { streamChat } from '@/lib/sse';
 
 type PersistedMessage = {
@@ -432,9 +433,9 @@ function EmptyAskState({
       <EmptyState
         icon={Sparkles}
         title="Start by asking about any PRD"
-        description="Try a question like “What's our onboarding flow for new PMs?”"
+        description="Ask in plain English and get grounded answers with sources. Try a question like “What's our onboarding flow for new PMs?”"
         action={
-          <div className="flex w-full max-w-md flex-col gap-2">
+          <div className="flex w-full max-w-md flex-col gap-3">
             <Button
               className="w-full"
               disabled={isCreating}
@@ -444,18 +445,23 @@ function EmptyAskState({
               {isCreating ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
               New chat
             </Button>
-            <div className="grid gap-2">
-              {EXAMPLE_PROMPTS.map((prompt) => (
-                <Button
-                  key={prompt}
-                  variant="outline"
-                  className="h-auto justify-start whitespace-normal py-2 text-left text-sm font-normal"
-                  type="button"
-                  onClick={() => onPickPrompt(prompt)}
-                >
-                  {prompt}
-                </Button>
-              ))}
+            <div className="flex flex-col gap-2">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Try one of these
+              </p>
+              <div className="grid gap-2">
+                {EXAMPLE_PROMPTS.map((prompt) => (
+                  <Button
+                    key={prompt}
+                    variant="outline"
+                    className="h-auto justify-start whitespace-normal py-2 text-left text-sm font-normal"
+                    type="button"
+                    onClick={() => onPickPrompt(prompt)}
+                  >
+                    {prompt}
+                  </Button>
+                ))}
+              </div>
             </div>
           </div>
         }
@@ -558,25 +564,43 @@ function ConversationView({
 
 function MessageBubble({ message }: { message: RenderMessage }) {
   const isAssistant = message.role === 'assistant';
+  const isStreaming = isAssistant && !message.content;
 
+  if (!isAssistant) {
+    // User turn: compact bubble aligned to the right.
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-primary px-4 py-2.5 text-sm leading-6 text-primary-foreground">
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Assistant turn: full-width, avatar + content, no heavy border box.
   return (
-    <article
-      className={cn(
-        'rounded-lg border p-4',
-        isAssistant ? 'bg-background' : 'bg-secondary/60',
-      )}
-    >
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {isAssistant ? 'Assistant' : 'You'}
-      </p>
-      {message.rewrite ? (
-        <p className="mt-2 text-xs text-muted-foreground">Rewritten question: {message.rewrite}</p>
-      ) : null}
-      <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{message.content}</p>
-      {isAssistant && message.sources && message.sources.sources.length > 0 ? (
-        <SourcesPanel payload={message.sources} />
-      ) : null}
-    </article>
+    <div className="flex gap-3">
+      <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+        <Sparkles className="size-4" />
+      </div>
+      <div className="min-w-0 flex-1 space-y-2">
+        {message.rewrite ? (
+          <p className="text-xs italic text-muted-foreground">
+            Interpreted as: {message.rewrite}
+          </p>
+        ) : null}
+        {isStreaming ? (
+          <p className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" /> Thinking…
+          </p>
+        ) : (
+          <MarkdownView className="text-sm leading-6" body={message.content} />
+        )}
+        {message.sources && message.sources.sources.length > 0 ? (
+          <SourcesPanel payload={message.sources} />
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -594,17 +618,16 @@ function SourcesPanel({ payload }: { payload: SourcesPayload }) {
       <ul className="mt-3 space-y-2">
         {payload.sources.map((source) => (
           <li key={`${source.id}-${source.title}`} className="text-sm">
-            <span className="font-medium">{source.id}</span>
+            {/* The PRD id links to the in-app detail page (most useful for a web user). */}
+            <Link to={`/library/${encodeURIComponent(source.id)}`} className="font-medium text-primary hover:underline">
+              {source.id}
+            </Link>
             {source.title ? <span className="text-muted-foreground"> · {source.title}</span> : null}
             <div className="mt-1 flex flex-wrap gap-3 text-xs font-medium text-primary">
+              <Link to={`/library/${encodeURIComponent(source.id)}`}>Open PRD</Link>
               {source.source_url ? (
                 <a href={source.source_url} rel="noreferrer" target="_blank">
-                  Source
-                </a>
-              ) : null}
-              {source.obsidian_link ? (
-                <a href={source.obsidian_link} rel="noreferrer" target="_blank">
-                  Obsidian
+                  Notion ↗
                 </a>
               ) : null}
             </div>

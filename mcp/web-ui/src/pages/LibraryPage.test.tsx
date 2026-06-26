@@ -75,14 +75,79 @@ describe('LibraryPage', () => {
     expect(await screen.findByText('Billing workspace')).toBeInTheDocument();
   });
 
-  it('shows an empty state when no PRDs are found', async () => {
+  it('shows the empty-vault state when no PRDs are found', async () => {
     server.use(
       http.get('/api/prd/library', () => HttpResponse.json({ results: [], next_cursor: null })),
     );
 
     renderWithProviders(<LibraryPage />, { me: { permissions: ['prd.read'] } });
 
+    expect(await screen.findByText(/no prds yet/i)).toBeInTheDocument();
+  });
+
+  it('admin sees the setup checklist + "Run your first sync" on an empty vault', async () => {
+    server.use(
+      http.get('/api/prd/library', () => HttpResponse.json({ results: [], next_cursor: null })),
+    );
+
+    renderWithProviders(<LibraryPage />, {
+      me: { permissions: ['prd.read', 'users.manage'] },
+    });
+
+    expect(await screen.findByText(/no prds yet/i)).toBeInTheDocument();
+    // The label "Run your first sync" appears twice: the primary CTA and the
+    // checklist step 2. Both link to /admin/sources.
+    const syncLinks = screen.getAllByRole('link', { name: /run your first sync/i });
+    expect(syncLinks).toHaveLength(2);
+    for (const link of syncLinks) {
+      expect(link).toHaveAttribute('href', '/admin/sources');
+    }
+    // SetupChecklist steps are present.
+    expect(screen.getByRole('link', { name: /connect notion/i })).toHaveAttribute(
+      'href',
+      '/admin/sources',
+    );
+    expect(screen.getByRole('link', { name: /invite your team/i })).toHaveAttribute(
+      'href',
+      '/admin/directory',
+    );
+    // No admin guidance string for non-admins.
+    expect(screen.queryByText(/ask an admin/i)).not.toBeInTheDocument();
+  });
+
+  it('non-admin sees the ask-an-admin message and no checklist on an empty vault', async () => {
+    server.use(
+      http.get('/api/prd/library', () => HttpResponse.json({ results: [], next_cursor: null })),
+    );
+
+    renderWithProviders(<LibraryPage />, { me: { permissions: ['prd.read'] } });
+
+    expect(await screen.findByText(/no prds yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/ask an admin to run a notion sync/i)).toBeInTheDocument();
+    // No onboarding affordances for non-admins.
+    expect(screen.queryByRole('link', { name: /run your first sync/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /connect notion/i })).not.toBeInTheDocument();
+  });
+
+  it('filtered-empty keeps the clear-filters action and no onboarding', async () => {
+    server.use(
+      http.get('/api/prd/library', () => HttpResponse.json({ results: [], next_cursor: null })),
+    );
+
+    renderWithProviders(<LibraryPage />, {
+      me: { permissions: ['prd.read', 'users.manage'] },
+    });
+
+    // Type a tag filter so the empty result is a filtered-out view, not an empty vault.
+    const tagInput = await screen.findByPlaceholderText(/filter by tag/i);
+    fireEvent.change(tagInput, { target: { value: 'billing' } });
+
     expect(await screen.findByText(/no prds found/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /clear filters/i })).toBeInTheDocument();
+    // Empty-vault onboarding must NOT appear when a filter is active.
+    expect(screen.queryByText(/no prds yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /run your first sync/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/get started/i)).not.toBeInTheDocument();
   });
 
   it('T-3 shows an error when the library fails to load', async () => {
