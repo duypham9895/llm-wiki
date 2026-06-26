@@ -1,7 +1,6 @@
 import * as React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { LogOut, Menu, Moon, Search, Sun, KeyRound, BookOpen } from 'lucide-react';
 
 import { apiFetch } from '@/lib/api';
@@ -204,31 +203,11 @@ export function AppShell() {
           <div className="sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-y-auto">{NavList}</div>
         </aside>
         <main id="main" className="min-h-[calc(100vh-3.5rem)] p-4 md:p-6">
-          <PageTransition pathname={location.pathname}>
-            <Outlet />
-          </PageTransition>
+          <Outlet />
         </main>
       </div>
 
       <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
     </div>
-  );
-}
-
-/** Fade + small slide-up on route change. Honors prefers-reduced-motion. */
-function PageTransition({ pathname, children }: { pathname: string; children: React.ReactNode }) {
-  const reduced = useReducedMotion();
-  return (
-    <AnimatePresence mode="wait" initial={false}>
-      <motion.div
-        key={pathname}
-        initial={reduced ? { opacity: 0 } : { opacity: 0, y: 4 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={reduced ? { opacity: 0 } : { opacity: 0, y: -4 }}
-        transition={{ duration: reduced ? 0 : 0.15, ease: 'easeOut' }}
-      >
-        {children}
-      </motion.div>
-    </AnimatePresence>
   );
 }
